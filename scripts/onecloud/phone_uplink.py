@@ -9,6 +9,7 @@ from pathlib import Path
 import socket
 import subprocess
 import time
+import own_domain
 import setup_wizard
 
 HOTSPOT = 'uplink-hotspot.json'
@@ -183,6 +184,17 @@ class PhoneUplink:
         for child in ('receiver', 'dnsmasq', 'hostapd'):
             self.platform.stop_child(child)
 
+    def own_answer(self):
+        """The box's own name, answered locally even while other names follow upstream DNS."""
+        own = self.status.get('own_name')
+        if not own:
+            return []
+        ddns = own_domain.load(self.state)
+        local = bool(ddns and ddns.get('provider') in (own_domain.DESEC, own_domain.DNSPOD))
+        if local or self.status.get('tesla') or setup_wizard.options(self.state).get('local_dns'):
+            return [own]
+        return []
+
     def start_ap(self, channel, width, names, upstream=None):
         start_shared_ap(self.platform, self.address, self.box, channel, width, self.wait_for, names, upstream,
                         query_log=self.state / 'diag/tesla-dns.log' if self.status.get('tesla') else None,
@@ -194,8 +206,9 @@ class PhoneUplink:
         self.stop_network()
         self.platform.cleanup_phone_uplink()
         names = list(setup_wizard.TESLA_CHECK_NAMES) if self.status.get('tesla') else []
-        if self.status.get('own_name') and (self.status.get('tesla') or setup_wizard.options(self.state).get('local_dns')):
-            names.append(self.status['own_name'])
+        for name in self.own_answer():
+            if name not in names:
+                names.append(name)
         self.start_ap(self.channel, self.width, names)
         self.set_status('offline', reason)
         self.next_try = self.clock() + self.backoff
@@ -256,8 +269,9 @@ class PhoneUplink:
             p.enable_phone_nat(self.address.network)
             freq = int(self.frequency)
             channel = (freq - 2407) // 5 if freq < 3000 else (freq - 5000) // 5
-            # Real upstream: all names, including own domain and Tesla checks, resolve normally.
-            self.start_ap(channel, 20, [], upstream)
+            # Upstream DNS for the car's other names. The box name stays on the box, so the
+            # trusted certificate still matches while the phone hotspot is the internet.
+            self.start_ap(channel, 20, self.own_answer(), upstream)
             self.backoff = 15
             self.set_status('online', '已连上手机热点，车机可上网')
         except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:

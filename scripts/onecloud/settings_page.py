@@ -506,8 +506,9 @@ class SettingsPage:
                 f'<div class=inner style="padding:0 0 12px">{form}<p class=note>调试中想恢复：给盒子拔电再插上，就回到原来的网络；或等 30 分钟自动结束。</p></div></details>{actions}')
 
     def save_ddns(self, form):
-        """Own DuckDNS name (own_domain.py); a new name or turning it off drops the old name's certificate.
-        A deSEC name is configured when the box is prepared (state/ddns.json), not from this page."""
+        """Own domain (own_domain.py); a new name or turning it off drops the old name's certificate.
+        A deSEC name is configured when the box is prepared (state/ddns.json), not from this page.
+        DNSPod keeps the A record on the box and uses the token only for the certificate's TXT record."""
         old = own_domain.load(self.state)
         if old and old.get("provider") == own_domain.DESEC:
             raise ValueError("这个域名是刷机时配置的，不能在这里修改。")
@@ -516,19 +517,39 @@ class SettingsPage:
             own_domain.forget_certificate(self.state)
             self.apply_later("own domain cleared")
             return "已关闭自己的域名，盒子约 1 分钟后改回自带证书。"
-        domain = own_domain.sub_domain(form.get("domain"))
-        token = (form.get("token") or "").strip()
-        if not token and old and old["domain"] == domain:
-            token = old["token"]   # left empty: keep the saved one
-        token = own_domain.check_token(token)
-        if not old or old["domain"] != domain:
+        provider = (form.get("provider") or "duckdns").strip().lower()
+        if provider == own_domain.DNSPOD:
+            domain = own_domain.domain_name(form.get("domain"))
+            token_id = (form.get("dnspod_id") or "").strip()
+            token = (form.get("token") or "").strip()
+            if old and old.get("provider") == own_domain.DNSPOD and old.get("domain") == domain:
+                token_id = token_id or old.get("id") or ""
+                token = token or old.get("token") or ""
+            config = {"provider": own_domain.DNSPOD, "domain": domain,
+                      "id": own_domain.check_dnspod_id(token_id),
+                      "token": own_domain.check_dnspod_token(token)}
+            name = domain
+            notice = (f"已保存 {name}。盒子约 1 分钟后重启服务，连盒子热点的设备会把这个域名解析到盒子。"
+                      "联网后自动申请正式证书（几分钟），下次开机起用。")
+        elif provider in ("duckdns", ""):
+            domain = own_domain.sub_domain(form.get("domain"))
+            token = (form.get("token") or "").strip()
+            if not token and old and old.get("provider") != own_domain.DNSPOD and old.get("domain") == domain:
+                token = old["token"]   # left empty: keep the saved one
+            # Public IPv6 only where the box joins a hotspot: on its own hotspot it has no public address.
+            ipv6 = form.get("ipv6") == "on" and self.setup().get("mode") in setup_wizard.JOINS
+            config = {"domain": domain, "token": own_domain.check_token(token),
+                      **({"ipv6": True} if ipv6 else {})}
+            name = domain + own_domain.SUFFIX
+            notice = (f"已保存 {name}。盒子约 1 分钟后重启服务，联网时自动更新解析并申请正式证书"
+                      "（几分钟），下次开机起用。")
+        else:
+            raise ValueError("不支持的域名方式。")
+        if own_domain.name_of(old) != name:
             own_domain.forget_certificate(self.state)
-        # Public IPv6 only where the box joins a hotspot: on its own hotspot it has no public address.
-        ipv6 = form.get("ipv6") == "on" and self.setup().get("mode") in setup_wizard.JOINS
-        _save(self.ddns_file, {"domain": domain, "token": token, **({"ipv6": True} if ipv6 else {})})
+        _save(self.ddns_file, config)
         self.apply_later("own domain saved")
-        return (f"已保存 {domain}{own_domain.SUFFIX}。盒子约 1 分钟后重启服务，联网时自动更新解析并申请正式证书"
-                "（几分钟），下次开机起用。")
+        return notice
 
     def apply_certificate(self, form):
         """Try the certificate now, or import one from elsewhere (own_domain.py). A new certificate is loaded when
@@ -568,7 +589,7 @@ class SettingsPage:
                 'placeholder="-----BEGIN PRIVATE KEY-----"></textarea>'
                 '<button class="btn plain" name=action value=import '
                 'onclick="return confirm(\'导入后服务会重启一下，确定？\')">导入并重启服务</button></form>'
-                '<p class=foot>两段都要是 PEM 文本，证书必须是这个子域名的（名字对不上会被拒绝），私钥要和证书成对。'
+                '<p class=foot>两段都要是 PEM 文本，证书必须是这个域名的（名字对不上会被拒绝），私钥要和证书成对。'
                 '证书只写到盒子本地，不会上传；服务重启后才生效。</p></div></details>')
         return actions
 
@@ -586,16 +607,44 @@ class SettingsPage:
                     '更换域名请联系设备提供方。</p>'
                     + ('<p class=note>这个网址需要车机连接盒子热点才能解析；其他连接方式请使用设置页显示的 IP 地址。</p>'
                        if mode != "box_hotspot" else '') + self.certificate_actions(nonce, ddns, name))
-        form = (f'<form method=post action=/ddns>{ui.hidden(nonce)}<div class=group>'
-                f'<label class=cell><span class=main><b>子域名</b></span><input type=text name=domain '
-                f'value="{escape(ddns.get("domain", ""))}" placeholder="如 mycar" required autocapitalize=off '
+        dnspod = ddns.get("provider") == own_domain.DNSPOD
+        kept = "留空表示不修改" if ddns else "必填"
+        duck_domain = "" if dnspod else ddns.get("domain", "")
+        pod_domain = ddns.get("domain", "") if dnspod else ""
+        duck_ph = "留空表示不修改" if ddns and not dnspod else "必填"
+        pod_ph = "留空表示不修改" if dnspod and ddns.get("token") else "必填"
+        form = (f'<form id=ddns-form method=post action=/ddns>{ui.hidden(nonce)}<div class=group>'
+                '<label class=cell><span class=main><b>域名方式</b></span>'
+                '<select id=ddns-provider name=provider style="text-align:right">'
+                f'<option value=duckdns{" selected" if not dnspod else ""}>DuckDNS</option>'
+                f'<option value=dnspod{" selected" if dnspod else ""}>DNSPod（腾讯云 DNS）</option>'
+                '</select></label>'
+                f'<label class=cell><span class=main><b id=ddns-name>{"域名" if dnspod else "子域名"}</b></span>'
+                f'<input id=ddns-domain type=text name=domain value="{escape(ddns.get("domain", ""))}" '
+                f'data-duck="{escape(duck_domain)}" data-pod="{escape(pod_domain)}" '
+                f'placeholder="{"如 dashplay.example.com" if dnspod else "如 mycar"}" required autocapitalize=off '
                 'style="text-align:right"></label>'
-                '<label class=cell><span class=main><b>Token</b></span><input type=password name=token '
-                f'placeholder="{"留空表示不修改" if ddns else "必填"}" autocomplete=off style="text-align:right"></label>'
-                + ('<label class=cell><span class=main><b>同时登记公网 IPv6</b><span>车机不让打开 192.168.x.x 这类局域网地址时才勾选</span>'
+                f'<label class=cell id=ddns-id{"" if dnspod else " style=display:none"}>'
+                '<span class=main><b>DNSPod Token ID</b></span>'
+                f'<input type=text name=dnspod_id placeholder="{"留空表示不修改" if ddns.get("id") else "DNSPod 必填"}" '
+                'autocomplete=off autocapitalize=off style="text-align:right"></label>'
+                '<label class=cell><span class=main><b>Token</b></span>'
+                f'<input id=ddns-token type=password name=token data-duck-ph="{duck_ph}" data-pod-ph="{pod_ph}" '
+                f'placeholder="{kept}" autocomplete=off style="text-align:right"></label>'
+                + ('<label class=cell id=ddns-v6' + (' style=display:none' if dnspod else '')
+                   + '><span class=main><b>同时登记公网 IPv6</b><span>仅 DuckDNS。车机不让打开 192.168.x.x 这类局域网地址时才勾选</span>'
                    f'</span><input type=checkbox name=ipv6 value=on{" checked" if ddns.get("ipv6") else ""}></label>'
                    if mode in setup_wizard.JOINS else "") + '</div>'
                 '<button class="btn plain" name=action value=save>保存</button></form>'
+                '<script>(function(){var sel=document.getElementById("ddns-provider"),domain=document.getElementById("ddns-domain"),'
+                'label=document.getElementById("ddns-name"),idRow=document.getElementById("ddns-id"),'
+                'token=document.getElementById("ddns-token"),v6=document.getElementById("ddns-v6");if(!sel)return;'
+                'var draft={duckdns:domain.getAttribute("data-duck")||"",dnspod:domain.getAttribute("data-pod")||""},current=sel.value;'
+                'function show(el,on){if(el)el.style.display=on?"":"none";}'
+                'function apply(){var pod=sel.value==="dnspod";label.textContent=pod?"域名":"子域名";'
+                'domain.placeholder=pod?"如 dashplay.example.com":"如 mycar";domain.value=draft[sel.value]||"";'
+                'show(idRow,pod);show(v6,!pod);token.placeholder=token.getAttribute(pod?"data-pod-ph":"data-duck-ph");}'
+                'sel.addEventListener("change",function(){draft[current]=domain.value;token.value="";current=sel.value;apply();});})();</script>'
                 + (f'<form method=post action=/ddns>{ui.hidden(nonce)}<button class="btn plain" name=action value=clear '
                    'onclick="return confirm(\'关闭后车机改用盒子自带证书的地址，确定？\')">关闭</button></form>' if ddns else ""))
         state = (own_domain.message(self.state, name, mode == "box_hotspot", retry=bool(self.retry_cert))
@@ -609,9 +658,10 @@ class SettingsPage:
                 f'<span class=value>{escape(name or "未设置")}</span><span class=chev></span></summary>'
                 f'<div class=inner style="padding:0 0 12px">{form}'
                 + (f'<p class=foot>{escape(state)}</p>' if state else "") + actions +
-                '<p class=foot>在 duckdns.org 免费注册并建一个子域名，把子域名和页面上的 token 填在这里。盒子会把这个域名指向自己，'
-                f'并向 Let’s Encrypt 申请免费的正式证书、到期前自动续签；车机改用 https://子域名.duckdns.org:{viewer_port.resolve(self.state)}/ 打开，'
-                f'不再有证书警告。不需要开放任何端口。{ipv6}'
+                '<p class=foot>DNSPod（腾讯云 DNS）：域名填完整名称。Token ID 和 Token 在 DNSPod 控制台的密钥管理里创建，'
+                '权限要能改这个域名的解析。盒子热点会把这个域名解析到盒子自己，证书用 DNSPod 的 TXT 记录向 Let’s Encrypt 申请。'
+                'DuckDNS：只填子域名和页面上的 token。'
+                f'车机用 https://域名:{viewer_port.resolve(self.state)}/ 打开，不再有证书警告。不需要开放任何端口。{ipv6}'
                 + ('盒子热点方式在车上没有网络，申请和续签要在家插上网线开机。' if mode == "box_hotspot" else "") + '</p></div></details>')
 
     # What goes over the car's own Bluetooth instead of the CarPlay page (found in a Tesla, 2026-10-14; supervisor.py

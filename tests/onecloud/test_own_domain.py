@@ -34,6 +34,7 @@ echo "$PATH" >> "$FAKE_DIR/env"
 echo "${ACME_USE_IPV4_REQUESTS:-}" >> "$FAKE_DIR/ipv4"
 [ -n "$DuckDNS_Token" ] && echo "token in environment" >> "$FAKE_DIR/calls"
 [ -n "$DEDYN_TOKEN" ] && echo "desec token in environment" >> "$FAKE_DIR/calls"
+[ -n "$DP_Id" ] && [ -n "$DP_Key" ] && echo "dnspod token in environment" >> "$FAKE_DIR/calls"
 case " $* " in *" --issue "*) [ -n "$FAKE_SLEEP" ] && sleep "$FAKE_SLEEP"; exit "${FAKE_ISSUE:-0}" ;; esac
 while [ $# -gt 0 ]; do
     case "$1" in --fullchain-file) cp "$FAKE_DIR/fullchain.pem" "$2" ;; --key-file) cp "$FAKE_DIR/key.pem" "$2" ;; esac
@@ -113,6 +114,24 @@ class DesecConfigTests(unittest.TestCase):
                           side_effect=AssertionError("deSEC must not publish an A record")):
             self.assertTrue(own_domain.update_record(config, "100.96.0.1"))
 
+    def test_dnspod_name_is_local_and_waits_without_a_token(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root)
+            (state / "ddns.json").write_text(json.dumps(
+                {"provider": "dnspod", "domain": "DashPlay.apeng.fun", "id": "", "token": ""}))
+            loaded = own_domain.load(state)
+            self.assertEqual(loaded["domain"], "dashplay.apeng.fun")
+            self.assertEqual(own_domain.name_of(loaded), "dashplay.apeng.fun")
+            self.assertEqual(loaded["id"], "")
+            with patch.object(own_domain.urllib.request, "urlopen",
+                              side_effect=AssertionError("DNSPod must not publish an A record")):
+                self.assertTrue(own_domain.update_record(loaded, "100.96.0.1"))
+        for bad in ("", "abc", "12 34"):
+            with self.assertRaises(ValueError):
+                own_domain.check_dnspod_id(bad)
+        with self.assertRaises(ValueError):
+            own_domain.check_dnspod_token("short")
+
 
 @unittest.skipUnless(shutil.which("openssl"), "needs the openssl command")
 class DesecMaintainerTests(unittest.TestCase):
@@ -155,6 +174,41 @@ class DesecMaintainerTests(unittest.TestCase):
         status = own_domain.read_status(self.state)
         self.assertEqual(status.get("record"), "local")
         self.assertEqual(status.get("address"), "100.96.0.1")
+
+
+@unittest.skipUnless(shutil.which("openssl"), "needs the openssl command")
+class DnspodMaintainerTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name) / "dashplay"; self.state = self.root / "state"
+        (self.root / "acme").mkdir(parents=True); self.state.mkdir()
+        self.fake = Path(tmp.name) / "fake"; self.fake.mkdir()
+        acme = self.root / "acme" / "acme.sh"
+        acme.write_text(FAKE_ACME); acme.chmod(0o755)
+        self.name = "dashplay.apeng.fun"
+        self.config = {"provider": "dnspod", "domain": self.name, "id": "10001",
+                       "token": "syntheticdnspodtoken1"}
+        env = patch.dict(os.environ, FAKE_DIR=str(self.fake)); env.start(); self.addCleanup(env.stop)
+        ready = patch.object(own_domain, "network_ready", lambda provider=None: None)
+        ready.start(); self.addCleanup(ready.stop)
+        self.stopped = threading.Event()
+
+    def test_obtains_with_dnspod_and_keeps_the_token_off_the_command_line(self):
+        make_certificate(self.fake, self.name)
+        maintainer = own_domain.Maintainer(self.root, self.config, "100.96.0.1", self.stopped, say=lambda _: None)
+        self.assertEqual(maintainer.check_certificate(), own_domain.CERT_CHECK)
+        calls = (self.fake / "calls").read_text()
+        self.assertIn("--dns dns_dp", calls)
+        self.assertIn("dnspod token in environment", calls)
+        self.assertNotIn(self.config["token"], calls)
+        self.assertNotIn(self.config["id"], calls)
+
+    def test_missing_token_waits_without_calling_acme(self):
+        config = dict(self.config, id="", token="")
+        maintainer = own_domain.Maintainer(self.root, config, "100.96.0.1", self.stopped, say=lambda _: None)
+        self.assertEqual(maintainer.check_certificate(), own_domain.READY_RETRY)
+        self.assertEqual(own_domain.read_status(self.state).get("reason"), "token")
+        self.assertFalse((self.fake / "calls").exists())
 
 
 @unittest.skipUnless(shutil.which("openssl"), "needs the openssl command")
@@ -620,6 +674,27 @@ class SettingsPageTests(unittest.TestCase):
 
     def save(self, **form):
         return self.page.apply("/ddns", dict(form, nonce=self.nonce))
+
+    def test_the_form_follows_the_provider_and_a_switch_needs_that_providers_token(self):
+        html = self.page.render("")
+        self.assertIn("id=ddns-name>子域名<", html)
+        self.assertIn("id=ddns-id style=display:none", html)
+        self.assertIn("token.value=\"\"", html)
+        pod = "syntheticdnspodtoken1"
+        self.save(action="save", provider="dnspod", domain="dashplay.apeng.fun",
+                  dnspod_id="10001", token=pod)
+        html = self.page.render("")
+        self.assertIn("id=ddns-name>域名<", html)
+        self.assertNotIn("id=ddns-id style=display:none", html)
+        self.assertNotIn(pod, html)
+        with self.assertRaises(ValueError):
+            self.save(action="save", provider="duckdns", domain="mycar", token="")
+        self.assertEqual(own_domain.load(self.state)["provider"], "dnspod")
+        duck = "a1b2c3d4e5f6g7h8"
+        self.save(action="save", provider="duckdns", domain="mycar", token=duck)
+        self.assertEqual(own_domain.load(self.state), {"domain": "mycar", "token": duck})
+        with self.assertRaises(ValueError):
+            self.save(action="save", provider="dnspod", domain="dashplay.apeng.fun", token="")
 
     def test_save_keep_token_change_name_and_turn_off(self):
         self.assertIn("未设置", self.page.render(""))

@@ -28,11 +28,11 @@ def inspect(root):
         raise ValueError("新程序无法读取设备已有的域名配置")
     name = own_domain.name_of(config)
     expected = raw["domain"].strip().lower().rstrip(".")
-    if config.get("provider") != "desec":
+    if config.get("provider") not in ("desec", "dnspod"):
         expected = expected.removesuffix(".duckdns.org") + ".duckdns.org"
     if name != expected:
         raise ValueError("新程序解释出的域名与原配置不一致")
-    hook = "dns_desec.sh" if config.get("provider") == "desec" else "dns_duckdns.sh"
+    hook = {"desec": "dns_desec.sh", "dnspod": "dns_dp.sh"}.get(config.get("provider"), "dns_duckdns.sh")
     if not (Path(__file__).parent / "acme/dnsapi" / hook).is_file():
         raise ValueError("升级包缺少设备所需的 DNS 验证脚本")
     return config

@@ -161,7 +161,7 @@ def hotspot_names(state, own_name, use):
         return []
     checks = list(setup_wizard.TESLA_CHECK_NAMES) if chosen.get("tesla") else []
     ddns = own_domain.load(state)
-    local_only = bool(ddns and ddns.get("provider") == own_domain.DESEC)
+    local_only = bool(ddns and ddns.get("provider") in (own_domain.DESEC, own_domain.DNSPOD))
     return checks + ([own_name] if own_name and (local_only or chosen.get("tesla") or chosen.get("local_dns")) else [])
 
 

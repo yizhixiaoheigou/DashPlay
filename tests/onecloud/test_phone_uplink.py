@@ -52,7 +52,18 @@ class PhoneUplinkTests(unittest.TestCase):
         self.assertEqual(self.p.configure_hotspot.call_args.args[:2], (149,20))
         self.p.n_only_ap.assert_called_once()
         self.assertEqual(self.p.start_dhcp.call_args.kwargs['upstream'], '192.0.2.1')
-        self.assertEqual(self.p.start_dhcp.call_args.args[2], [], 'online DNS must forward even own domain')
+        self.assertEqual(self.p.start_dhcp.call_args.args[2], ['example.duckdns.org'],
+                         'online DNS forwards other names but the box name stays on the box')
+
+    def test_dnspod_name_stays_local_while_other_names_follow_upstream(self):
+        self.status['tesla'] = False
+        self.status['own_name'] = 'dashplay.apeng.fun'
+        (self.state / 'ddns.json').write_text(json.dumps({
+            'provider': 'dnspod', 'domain': 'dashplay.apeng.fun',
+            'id': '10001', 'token': 'syntheticdnspodtoken1'}))
+        self.online()
+        self.assertEqual(self.p.start_dhcp.call_args.args[2], ['dashplay.apeng.fun'])
+        self.assertEqual(self.p.start_dhcp.call_args.kwargs['upstream'], '192.0.2.1')
         self.receiver.assert_called_with(149)
         self.assertFalse(self.status['tesla_offline'])
 

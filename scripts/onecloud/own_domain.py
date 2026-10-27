@@ -5,6 +5,8 @@ no "continue"). Off unless the owner enters a DuckDNS sub-domain and token: on t
 
 - Preconfigured deSEC names use the same runtime and upgrade package. state/ddns.json selects provider=desec,
   a full domain name and a per-device token. Only DNS-01 TXT is public; the device's hotspot answers A locally.
+  DNSPod (Tencent Cloud DNS, state "provider": "dnspod") is the same shape: the full name, a token id and a token.
+  DNS-01 uses acme.sh's dns_dp (DP_Id, DP_Key). The hotspot answers the name itself; no public A record.
   Factory provisioning tools and actual credentials are separate from the public program.
 - The public DuckDNS record points the name at the address the head unit opens: the box on the car hotspot or
   portable Wi-Fi, 192.168.78.1 on the box hotspot, the router's own address on OpenWrt. DuckDNS takes a
@@ -49,6 +51,9 @@ DESEC = "desec"
 DOMAIN = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 TOKEN = re.compile(r"[A-Za-z0-9-]{16,64}")   # DuckDNS shows a UUID
 DESEC_TOKEN = re.compile(r"[A-Za-z0-9_-]{20,64}")   # deSEC shows 28 URL-safe characters
+DNSPOD = "dnspod"
+DNSPOD_ID = re.compile(r"[0-9]{1,20}")
+DNSPOD_TOKEN = re.compile(r"[A-Za-z0-9]{16,128}")
 RENEW_DAYS = 30            # Let's Encrypt certificates last 90 days
 RECORD_REFRESH = 1800      # seconds between DuckDNS updates once one succeeded
 RECORD_RETRY = 60
@@ -98,15 +103,40 @@ def check_desec_token(token):
     return token
 
 
+def check_dnspod_id(token_id):
+    token_id = (token_id or "").strip()
+    if not DNSPOD_ID.fullmatch(token_id):
+        raise ValueError("DNSPod Token ID 格式不对：在 DNSPod 的密钥管理里创建 API Token 后，复制 ID。")
+    return token_id
+
+
+def check_dnspod_token(token):
+    token = (token or "").strip()
+    if not DNSPOD_TOKEN.fullmatch(token):
+        raise ValueError("DNSPod Token 格式不对：在 DNSPod 的密钥管理里创建 API Token 后，复制 Token。")
+    return token
+
+
 def load(state):
-    """state/ddns.json -> DuckDNS {"domain": sub-domain, "token": ..., ["ipv6": True]} or deSEC
-    {"provider": "desec", "domain": full-name, "token": ...}; None when off or unreadable."""
+    """state/ddns.json -> DuckDNS {"domain": sub-domain, "token": ..., ["ipv6": True]}, deSEC
+    {"provider": "desec", "domain": full-name, "token": ...}, or DNSPod
+    {"provider": "dnspod", "domain": full-name, "id": ..., "token": ...}; None when off or unreadable.
+    DNSPod id and token may both be empty until the owner types them on the settings page; the name is
+    still answered on the hotspot."""
     try:
         config = json.loads((Path(state) / "ddns.json").read_text())
         provider = str(config.get("provider") or "duckdns").lower()
         if provider == DESEC:
             return {"provider": DESEC, "domain": domain_name(config["domain"]),
                     "token": check_desec_token(config["token"])}
+        if provider == DNSPOD:
+            token_id = str(config.get("id") or "").strip()
+            token = str(config.get("token") or "").strip()
+            if token_id or token:
+                token_id = check_dnspod_id(token_id)
+                token = check_dnspod_token(token)
+            return {"provider": DNSPOD, "domain": domain_name(config["domain"]),
+                    "id": token_id, "token": token}
         if provider != "duckdns":
             return None
         loaded = {"domain": sub_domain(config["domain"]), "token": check_token(config["token"])}
@@ -120,7 +150,7 @@ def load(state):
 def name_of(config):
     if not config:
         return None
-    return config["domain"] if config.get("provider") == DESEC else config["domain"] + SUFFIX
+    return config["domain"] if config.get("provider") in (DESEC, DNSPOD) else config["domain"] + SUFFIX
 
 
 def directory_host():
@@ -176,7 +206,8 @@ def network_ready(run=subprocess.run, resolve=socket.getaddrinfo, provider=None)
     being rebuilt and the Wi-Fi uplink was down, which cost an hour of retry (2026-10-26, N1 mode 3)."""
     if not default_route_families(run):
         return "route"
-    for host in (("desec.io" if provider == DESEC else "www.duckdns.org"), directory_host()):
+    provider_host = {DESEC: "desec.io", DNSPOD: "dnsapi.cn"}.get(provider, "www.duckdns.org")
+    for host in (provider_host, directory_host()):
         try:
             resolve(host, 443, type=socket.SOCK_STREAM)
         except OSError:
@@ -231,6 +262,8 @@ def reason_text(reason):
         return "网络中断"
     if reason == "certificate":
         return "证书内容不对"
+    if reason == "token":
+        return "请在本页填写 DNSPod 的 Token ID 和 Token"
     return "acme.sh 申请没有成功"
 
 
@@ -242,9 +275,9 @@ def forget_certificate(state):
 
 def update_record(config, address, ipv6=None, clear=False, timeout=15):
     """Point the name at address (private addresses allowed) and, when given, its AAAA at ipv6. clear: drop both
-    records first (DuckDNS has no way to drop the AAAA alone). True when DuckDNS answered OK. A deSEC name is
-    answered by the box itself, so there is no public A/AAAA record to keep."""
-    if config.get("provider") == DESEC:
+    records first (DuckDNS has no way to drop the AAAA alone). True when DuckDNS answered OK. A deSEC or DNSPod
+    name is answered by the box itself, so there is no public A/AAAA record to keep."""
+    if config.get("provider") in (DESEC, DNSPOD):
         return True
     def call(fields):
         query = urllib.parse.urlencode(dict(fields, domains=config["domain"], token=config["token"]))
@@ -453,7 +486,8 @@ class Maintainer(threading.Thread):
         super().__init__(name="own-domain", daemon=True)
         self.root, self.state = Path(root), Path(root) / "state"
         self.config, self.name, self.address = config, name_of(config), address
-        self.local_only = bool(config and config.get("provider") == DESEC)   # deSEC: the box answers the name
+        # deSEC and DNSPod: the box answers the name. DNSPod still publishes the ACME TXT at the provider.
+        self.local_only = bool(config and config.get("provider") in (DESEC, DNSPOD))
         if tesla and address:
             from setup_wizard import tesla_reaches
             if not tesla_reaches(address):
@@ -530,8 +564,13 @@ class Maintainer(threading.Thread):
         if certificate_for(self.state, self.name, RENEW_DAYS):
             write_status(self.state, name=self.name, phase="ready", reason="")
             return CERT_CHECK
+        if (self.config.get("provider") == DNSPOD
+                and not (self.config.get("id") and self.config.get("token"))):
+            write_status(self.state, name=self.name, phase="waiting", reason="token")
+            return READY_RETRY
         try:
-            missing = network_ready(provider=DESEC) if self.local_only else network_ready()
+            missing = (network_ready(provider=self.config.get("provider")) if self.local_only
+                       else network_ready())
         except (OSError, ValueError, subprocess.SubprocessError, TypeError):   # never kill the worker here
             missing = "route"
         if missing:   # boot, access point rebuilding, uplink not up yet: not a failure, look again shortly
@@ -572,7 +611,7 @@ class Maintainer(threading.Thread):
             if log.exists():
                 log.replace(home / "acme.log.1")
             # 2: acme.sh still has a certificate it considers current; install that one.
-            dns = "dns_desec" if self.local_only else "dns_duckdns"
+            dns = {DESEC: "dns_desec", DNSPOD: "dns_dp"}.get(self.config.get("provider"), "dns_duckdns")
             if self.acme(["--issue", "--dns", dns, "--dnssleep", str(DNS_SLEEP), "-d", self.name,
                           "--keylength", "ec-256"], log, lock.fileno()) not in (0, 2):
                 raise RuntimeError("acme.sh could not obtain the certificate")
@@ -586,13 +625,21 @@ class Maintainer(threading.Thread):
     def install(self, chain, key):
         install_certificate(self.state, self.name, chain, key)
 
+    def dns_env(self):
+        """Provider credentials for the acme.sh process. Never placed on its command line."""
+        provider = self.config.get("provider")
+        if provider == DESEC:
+            return {"DEDYN_TOKEN": self.config["token"]}
+        if provider == DNSPOD:
+            return {"DP_Id": self.config["id"], "DP_Key": self.config["token"]}
+        return {"DuckDNS_Token": self.config["token"]}
+
     def acme(self, arguments, log, lock_fd=None):
         """acme.sh in its own process group, cancelled when the service stops; the token only in its environment."""
         home = self.state / "acme"
         command = [str(self.root / "acme" / "acme.sh"), "--home", str(self.root / "acme"), "--config-home", str(home),
                    "--cert-home", str(home / "certs"), *arguments, "--server", ACME_SERVER, "--no-color"]
-        env = dict(os.environ, **({"DEDYN_TOKEN": self.config["token"]} if self.local_only
-                                  else {"DuckDNS_Token": self.config["token"]}))
+        env = dict(os.environ, **self.dns_env())
         shim = curl_shim(home)
         if shim:   # acme.sh asks for "curl"; its requests get bounded by the shim, the script stays untouched
             env["PATH"] = shim + os.pathsep + env.get("PATH", "")
