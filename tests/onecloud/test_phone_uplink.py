@@ -52,8 +52,50 @@ class PhoneUplinkTests(unittest.TestCase):
         self.assertEqual(self.p.configure_hotspot.call_args.args[:2], (149,20))
         self.p.n_only_ap.assert_called_once()
         self.assertEqual(self.p.start_dhcp.call_args.kwargs['upstream'], '192.0.2.1')
-        self.assertEqual(self.p.start_dhcp.call_args.args[2], [], 'online DNS must forward even own domain')
+        self.assertEqual(self.p.start_dhcp.call_args.args[2], ['example.duckdns.org'])
         self.receiver.assert_called_with(149)
+        self.assertFalse(self.status['tesla_offline'])
+
+    def test_desec_name_survives_uplink_and_fallback_without_fake_online_checks(self):
+        name = 'box01.car.example.com'
+        (self.state / 'ddns.json').write_text(json.dumps({
+            'provider': 'desec', 'domain': name, 'token': 'synthetic-test-token'}))
+        (self.state / 'options.json').write_text('{"local_dns":false}')
+        self.status['own_name'] = name
+        self.u.address = ipaddress.ip_interface('100.97.0.1/24')
+        for tesla in (True, False):
+            with self.subTest(tesla=tesla):
+                self.status['tesla'] = tesla
+                self.u.phase = 'offline'
+                self.p.connected.return_value = True
+                self.now = self.u.next_try
+                self.u.tick()
+                self.assertEqual(self.u.phase, 'online')
+                call = self.p.start_dhcp.call_args
+                self.assertEqual(call.args[2], [name])
+                self.assertFalse(self.status['tesla_offline'])
+                platform = DebianPlatform('wlan-test', self.state)
+                with patch.object(platform, 'start') as start:
+                    platform.start_dhcp(*call.args, **call.kwargs)
+                    argv = start.call_args.args[1]
+                self.assertIn(f'--address=/{name}/100.97.0.1', argv)
+                self.assertIn(f'--local=/{name}/', argv, 'AAAA must not leak to public DNS either')
+                self.assertIn('--server=192.0.2.1', argv)
+                self.assertIn('--server=223.5.5.5', argv)
+                self.assertFalse(any(check in arg for check in setup_wizard.TESLA_CHECK_NAMES for arg in argv))
+                self.p.connected.return_value = False
+                self.u.tick()
+                expected = list(setup_wizard.TESLA_CHECK_NAMES) if tesla else []
+                self.assertEqual(self.p.start_dhcp.call_args.args[2], expected + [name])
+                self.p.connected.return_value = True
+                self.now = self.u.next_try
+                self.u.tick()
+                self.assertEqual(self.p.start_dhcp.call_args.args[2], [name])
+
+    def test_uplink_without_own_domain_only_forwards_dns(self):
+        self.status['own_name'] = None
+        self.online()
+        self.assertEqual(self.p.start_dhcp.call_args.args[2], [])
         self.assertFalse(self.status['tesla_offline'])
 
     def test_loss_and_changed_channel_remove_nat_and_restore_checks(self):

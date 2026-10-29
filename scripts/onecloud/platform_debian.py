@@ -666,17 +666,21 @@ class DebianPlatform:
         router: hand out the box as default gateway with those names (Tesla offline checks, supervisor.hotspot_router)."""
         network = address.network
         hosts = list(network.hosts())
+        # On dnsmasq >= 2.86 an IPv4 --address alone still forwards other query types.
+        # Keep AAAA/HTTPS queries local too: deSEC names intentionally have no public records.
+        local_names = [flag for name in names for flag in
+                       (f"--address=/{name}/{address.ip}", f"--local=/{name}/")]
         # First-run setup only: a router and a DNS server that answers every name with the box make
         # phones detect a captive portal and open the setup page by themselves.
         if upstream:
             dns = ["--port=53", "--no-resolv", "--no-hosts", f"--server={upstream}", "--server=223.5.5.5",
-                   *(f"--address=/{name}/{address.ip}" for name in names),
+                   *local_names,
                    f"--dhcp-option=3,{address.ip}", f"--dhcp-option=6,{address.ip}"]
         elif portal:
             dns = [f"--port=53", f"--address=/#/{address.ip}", f"--dhcp-option=3,{address.ip}",
                    f"--dhcp-option=6,{address.ip}"]
         elif names:
-            dns = ["--port=53", "--no-resolv", "--no-hosts", *(f"--address=/{name}/{address.ip}" for name in names),
+            dns = ["--port=53", "--no-resolv", "--no-hosts", *local_names,
                    f"--dhcp-option=3,{address.ip}" if router else "--dhcp-option=3", f"--dhcp-option=6,{address.ip}"]
         else:
             dns = ["--port=0", "--dhcp-option=3", "--dhcp-option=6"]

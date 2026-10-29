@@ -9,6 +9,7 @@ from pathlib import Path
 import socket
 import subprocess
 import time
+import own_domain
 import setup_wizard
 
 HOTSPOT = 'uplink-hotspot.json'
@@ -190,12 +191,23 @@ class PhoneUplink:
         self.start_receiver(channel)
         self.status['channel'] = channel
 
+    def own_names(self):
+        """Keep the same local-name policy as the initial box AP, regardless of uplink state.
+
+        deSEC names have no public A/AAAA records. Tesla and optional local DNS also
+        keep their own name local; only unrelated names should use the uplink.
+        """
+        config = own_domain.load(self.state)
+        local_only = bool(config and config.get('provider') == own_domain.DESEC)
+        name = self.status.get('own_name')
+        enabled = local_only or self.status.get('tesla') or setup_wizard.options(self.state).get('local_dns')
+        return [name] if name and enabled else []
+
     def fallback(self, reason):
         self.stop_network()
         self.platform.cleanup_phone_uplink()
         names = list(setup_wizard.TESLA_CHECK_NAMES) if self.status.get('tesla') else []
-        if self.status.get('own_name') and (self.status.get('tesla') or setup_wizard.options(self.state).get('local_dns')):
-            names.append(self.status['own_name'])
+        names.extend(self.own_names())
         self.start_ap(self.channel, self.width, names)
         self.set_status('offline', reason)
         self.next_try = self.clock() + self.backoff
@@ -256,8 +268,8 @@ class PhoneUplink:
             p.enable_phone_nat(self.address.network)
             freq = int(self.frequency)
             channel = (freq - 2407) // 5 if freq < 3000 else (freq - 5000) // 5
-            # Real upstream: all names, including own domain and Tesla checks, resolve normally.
-            self.start_ap(channel, 20, [], upstream)
+            # Keep our own name local. Tesla checks and other websites use the real upstream.
+            self.start_ap(channel, 20, self.own_names(), upstream)
             self.backoff = 15
             self.set_status('online', '已连上手机热点，车机可上网')
         except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
