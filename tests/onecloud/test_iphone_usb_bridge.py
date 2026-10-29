@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import struct
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -46,6 +47,25 @@ class UsbRequestTests(unittest.TestCase):
         endpoint, length, timeout, address = struct.unpack(bridge.BULK_STRUCT, request)
         self.assertEqual((endpoint, length, timeout), (0x81, 8, 1000))
         self.assertNotEqual(address, 0)
+
+    def test_wired_device_is_an_iphone_even_when_an_ipad_sorts_first(self):
+        with tempfile.TemporaryDirectory() as root:
+            bus = Path(root)
+            self.write_usb(bus / '1-1', '05ac', '024f', 'Aluminium Keyboard')
+            self.write_usb(bus / '1-2', '05ac', '12a8', 'iPad')
+            self.write_usb(bus / '1-2:1.0', '05ac', '12a8', 'iPad')
+            self.write_usb(bus / '2-1', '05ac', '12a8', 'iPhone')
+            self.write_usb(bus / '3-1', '1234', '12a8', 'iPhone')
+            with patch.object(bridge.glob, 'glob', return_value=[str(path) for path in sorted(bus.iterdir())]):
+                self.assertEqual(bridge.apple_device(), bus / '2-1')
+                (bus / '2-1').rename(bus / 'gone')
+                self.assertIsNone(bridge.apple_device())
+
+    def write_usb(self, path, vendor, product, name):
+        path.mkdir()
+        (path / 'idVendor').write_text(vendor + '\n')
+        (path / 'idProduct').write_text(product + '\n')
+        (path / 'product').write_text(name + '\n')
 
 
 if __name__ == '__main__':
