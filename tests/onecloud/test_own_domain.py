@@ -107,11 +107,29 @@ class DesecConfigTests(unittest.TestCase):
                                       "token": self.TOKEN})
             self.assertEqual(own_domain.name_of(loaded), "box01.car.example.com")
 
-    def test_no_public_record(self):
+    def test_the_address_record_goes_to_desec(self):
+        # deSEC: zone = the name without its first label (the provider names one label per box).
+        import io, urllib.error
         config = {"provider": "desec", "domain": "box01.car.example.com", "token": self.TOKEN}
-        with patch.object(own_domain.urllib.request, "urlopen",
-                          side_effect=AssertionError("deSEC must not publish an A record")):
-            self.assertTrue(own_domain.update_record(config, "100.96.0.1"))
+        sent = []
+        class Reply(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+        def urlopen(request, timeout):
+            sent.append(request); return Reply(b"[]")
+        with patch.object(own_domain.urllib.request, "urlopen", urlopen):
+            self.assertEqual(own_domain.update_record(config, "192.168.43.105"), "ok")
+        request = sent[0]
+        self.assertEqual((request.get_method(), request.full_url),
+                         ("PUT", "https://desec.io/api/v1/domains/car.example.com/rrsets/"))
+        self.assertEqual(request.get_header("Authorization"), "Token " + self.TOKEN)
+        self.assertEqual(json.loads(request.data), [{"subname": "box01", "type": "A", "ttl": own_domain.DESEC_TTL,
+                                                     "records": ["192.168.43.105"]}])
+        for code, result in ((403, "denied"), (404, "denied"), (400, "invalid"), (422, "invalid"), (429, "failed"),
+                             (500, "failed")):
+            error = urllib.error.HTTPError(request.full_url, code, "x", {}, io.BytesIO(b""))
+            with patch.object(own_domain.urllib.request, "urlopen", side_effect=error):
+                self.assertEqual(own_domain.update_record(config, "192.168.43.105"), result, f"HTTP {code}")
 
 
 @unittest.skipUnless(shutil.which("openssl"), "needs the openssl command")
@@ -142,19 +160,59 @@ class DesecMaintainerTests(unittest.TestCase):
         self.assertNotIn(self.TOKEN, calls, "the token stays off acme.sh's command line")
         self.assertTrue(own_domain.certificate_for(self.state, self.name, own_domain.RENEW_DAYS))
 
-    def test_record_stays_local(self):
-        maintainer = own_domain.Maintainer(self.root, self.config, "100.96.0.1", self.stopped, say=lambda _: None)
-        with patch.object(maintainer, "check_certificate", lambda: own_domain.CERT_CHECK), \
-                patch.object(own_domain, "update_record", side_effect=AssertionError("no public record")):
+    def run_until(self, maintainer, published):
+        with patch.object(maintainer, "check_certificate", lambda: own_domain.CERT_CHECK):
             maintainer.start()
             for _ in range(50):
-                if own_domain.read_status(self.state).get("record") == "local":
+                if own_domain.read_status(self.state).get("published") == published:
                     break
                 time.sleep(0.1)
             self.stopped.set(); maintainer.join(10)
-        status = own_domain.read_status(self.state)
+        return own_domain.read_status(self.state)
+
+    def test_record_stays_local_and_the_address_is_published_on_a_joined_hotspot(self):
+        # The box keeps answering the name on its own hotspot (record "local", which upgrade_checks reads); on a
+        # joined car hotspot or MiFi the public A record lets the car find the box too (2026-10-29).
+        maintainer = own_domain.Maintainer(self.root, self.config, "192.168.43.105", self.stopped,
+                                           say=lambda _: None, interface="wlan0")
+        with patch.object(own_domain, "update_record", return_value="ok") as update:
+            status = self.run_until(maintainer, "ok")
+        update.assert_called_with(self.config, "192.168.43.105")
         self.assertEqual(status.get("record"), "local")
-        self.assertEqual(status.get("address"), "100.96.0.1")
+        self.assertEqual(status.get("address"), "192.168.43.105")
+
+    def test_nothing_is_published_on_the_box_hotspot(self):
+        # The box answers the name there itself; its hotspot address (100.96.0.1 for a Tesla) stays off the
+        # public DNS.
+        maintainer = own_domain.Maintainer(self.root, self.config, "100.96.0.1", self.stopped, say=lambda _: None)
+        with patch.object(own_domain, "update_record", side_effect=AssertionError("published")):
+            status = self.run_until(maintainer, "")
+        self.assertEqual((status.get("record"), status.get("address")), ("local", "100.96.0.1"))
+
+    def test_a_key_allowed_only_the_certificate_record_is_said_once_and_retried_slowly(self):
+        # Boxes made before 2026-10-29 got a token for the ACME TXT only: deSEC refuses the A record.
+        maintainer = own_domain.Maintainer(self.root, self.config, "192.168.43.105", self.stopped,
+                                           say=lambda _: None, interface="wlan0")
+        with patch.object(own_domain, "update_record", return_value="denied"):
+            status = self.run_until(maintainer, "denied")
+        self.assertEqual(status.get("record"), "local")
+        self.assertIn("显示的 IP 地址", own_domain.message(self.state, self.name, False))
+        self.assertNotIn("IP 地址", own_domain.message(self.state, self.name, True),
+                         'on the box hotspot the box answers the name itself')
+
+    def test_a_record_the_provider_refuses_is_not_retried_every_minute(self):
+        # 400/422 (the TTL this zone does not take, a bad record): retrying cannot fix it, so it is looked at again
+        # like a token without permission instead of every minute (2026-10-29 review).
+        maintainer = own_domain.Maintainer(self.root, self.config, "192.168.43.105", self.stopped,
+                                           say=lambda _: None, interface="wlan0")
+        with patch.object(own_domain, "update_record", return_value="invalid"):
+            status = self.run_until(maintainer, "invalid")
+        self.assertEqual(status.get("record"), "local")
+        text = own_domain.message(self.state, self.name, False)
+        self.assertIn("服务商不接受", text)
+        self.assertIn("隔几小时", text)
+        self.assertNotIn("服务商不接受", own_domain.message(self.state, self.name, True),
+                         'on the box hotspot nothing is published')
 
 
 @unittest.skipUnless(shutil.which("openssl"), "needs the openssl command")
@@ -654,6 +712,20 @@ class SettingsPageTests(unittest.TestCase):
         self.assertIn("checked", self.page.render("").split("name=ipv6")[1][:40])
         self.save(action="save", domain="mycar", token="")
         self.assertNotIn("ipv6", own_domain.load(self.state), "unticked: off")
+
+    def test_the_own_name_default_says_where_to_turn_it_off(self):
+        # Way of use 3 answers the owner's name by default (2026-10-29); a car with its own LTE may then fail to
+        # resolve other names, so the page says outside the folded group where the switch is. Tesla mode and a
+        # deSEC name always answer it (no switch), so the hint would be wrong there.
+        hint = "关掉「由盒子告诉车机域名在哪」"
+        self.save(action="save", domain="mycar", token=TOKEN)
+        self.assertIn(hint, self.page.render(""))
+        (self.state / "options.json").write_text(json.dumps({"tesla": True}))
+        self.assertNotIn(hint, self.page.render(""))
+        (self.state / "options.json").unlink()
+        (self.state / "ddns.json").write_text(json.dumps({"provider": "desec", "domain": "box01.car.example.com",
+                                                          "token": "A1b2C3d4E5f6G7h8J9kMnPqRsTuV"}))
+        self.assertNotIn(hint, self.page.render(""))
 
     def test_retry_button_and_manual_import(self):
         self.save(action="save", domain="mycar", token=TOKEN)

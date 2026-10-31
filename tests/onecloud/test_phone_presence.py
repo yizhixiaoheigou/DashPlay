@@ -35,6 +35,75 @@ class PresenceTests(unittest.TestCase):
         self.assertTrue(presence.grant_boot(state, presence.boot_key('boot-one', 'e2')))    # network rebuilt
         self.assertEqual(presence.boot_key('boot-one'), 'boot-one')   # without a supervisor: per boot only
 
+    def test_manual_pause_blocks_boot_selection_and_stale_pairing_grants(self):
+        state = {'phones':{'A':{},'B':{}}, 'last_phone':'A', 'paused':['A']}
+        self.assertEqual(presence.invite_phone(state, {'A','B'}), 'B')
+        self.assertIsNone(presence.invite_phone(state, {'A'}))
+        self.assertEqual(presence.choose_phone(state, {'A','B'}, {'A','B'}, newly_paired='A'), 'B')
+        self.assertIsNone(presence.choose_phone(state, {'A'}, {'A'}, newly_paired='A'))
+
+    def test_pause_persists_across_receiver_boot_and_explicit_switch_resumes(self):
+        import os, tempfile, types
+        phone = '02:00:00:00:00:01'
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)/'phone-presence.json'
+            state.write_text(json.dumps({'phones':{phone:{}}, 'last_phone':phone}))
+            paused = state.with_name('phone-paused.json')
+            paused.write_text(json.dumps({'phones':[phone]}))
+            env = {'CARPLAY_PRESENCE_STATE':str(state), 'CARPLAY_PRESENCE_INTERFACE':'test0'}
+            with patch.dict(os.environ,env), patch.object(presence,'paired_cached',return_value={phone}), \
+                    patch.object(presence,'get_platform',return_value=types.SimpleNamespace(boot_id=lambda:'new-boot')):
+                with patch.object(presence.sys,'argv',['x','boot']):
+                    self.assertEqual(presence.main(),1)
+                with patch.object(presence.sys,'argv',['x','allowed',phone]):
+                    self.assertEqual(presence.main(),1)
+                with patch.object(presence.sys,'argv',['x','switch',phone]):
+                    self.assertEqual(presence.main(),0)
+                self.assertEqual(json.loads(paused.read_text())['phones'],[])
+                with patch.object(presence.sys,'argv',['x','allowed',phone]):
+                    self.assertEqual(presence.main(),0)
+
+    def test_disconnect_request_is_scoped_to_current_receiver_and_paused_owner(self):
+        import os, tempfile, types
+        phone = '02:00:00:00:00:01'
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)/'phone-presence.json'
+            state.write_text(json.dumps({'phones':{phone:{}},'boot':'epoch','active':phone}))
+            state.with_name('phone-paused.json').write_text(json.dumps({'phones':[phone]}))
+            request = state.with_name('phone-disconnect.json')
+            request.write_text(json.dumps({'phone':phone,'boot':'old-epoch'}))
+            with patch.dict(os.environ,{'CARPLAY_PRESENCE_STATE':str(state),'CARPLAY_PRESENCE_INTERFACE':'test0'}), \
+                    patch.object(presence.sys,'argv',['x','disconnect-request']), \
+                    patch.object(presence,'get_platform',return_value=types.SimpleNamespace(boot_id=lambda:'boot')):
+                self.assertEqual(presence.main(),1)
+                self.assertFalse(request.exists())
+                request.write_text(json.dumps({'phone':phone,'boot':'epoch'}))
+                with patch('builtins.print') as output:
+                    self.assertEqual(presence.main(),0)
+                output.assert_called_with(phone)
+                self.assertEqual(json.loads(state.read_text())['active'],phone)
+
+    def test_switch_request_names_the_phone_once_and_expires(self):
+        import os, tempfile, time, types
+        phone = '02:00:00:00:00:02'
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)/'phone-presence.json'
+            state.write_text(json.dumps({'phones':{phone:{}},'boot':'epoch','active':None}))
+            request = state.with_name('phone-switch.json')
+            request.write_text(json.dumps({'phone':phone,'boot':'old-epoch','expires':time.monotonic()+30}))
+            with patch.dict(os.environ,{'CARPLAY_PRESENCE_STATE':str(state),'CARPLAY_PRESENCE_INTERFACE':'test0'}), \
+                    patch.object(presence.sys,'argv',['x','switch-request']), \
+                    patch.object(presence,'get_platform',return_value=types.SimpleNamespace(boot_id=lambda:'boot')):
+                self.assertEqual(presence.main(),1)   # another boot's request is dropped, not served
+                self.assertFalse(request.exists())
+                request.write_text(json.dumps({'phone':phone,'boot':'epoch','expires':time.monotonic()+30}))
+                with patch('builtins.print') as output:
+                    self.assertEqual(presence.main(),0)
+                output.assert_called_with(phone)
+                self.assertFalse(request.exists(), 'one switch per request')
+                request.write_text(json.dumps({'phone':phone,'boot':'epoch','expires':time.monotonic()-1}))
+                self.assertEqual(presence.main(),1)
+
     def test_reply_requires_arp_reply_to_our_interface_and_ip(self):
         local = bytes.fromhex('020000000001')
         phone = bytes.fromhex('020000000002')

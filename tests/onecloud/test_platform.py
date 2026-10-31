@@ -76,6 +76,14 @@ class PlatformTests(unittest.TestCase):
         with patch.object(self.platform, 'scan', return_value=Mock(returncode=1, stdout='', stderr='scan failed')):
             self.assertEqual(self.platform.find_hotspot('Phone'), (False, False, 'scan failed'))
 
+    def test_find_hotspot_ignores_results_cached_from_earlier_scans(self):
+        block = 'BSS 02:00:00:00:00:01(on wlan0)\n\tfreq: 5745.0\n\tlast seen: {} ms ago\n\tSSID: Phone\n'
+        for age, frequency, expected in ((9147, None, False), (0, 5180, False), (0, 5745, True), (0, None, True)):
+            with self.subTest(age=age, frequency=frequency):
+                scan = Mock(returncode=0, stdout=block.format(age), stderr='')
+                with patch.object(self.platform, 'scan', return_value=scan):
+                    self.assertEqual(self.platform.find_hotspot('Phone', frequency)[1], expected)
+
     def test_uplink_scan_has_a_shorter_deadline_without_changing_setup_scans(self):
         with patch('platform_debian.subprocess.run', return_value=Mock(returncode=0, stdout='', stderr='')) as run:
             self.platform.find_hotspot('Phone', timeout=10)

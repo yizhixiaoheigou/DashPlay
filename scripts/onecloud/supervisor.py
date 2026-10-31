@@ -18,6 +18,7 @@ for car browsers that refuse the box's local CA. Remote debugging (debug_uplink.
 settings page, any mode joins the owner's phone hotspot instead, wired CarPlay only, until the window ends or a reboot.
 """
 import argparse
+import audio_routes
 import ipaddress
 import json
 import os
@@ -29,10 +30,11 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 
 from boxnet import ensure_leaf
 import debug_uplink
-from phone_uplink import PhoneUplink, JoinedPhoneAP, UnsuitableChannel
+from phone_uplink import PhoneUplink, LegacyPhoneUplink, JoinedPhoneAP, UnsuitableChannel
 import board_phicomm_n1
 from mdns_name import NameResponder
 import viewer_port
@@ -48,6 +50,7 @@ CAR_WAIT = 60          # head units often raise their hotspot after the box has 
 LINK_LOSS_GRACE = 30   # seconds without the car hotspot before falling back
 RESCAN_EVERY = 60      # box-hotspot mode: look for the car hotspot when no station is attached
 BIND_WAIT = 120        # an early receiver waits this long for its address (CAR_WAIT + DHCP)
+CABLE_OFF = RUN / "cable-carplay-off"     # no CarPlay on the cable: written by the receiver (CableRole.kt)
 WIRED_STATUS = RUN / "wired-status.json"   # written by the receiver, shown on the settings page
 
 
@@ -153,16 +156,14 @@ def joined_receiver_network(state, plan, interface, debug=False, direct_address=
 
 
 def hotspot_names(state, own_name, use):
-    """Names the box answers on its own hotspot (settings page, state/options.json "local_dns"): the own domain in
-    box-hotspot mode, so that a car whose browser gets no other DNS there (no internet, or it does not fall back to
-    its LTE, as the Xpeng did 2026-10-12) still opens it with the trusted certificate."""
+    """Names the box answers on its own hotspot (setup_wizard.answers_own_name): the own domain in box-hotspot mode,
+    so that a car whose browser gets no other DNS there (no internet, or it does not fall back to its LTE, as the
+    Xpeng did 2026-10-12) still opens it with the trusted certificate."""
     chosen = options(state)
     if use != "box_hotspot":
         return []
     checks = list(setup_wizard.TESLA_CHECK_NAMES) if chosen.get("tesla") else []
-    ddns = own_domain.load(state)
-    local_only = bool(ddns and ddns.get("provider") == own_domain.DESEC)
-    return checks + ([own_name] if own_name and (local_only or chosen.get("tesla") or chosen.get("local_dns")) else [])
+    return checks + ([own_name] if own_name and setup_wizard.answers_own_name(chosen, own_domain.load(state)) else [])
 
 
 def hotspot_router(state, use):
@@ -176,12 +177,33 @@ def hotspot_router(state, use):
 def car_audio_args(state):
     """run-receiver.py options for what goes over the car's own Bluetooth (settings page, state/options.json
     "car_music" / "car_voice"; found in a Tesla, 2026-10-14); Tesla mode is all of them."""
+    # One sound switch since 2026-10-31 (audio_routes.resolve): CarPlay keeps its sound, or none goes through CarPlay.
+    # A box whose owner never touched it keeps the older options unchanged.
     chosen = options(state)
     tesla = tesla_mode(state)
+    if audio_routes.OUTPUT_KEY in chosen:
+        return audio_routes.arguments(chosen, tesla)
     if tesla and all(chosen.get(key, True) is True for key in ("car_music", "car_voice")):
         return ["--tesla"]
     return (["--tesla-browser"] if tesla else []) + [flag for key, flag in (
         ("car_music", "--car-music"), ("car_voice", "--car-voice")) if chosen.get(key, tesla) is True]
+
+
+RECEIVER_OPTION_FLAGS = ("--tesla", "--tesla-browser", "--car-music", "--car-voice")
+
+
+def receiver_options(argv, state):
+    """A receiver command line with today's sound and idle-release options (settings page "receiver options
+    changed"): those need the receiver restarted, not the network (2026-10-29)."""
+    kept, skip = [], False
+    for arg in argv:
+        if skip:
+            skip = False
+        elif arg in ("--idle-release", "--audio-routes"):
+            skip = True
+        elif arg not in RECEIVER_OPTION_FLAGS:
+            kept.append(arg)
+    return kept + ["--idle-release", str(idle_release(state)), *car_audio_args(state)]
 
 
 def main():
@@ -237,6 +259,7 @@ def main():
     platform = get_platform(interface, run=RUN)
     platform.bluetooth_state = state
     platform.cleanup_phone_uplink()  # restore MAC/NAT after an interrupted previous run
+    platform.stop_usb_sharing()      # and the USB-tethering NAT; its profiles are decided below
     setup = setup_wizard.load(state)
     # Tesla mode: the box hotspot moves to setup_wizard.SHARED_LAN, which a Tesla's browser opens (2026-10-14).
     tesla = tesla_mode(state)
@@ -294,12 +317,29 @@ def main():
         if name == "receiver" and not have_identity:
             return None   # settings page and network only, until the identity files are added
         if name == "receiver":
+            mark(f"receiver start requested ({traceback.extract_stack(limit=3)[-2].name})")
+            # Channel recovery callbacks retain their original argv; always reload saved sound/idle options.
+            argv = receiver_options(argv, state)
             # Each receiver started for a (re)built network may invite the last phone once more
             # (phone-presence.py boot_key): the iPhone left the box hotspot while it was rebuilt.
             os.environ["CARPLAY_NETWORK_EPOCH"] = secrets.token_hex(4)
+            receiver_argv_now[:] = argv
         return platform.start(name, argv)
 
-    stop_child = platform.stop_child
+    receiver_argv_now = []   # the running receiver's command line, for a restart with new options only
+    receiver_refresh = []    # asked from the settings page's thread; done in the main loop
+
+    def on_settings_change(reason):
+        if reason == "receiver options changed":
+            receiver_refresh.append(reason)
+        else:
+            request_reexec(reason)
+
+    def stop_child(name):
+        # Who ended the receiver matters at boot: several restarts in a row looked like a crash (2026-10-31).
+        if name == "receiver":
+            mark(f"receiver stop requested ({traceback.extract_stack(limit=3)[-2].name})")
+        platform.stop_child(name)
 
     def mark(step):
         # Seconds since kernel start (CLOCK_MONOTONIC), comparable with systemd-analyze.
@@ -344,7 +384,7 @@ def main():
     light = platform.status_light()
     scanner = setup_wizard.Scanner(interface, hotspot["ssid"], lambda: status["mode"], platform=platform)
     maintainer = []   # own_domain.Maintainer, when a DuckDNS name is set
-    settings = SettingsPage(state, lambda: status, request_reexec, lambda: [ip.network for ip in platform.local_addresses()],
+    settings = SettingsPage(state, lambda: status, on_settings_change, lambda: [ip.network for ip in platform.local_addresses()],
                             scanner, WIRED_STATUS, run=RUN,
                             retry_cert=lambda: [worker.request_retry() for worker in list(maintainer)])
     uplink = None
@@ -413,7 +453,13 @@ def main():
         # The cable is offered where the iPhone can be plugged in (not a 410 stick: its USB bridge cost 7 MB for
         # nothing); wireless (Bluetooth handoff) except in car_hotspot mode.
         # Remote debugging hands the iPhone no Wi-Fi: the phone hotspot is the owner's, not the car's.
-        usb_args = (["--wired", "--wired-status", str(WIRED_STATUS)] if platform.wired_capable() else []) + (
+        # Whether the cable carries CarPlay is the viewer's choice (its wired / wireless rows), kept in a marker
+        # the receiver owns; "wireless only" (setup iphone = wireless) keeps it off. How the box reaches the
+        # internet is a separate setting and never changes with it (2026-10-31).
+        wireless_only = (setup.get('iphone') == 'wireless' and setup_wizard.wireless(setup, options(state))
+                         and not debug)
+        usb_args = (["--wired", "--wired-status", str(WIRED_STATUS), "--cable-off-file", str(CABLE_OFF),
+                     "--cable-carplay", "off" if wireless_only else "on"] if platform.wired_capable() else []) + (
             [] if setup_wizard.wireless(setup, options(state)) and not debug else ["--no-wireless"]) + [
             # state/options.json "idle_release": seconds without a viewer before wireless CarPlay ends (0: never);
             # in state/, which program updates keep (they replace service.json).
@@ -516,7 +562,6 @@ def main():
             # Box hotspot: the head unit opens the box at its fixed address; online through the Ethernet cable
             # (at home) the box renews the certificate. The fallback hotspot of the joining modes leaves the record.
             keep_name(str(address.ip) if use == "box_hotspot" else None)
-            platform.set_ap_address(address)
             # The JVM needs ~6 s on this CPU (with AppCDS) before it first contacts the iPhone, while the
             # AP is up in ~4 s, so start it first (2026-10-10 boot profiling). It only needs the address
             # bound; bt-bridge waits for a powered adapter itself (BT_BRIDGE_READY_WAIT).
@@ -525,37 +570,82 @@ def main():
                                    "--bind", str(address.ip), *phone_args, "--viewer-port", str(viewer_port.resolve(state)),
                                    "--interface", platform.ap_interface, "--channel", str(ap_channel), *ap_security, *usb_args])
 
-            launch_receiver(channel)
-            mark("receiver launched")
-            used = None
-            for ap_channel, ap_mhz in hotspot_attempts(channel, width):
-                if used:
-                    print(f"box hotspot did not start on channel {used[0]} at {used[1]} MHz; "
-                          f"trying channel {ap_channel} at {ap_mhz} MHz", flush=True)
-                    stop_child("hostapd")
-                    platform.configure_hotspot(ap_channel, ap_mhz, hotspot["ssid"], ap_passphrase)
-                    if ap_channel != used[0]:
-                        # The receiver hands the iPhone the channel, so it restarts with the one used.
-                        stop_child("receiver")
-                        launch_receiver(ap_channel)
-                used = (ap_channel, ap_mhz)
-                if platform.start_ap(wait_for):
-                    break
+            # 车机上网 (2026-10-31): "USB 共享网络" keeps the cable first and the saved phone hotspot as the
+            # fallback, so unplugging the cable no longer leaves the box offline until it is plugged in again.
+            daily = (use == "box_hotspot" and (setup.get("done") or setup.get("confirmed")) and not debug)
+            internet = options(state)["car_internet"]
+            usb_tether = False
+            wants_usb_tether = daily and internet == "usb_tether" and platform.wired_capable()
+            if wants_usb_tether:
+                # Before the receiver: its USB bridge reads the marker when the iPhone is plugged in.
+                try:
+                    # Only the marker here (fast): its USB bridge reads it when the iPhone is plugged in. The
+                    # manager profiles and NAT come after the receiver is up (finish_usb_tether), which is
+                    # ~5 s of subprocess calls that used to sit in front of CarPlay (C5 vs C1, 2026-10-31).
+                    platform.begin_usb_tether(address.network)
+                    usb_tether = True
+                    status["usb_tether"] = True
+                    mark("USB shared network enabled")
+                except (OSError, ValueError, subprocess.SubprocessError) as error:
+                    platform.disable_usb_tether()
+                    wants_usb_tether = False
+                    print(f"USB shared network unavailable: {type(error).__name__}", flush=True)
             else:
-                raise RuntimeError("box hotspot did not start")
-            mark("AP enabled")
-            # DHCP only: no router or DNS option. (A head unit joining it may still treat it as its
-            # default network and lose internet: box_hotspot mode says so; the other modes avoid it.)
-            portal = setup_wizard.captive(setup, "ap")
-            platform.start_dhcp(address, portal, hotspot_names(state, own_name, use),
-                                query_log=state / "diag/tesla-dns.log" if tesla and use == "box_hotspot" else None,
-                                router=hotspot_router(state, use))
-            status["tesla_offline"] = setup_wizard.tesla_offline(setup, options(state))
-            if portal:
-                mark("first-run setup portal enabled")
-        if use == "box_hotspot" and (setup.get("done") or setup.get("confirmed")) and not debug and options(state)["car_internet"] == "phone_hotspot":
-            uplink = PhoneUplink(platform, state, address, hotspot, used[0], used[1], wait_for,
-                                 launch_receiver, status)
+                platform.disable_usb_tether()
+            daily_uplink = daily and internet in ("phone_hotspot", "usb_tether")
+            if daily_uplink and (tesla or wants_usb_tether):
+                # usb_tether shares the uplink with the car (share=True) and keeps the AP while it joins.
+                uplink = PhoneUplink(platform, state, address, hotspot, channel, width, wait_for,
+                                     launch_receiver, status, share=wants_usb_tether,
+                                     say=lambda line: print(line, flush=True))
+                if not uplink.start():
+                    uplink = None
+            if uplink is None:
+                # Concurrent setup may have rewritten hostapd.conf before falling back.
+                platform.configure_hotspot(channel, width, hotspot["ssid"], ap_passphrase)
+                platform.set_ap_address(address)
+                launch_receiver(channel)
+                mark("receiver launched")
+                used = None
+                for ap_channel, ap_mhz in hotspot_attempts(channel, width):
+                    if used:
+                        print(f"box hotspot did not start on channel {used[0]} at {used[1]} MHz; "
+                              f"trying channel {ap_channel} at {ap_mhz} MHz", flush=True)
+                        stop_child("hostapd")
+                        platform.configure_hotspot(ap_channel, ap_mhz, hotspot["ssid"], ap_passphrase)
+                        if ap_channel != used[0]:
+                            # The receiver hands the iPhone the channel, so it restarts with the one used.
+                            stop_child("receiver")
+                            launch_receiver(ap_channel)
+                    used = (ap_channel, ap_mhz)
+                    if platform.start_ap(wait_for):
+                        break
+                else:
+                    raise RuntimeError("box hotspot did not start")
+                mark("AP enabled")
+                # DHCP only: no router or DNS option. (A head unit joining it may still treat it as its
+                # default network and lose internet: box_hotspot mode says so; the other modes avoid it.)
+                portal = setup_wizard.captive(setup, "ap")
+                platform.start_dhcp(address, portal, hotspot_names(state, own_name, use),
+                                    query_log=state / "diag/tesla-dns.log" if tesla and use == "box_hotspot" else None,
+                                    # Sharing the iPhone's internet: the box is the router and forwards DNS.
+                                    router=usb_tether or hotspot_router(state, use),
+                                    **({"upstream_file": platform.phone_resolv} if usb_tether else {}))
+                status["tesla_offline"] = setup_wizard.tesla_offline(setup, options(state))
+                if portal:
+                    mark("first-run setup portal enabled")
+            if daily_uplink and not tesla and not wants_usb_tether:
+                uplink = LegacyPhoneUplink(platform, state, address, hotspot, used[0], used[1], wait_for,
+                                          launch_receiver, status, say=lambda line: print(line, flush=True))
+            if usb_tether:
+                try:
+                    platform.finish_usb_tether()
+                    mark("USB shared network: profiles and NAT in place")
+                except (OSError, ValueError, subprocess.SubprocessError) as error:
+                    platform.disable_usb_tether()
+                    status.pop("usb_tether", None)
+                    usb_tether = False
+                    print(f"USB shared network sharing failed: {type(error).__name__}", flush=True)
         bluetooth.join()
         if not bluetooth_ok:
             # Only wireless CarPlay needs Bluetooth (the invitation); car_hotspot mode runs on the cable.
@@ -587,11 +677,22 @@ def main():
                 continue
             if uplink:
                 uplink.tick()
+                if isinstance(uplink, PhoneUplink) and not uplink.started:
+                    uplink = None  # recovered ordinary AP; restore normal child supervision
+            if receiver_refresh:
+                receiver_refresh.clear()
+                # Only a receiver that runs now: the network and the hotspot stay, the iPhone reconnects in seconds.
+                if receiver_argv_now and any(name == "receiver" for name, _ in children):
+                    print("receiver options changed: restarting the receiver only", flush=True)
+                    stop_child("receiver")
+                    start("receiver", receiver_options(receiver_argv_now, state))
             if direct_ap and direct_ap.changed():
                 request_reexec('direct phone AP lost upstream/channel; rebuild')
                 continue
             light.show("live" if phone_live() else "fallback" if fallback else "waiting")
             for name, child in children:
+                if isinstance(uplink, PhoneUplink) and name in ('wpa_supplicant', 'hostapd'):
+                    continue  # the uplink controller recovers these without restarting CarPlay
                 if child.poll() is not None:
                     raise RuntimeError(f"{name} exited with {child.returncode}")
             if status["mode"] == "sta":
@@ -633,6 +734,7 @@ def main():
         if direct_ap:
             direct_ap.close()
         platform.remove_sta_network()
+        platform.stop_usb_sharing()
         platform.flush_address()
         print("DashPlay services stopped", flush=True)
     if reexec and reexec[0] is not None:

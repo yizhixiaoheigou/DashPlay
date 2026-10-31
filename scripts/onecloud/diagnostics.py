@@ -318,7 +318,8 @@ def start(stopped, log: DiagLog, receiver_log: Path, platform, status, interval=
             try:
                 record = {"uptime": round(time.monotonic(), 1), "mode": status.get("mode")}
                 record.update({key: status[key] for key in ("uplink", "tesla_offline", "tesla_internet",
-                               "tesla_dns_log", "direct_phone", "phone_interface") if key in status})
+                               "tesla_dns_log", "direct_phone", "phone_interface", "tesla_lan_stable",
+                               "tesla_upstream", "uplink_link", "uplink_error") if key in status})
                 record.update(platform.diagnostics())
                 record["net"] = net_counters()
                 if state is not None:

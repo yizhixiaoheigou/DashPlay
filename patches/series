@@ -62,3 +62,16 @@ playport-touch-swipe.patch
 playport-performance-mode.patch
 playport-slim-runtime.patch
 playport-viewer-video-priority.patch
+playport-phone-switch.patch
+playport-viewer-audio-gains.patch
+playport-viewer-cleanup.patch
+playport-idle-new-session-grace.patch
+playport-settings-disconnect.patch
+playport-volume-scale.patch
+playport-audio-routes.patch
+playport-audio-shared-output.patch
+playport-wired-phone-list.patch
+playport-cable-rows.patch
+playport-settings-switch.patch
+playport-picture-sound-links.patch
+playport-wired-retry-backoff.patch

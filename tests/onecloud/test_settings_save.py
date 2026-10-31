@@ -36,6 +36,12 @@ class ConcurrentSaveTests(unittest.TestCase):
             self.assertIn(value["ssid"].split("-")[1], ("0", "1"))
             self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), ["car-hotspot.json"])
 
+    def test_one_save_for_the_settings_and_the_setup_state(self):
+        # settings_page._save and setup_wizard.save_json did the same job twice, the second without the lock or
+        # its own temporary file (2026-10-29): setup.json is written from the same request threads.
+        import setup_wizard
+        self.assertIs(settings_page._save, setup_wizard.save_json)
+
 
 if __name__ == "__main__":
     unittest.main()

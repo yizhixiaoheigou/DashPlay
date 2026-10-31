@@ -84,6 +84,15 @@ class TeslaOfflineTests(unittest.TestCase):
         self.assertEqual(get('other.example')[0], 404)
         status['uplink'] = {'phase':'online'}
         self.assertEqual(get(wizard.TESLA_CHECK_NAMES[0])[0], 404, 'real upstream must never receive a fake HTTP check')
+        # Persistent mode-three LAN uses the same baseline as F50; upstream state is independent.
+        status.update(tesla_lan_stable=True, tesla_offline=True)
+        for phase in ('online', 'wired', 'recovering', 'offline'):
+            status['uplink'] = {'phase': phase}
+            code, headers, _ = get(wizard.TESLA_CHECK_NAMES[0])
+            self.assertEqual((code, headers['X-ConnMan-Status']), (200, 'online'))
+            self.assertEqual(get('other.example')[0], 404)
+        status.pop('tesla_lan_stable')
+        status.pop('tesla_offline')
         status.pop('uplink')
         (self.state / 'options.json').write_text('{"tesla":false}')
         self.assertEqual(get(wizard.TESLA_CHECK_NAMES[0])[0], 404)

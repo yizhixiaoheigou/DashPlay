@@ -620,7 +620,9 @@ def identity(w, args):
 
 TESLA_SCRIPT = '''#!/bin/sh
 # Runs on the box, apart from the SSH session: the LAN moves to 100.96.0.1 and the session drops.
-{sim}uci set dashplay.main.tesla_mode=1
+{sim}uci set dashplay.main.car_music=1
+uci set dashplay.main.car_voice=1
+uci set dashplay.main.tesla_mode=1
 uci commit dashplay
 /etc/init.d/dashplay restart
 '''

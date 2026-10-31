@@ -41,6 +41,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -52,6 +53,10 @@ DESEC_TOKEN = re.compile(r"[A-Za-z0-9_-]{20,64}")   # deSEC shows 28 URL-safe ch
 RENEW_DAYS = 30            # Let's Encrypt certificates last 90 days
 RECORD_REFRESH = 1800      # seconds between DuckDNS updates once one succeeded
 RECORD_RETRY = 60
+DESEC_TTL = 900            # the lowest deSEC takes for this zone (dns_desec.sh); a changed address can take
+                           # up to this long to reach a car that asked before
+DESEC_DENIED_RETRY = 6 * 3600   # a token without A permission, or a record deSEC refuses (TTL/zone): look again
+                                # now and then; retrying every minute cannot fix either and only hits the rate limit
 CERT_CHECK = 12 * 3600
 CERT_RETRY = 3600          # once the quick attempts below are used up
 CERT_RETRY_STEPS = (60, 120, 300, 900)   # first failures: the authorization is still valid, a retry is cheap
@@ -240,12 +245,36 @@ def forget_certificate(state):
     (Path(state) / "own-domain.json").unlink(missing_ok=True)
 
 
+def update_desec(config, address, timeout=15):
+    """The deSEC name's public A record -> address, so that a car asking its own hotspot or a MiFi finds the box
+    too (the box still answers the name on its own hotspot). The zone is the name without its first label, as
+    the device provider names one label per box. "ok"; "denied" (403, or 404 for a domain the token may not write:
+    a token made before 2026-10-29 has the ACME TXT only, or the name's zone is not the one deSEC holds); "invalid"
+    (400/422: deSEC refuses this TTL or record, which retrying cannot fix); "failed" (no internet, throttled;
+    retried every minute)."""
+    sub, zone = config["domain"].split(".", 1)
+    body = json.dumps([{"subname": sub, "type": "A", "ttl": DESEC_TTL, "records": [address]}]).encode()
+    request = urllib.request.Request(f"https://desec.io/api/v1/domains/{zone}/rrsets/", data=body, method="PUT",
+                                     headers={"Authorization": "Token " + config["token"],
+                                              "Content-Type": "application/json", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response.read(16)
+        return "ok"
+    except urllib.error.HTTPError as error:
+        if error.code in (403, 404):
+            return "denied"
+        return "invalid" if error.code in (400, 422) else "failed"
+    except (OSError, ValueError):   # no internet yet; URLError is an OSError
+        return "failed"
+
+
 def update_record(config, address, ipv6=None, clear=False, timeout=15):
     """Point the name at address (private addresses allowed) and, when given, its AAAA at ipv6. clear: drop both
-    records first (DuckDNS has no way to drop the AAAA alone). True when DuckDNS answered OK. A deSEC name is
-    answered by the box itself, so there is no public A/AAAA record to keep."""
+    records first (DuckDNS has no way to drop the AAAA alone). True when DuckDNS answered OK. A deSEC name: its A
+    record only, and the result of update_desec."""
     if config.get("provider") == DESEC:
-        return True
+        return update_desec(config, address, timeout)
     def call(fields):
         query = urllib.parse.urlencode(dict(fields, domains=config["domain"], token=config["token"]))
         with urllib.request.urlopen("https://www.duckdns.org/update?" + query, timeout=timeout) as response:
@@ -485,10 +514,24 @@ class Maintainer(threading.Thread):
             now = time.monotonic()
             if self.address and now >= next_record:
                 if self.local_only:
-                    # deSEC: the name is answered by the box's own dnsmasq; no public A/AAAA, no IPv6 guard.
+                    # deSEC: the box's own dnsmasq answers the name on its hotspot (record "local", read by
+                    # upgrade_checks); the public A record ("published") only on a joined car hotspot or MiFi
+                    # (interface), where the car asks that network. On the box hotspot nothing is published, so
+                    # its 100.96 address never goes public. No AAAA, no IPv6 guard.
+                    if not self.interface:
+                        public = ""
+                    elif self.address == self.sent and now < self.sent_at + RECORD_REFRESH:
+                        public = "ok"
+                    else:
+                        public = update_record(self.config, self.address)
+                        if public == "ok":
+                            self.sent, self.sent_at = self.address, now
+                        self.say(f"desec {self.name} -> {self.address}: {public}")
                     write_status(self.state, name=self.name, record="local", address=self.address,
-                                 ipv6="", ipv6_state="off")
-                    next_record = float("inf")
+                                 ipv6="", ipv6_state="off", published=public)
+                    next_record = (float("inf") if not public else
+                                   now + {"ok": RECORD_REFRESH, "denied": DESEC_DENIED_RETRY,
+                                          "invalid": DESEC_DENIED_RETRY}.get(public, RECORD_RETRY))
                 else:
                     ipv6, v6state = self.ipv6()
                     if (self.address, ipv6) == self.sent and now < self.sent_at + RECORD_REFRESH:
@@ -661,6 +704,15 @@ def message(state, name, box_hotspot=False, retry=False):
         text += status.get("warning", "已保留原域名记录。")
     if status.get("record") == "failed":
         text += f"更新 {name} 的解析失败，盒子会继续重试。"
+    # deSEC's public A record (Maintainer); on the box hotspot the box answers the name itself, so it does not matter.
+    if not box_hotspot and status.get("published") == "denied":
+        text += ("这个域名的钥匙还不能在网上登记盒子的地址，连车机热点或随身 WiFi 时用域名打不开："
+                 "请先用设置页显示的 IP 地址，并联系设备提供方开通。")
+    elif not box_hotspot and status.get("published") == "failed":
+        text += "盒子的地址还没登记到网上，盒子会继续重试；登记前请用设置页显示的 IP 地址。"
+    elif not box_hotspot and status.get("published") == "invalid":
+        text += ("服务商不接受这个域名的登记（域名的分段或缓存时间不对），重试也修不好，盒子隔几小时再看一次："
+                 "连车机热点或随身 WiFi 时先用设置页显示的 IP 地址，并联系设备提供方处理。")
     text += {"ok": f"公网 IPv6 {status.get('ipv6')} 已登记，防火墙只让同一个 WiFi 里的设备连进盒子。",
              "none": "连着的热点没有给盒子分配公网 IPv6，暂时只登记了局域网地址。",
              "firewall": "盒子的防火墙没能启用，为安全起见没有登记公网 IPv6；请把诊断记录交给 AI 助手或开发者。",

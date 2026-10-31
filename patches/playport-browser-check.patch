@@ -66,7 +66,7 @@
 + add('AAC 原生音乐播放',!!w.MediaSource&&w.MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"'),false,'不支持时可能降级或没有声音，系统媒体控制也可能不可用。');
 + add('辅助音频解码',!!w.AudioDecoder,false,'缺少 AudioDecoder 时部分音轨不可用。');
 + add('全屏',!!d.documentElement.requestFullscreen,false,'不支持时仍可在窗口内显示。');
-+ add('系统媒体控制',!!w.navigator.mediaSession,false,'影响系统媒体卡片；方向盘按键仍需车机实测。');
++ add('系统媒体控制',!!w.navigator.mediaSession,false,'用于车机系统媒体卡片与方向盘切歌。');
 + if(w.VideoDecoder&&typeof w.VideoDecoder.isConfigSupported==='function'){
 +  pending++;var completed=false;
 +  function result(ok,detail){if(completed)return;completed=true;add('H.264 解码探测',ok,true,detail);pending--;finish();}

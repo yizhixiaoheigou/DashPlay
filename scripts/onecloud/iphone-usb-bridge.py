@@ -138,10 +138,83 @@ def claim(fd, device, number):
         time.sleep(0.05)
 
 
-def release_tethering(device):
+# Written by the supervisor when the owner chose "use the iPhone's internet over the cable" (options.json
+# "usb_tether", off by default; platform_debian.enable_usb_tether, 2026-10-30).
+USB_TETHER_MARK = Path("/run/dashplay/usb-tether")
+IPHETH_BIND = Path("/sys/bus/usb/drivers/ipheth/bind")
+# No CarPlay on the cable (2026-10-31): the viewer picked a wireless row, or the owner chose wireless only.
+# The receiver writes this marker (CableRole.kt) and starts the bridge again; it is about CarPlay only, the
+# box's internet over the cable (USB_TETHER_MARK) is decided separately. Configuration 4, the iPhone's own
+# hotspot configuration, cannot replace this: ipheth binds but the carrier stays 0 and no lease is asked for
+# (dp-0017, measured). Configuration 6 with only ipheth bound comes up (carrier 1, a 172.20.10.x lease), so
+# the bridge still selects it and then stays out of its CarPlay functions (usbmux, NCM).
+CABLE_OFF_ENV = "CARPLAY_CABLE_OFF_FILE"
+
+
+def cable_carplay_off(environ=None):
+    """Whether the cable must carry no CarPlay now: the receiver's marker exists."""
+    path = (os.environ if environ is None else environ).get(CABLE_OFF_ENV, "")
+    return bool(path) and Path(path).exists()
+
+
+def release_carplay_ncm(device):
+    """With no CarPlay on the cable, cdc_ncm may bind the iPhone's two CarPlay NCM functions (02/0d) by itself.
+    The USB internet profile also matches cdc_ncm (Android phones and USB MiFis tether over it), so it would
+    ask the iPhone's CarPlay link for a lease that never comes: release them. They carry nothing but CarPlay."""
+    for path in sorted(device.parent.glob(f"{device.name}:{CARPLAY_CONFIGURATION}.*")):
+        driver = path / "driver"
+        values = interface_values(path)
+        if (values["bInterfaceClass"], values["bInterfaceSubClass"]) == ("02", "0d") and driver.exists():
+            try:
+                (driver.resolve() / "unbind").write_text(path.name)
+                log(f"released the iPhone's CarPlay NCM function {path.name}")
+            except OSError as error:
+                log(f"CarPlay NCM function {path.name} not released: {error.strerror}")
+
+
+def report_tether_interface(device):
+    """Log the iPhone's USB internet interface with no CarPlay on the cable. Bound only when the owner chose
+    USB internet (release_tethering has done that); otherwise the cable just charges the iPhone."""
+    if not USB_TETHER_MARK.exists():
+        log("cable without CarPlay; USB internet not chosen, the iPhone only charges")
+        return
+    for path in sorted(device.parent.glob(f"{device.name}:{CARPLAY_CONFIGURATION}.*")):
+        if interface_values(path)["bInterfaceSubClass"] != "fd" or not (path / "driver").exists():
+            continue
+        interface = sorted(path.glob("net/*"))
+        log(f"tether {interface[0].name if interface else path.name}")
+        return
+
+
+def wait_for_unplug(device):
+    """Block until the iPhone leaves; the receiver starts the bridge again when it returns."""
+    node_name = device.name
+    while apple_device() is not None and Path(device).exists():
+        time.sleep(2)
+    # Not "usb ...": the receiver reads every "usb <state>" line as a state, and "usb iphone ... gone" read as a
+    # new iPhone on the cable paused wireless and ended a wireless session on unplug (2026-10-31, Xs).
+    log(f"iPhone {node_name} unplugged")
+
+
+def release_tethering(device, keep=None):
     """The CarPlay configuration also carries the iPhone's USB Personal Hotspot interface (ff/fd,
     kernel ipheth). Left bound, systemd-networkd took a DHCP lease and a default route through the
-    iPhone's mobile data and the iPhone showed a hotspot client (2026-10-12). CarPlay needs only NCM."""
+    iPhone's mobile data and the iPhone showed a hotspot client (2026-10-12). CarPlay needs only NCM,
+    so it is released, unless the owner asked for exactly that: the box online through the iPhone."""
+    if keep is None:
+        keep = USB_TETHER_MARK.exists()
+    if keep:
+        # Released by an earlier session (the option was off, or turned on with the iPhone already plugged in):
+        # the kernel does not bind it again by itself.
+        for path in device.parent.glob(f"{device.name}:{CARPLAY_CONFIGURATION}.*"):
+            if interface_values(path)["bInterfaceSubClass"] == "fd" and not (path / "driver").exists():
+                try:
+                    IPHETH_BIND.write_text(path.name)
+                    log(f"bound the iPhone's USB hotspot interface {path.name} again")
+                except OSError as error:
+                    log(f"USB hotspot interface {path.name} not bound: {error.strerror}")
+        log("keeping the iPhone's USB hotspot interface (usb_tether)")
+        return
     for _ in range(10):
         for path in device.parent.glob(f"{device.name}:{CARPLAY_CONFIGURATION}.*"):
             driver = path / "driver"
@@ -237,9 +310,20 @@ def main():
         serial = Path(device, "serial").read_text().strip()
     except OSError:
         serial = ""
-    log(f"usb iphone {serial}".strip())   # the serial keys the receiver's per-iPhone Lockdown record
+    # "usb iphone <serial>" makes the receiver pause wireless and end a running wireless session
+    # (WiredBootstrap -> setCablePhone). With no CarPlay on the cable the bridge says "usb tether <serial>":
+    # wireless CarPlay (this phone or another) keeps running while the cable is in.
+    off = cable_carplay_off()
+    log(f"usb {'tether' if off else 'iphone'} {serial}".strip())   # the serial keys the per-iPhone Lockdown record
     device = carplay_configuration(device)
     release_tethering(device)
+    if off:
+        # Stay out of usbmux/NCM, so the iPhone gets no CarPlay on this cable. Its USB internet interface is
+        # bound or released by release_tethering above, exactly as with CarPlay on the cable.
+        release_carplay_ncm(device)
+        report_tether_interface(device)
+        wait_for_unplug(device)
+        return
     mux = None
     for path in sorted(device.parent.glob(f"{device.name}:{CARPLAY_CONFIGURATION}.*")):
         values = interface_values(path)

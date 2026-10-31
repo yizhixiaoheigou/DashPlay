@@ -27,6 +27,9 @@ class SelectionTests(unittest.TestCase):
         self.assertIsNone(p.choose_phone(state, set(), {A,B}, B))
 
 class PendingPairingTests(unittest.TestCase):
+    def state(self):
+        return {'last_phone': A, 'phones': {A: {}, B: {}}}
+
     def test_first_pair_grant_expires_and_does_not_survive_reboot(self):
         import json,tempfile
         with tempfile.TemporaryDirectory() as directory:
@@ -35,6 +38,36 @@ class PendingPairingTests(unittest.TestCase):
             self.assertEqual(p.pending_phone(path,'one',99),B)
             self.assertIsNone(p.pending_phone(path,'one',100))
             self.assertIsNone(p.pending_phone(path,'two',5))
+
+    def test_switch_grant_may_replace_the_active_phone_but_only_a_paired_one(self):
+        # The viewer's explicit switch is the one place that may replace the phone using CarPlay: the
+        # receiver ends that session and invites the chosen phone, while the old phone stays on Wi-Fi.
+        state=self.state();state['active']=A
+        self.assertIsNone(p.switch_grant(state, {A,B}, '02:00:00:00:00:09', 100))
+        grant=p.switch_grant(state, {A,B}, B, 100)
+        self.assertEqual(grant, {'phone':B, 'expires':100+p.GRANT_SECONDS})
+        state.pop('active')
+        self.assertEqual(p.choose_phone(state, {A,B}, {A,B}, B, now=101), B)
+
+    def test_switch_grant_clears_an_earlier_refusal_of_the_chosen_phone(self):
+        state=self.state();p.decline(state, B, 0)
+        self.assertIsNotNone(p.switch_grant(state, {A,B}, B, 1))
+        self.assertNotIn(B, state['declined'])
+
+    def test_phone_rows_put_the_active_and_previous_phone_in_the_list(self):
+        names={A:'Alice iPhone', B:'Bob iPhone'}
+        state=self.state();state['active']=A
+        self.assertEqual(p.phone_rows(state, names), [
+            {'address':A, 'name':'Alice iPhone', 'active':True, 'last':True},
+            {'address':B, 'name':'Bob iPhone', 'active':False, 'last':False}])
+
+    def test_switch_grant_file_is_private_and_keeps_the_receiver_format(self):
+        import json,tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'pairing-request.json'
+            p.grant_phone(path, {'phone':B,'boot':'one','expires':100})
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(path.read_text()), {'phone':B,'boot':'one','expires':100})
 
 
 class DeclineAndNetworkTests(unittest.TestCase):

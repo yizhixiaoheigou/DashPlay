@@ -7,10 +7,10 @@ element of its own is the connection chain (car hotspot - box - iPhone) at the t
 the box hotspot has no internet, so no web fonts or external files.
 """
 from html import escape
+import json
 
 STYLE = """
 .summary-row b{flex:0 0 85px}.cell.summary-row .value{white-space:normal;overflow-wrap:anywhere;min-width:0}.role+.role{margin-top:12px}
-.validation{width:100%;border-collapse:collapse;font-size:14px;overflow-wrap:anywhere}.validation td,.validation th{padding:10px;text-align:left;border-bottom:1px solid #8884}.validation caption{text-align:left;padding:12px 0;font-weight:600}
 
 :root{--bg:#F2F2F7;--cell:#FFFFFF;--sep:rgba(60,60,67,.18);--label:#000;--secondary:rgba(60,60,67,.6);
 --tint:#007AFF;--green:#34C759;--orange:#FF9500;--red:#FF3B30;--fill:rgba(120,120,128,.12);--press:#D1D1D6;
@@ -235,24 +235,37 @@ def network_picker(networks, selected, nonce, action, path, submit, foot="", ext
             f'<form method=post action={path}>{hidden(nonce)}<button class="btn plain" name=action value=rescan>重新扫描</button></form>')
 
 
-def phone_rows(devices, active, last, nonce, idle):
+def phone_rows(devices, active, last, nonce, idle, paused=(), connecting=None):
     """Bluetooth-style 'My devices': tap a phone to connect it or remove it from the box."""
     if not devices:
         return '<div class=cell><span class=main><span>还没有添加手机</span></span></div>'
     html = ""
     for phone, name in devices.items():
-        state = "正在使用" if phone == active else "上次使用" if phone == last else "未连接"
+        state = ("正在使用" if phone == active else
+                 "已断开" if phone in paused else
+                 "等待接入" if phone == connecting else
+                 "上次使用 · 未连接" if phone == last else "已配对 · 未连接")
+        # Keep the right-hand status short on narrow screens; the explanation can wrap below the name.
+        detail = ("已断开 · 自动连接已暂停" if phone != active and phone in paused else
+                  "蓝牙已配对，等待接入 CarPlay" if phone != active and phone == connecting else "")
+        detail = f'<span>{detail}</span>' if detail else ""
         summary = (f'<summary class="cell{" on" if phone == active else ""}"><span class=main><b>{escape(name)}</b>'
-                   f'<span>蓝牙 …{escape(phone[-5:])}</span></span><span class=value>{state}</span><span class=chev></span></summary>')
+                   f'<span>蓝牙 …{escape(phone[-5:])}</span>{detail}</span><span class=value>{state}</span><span class=chev></span></summary>')
         actions = ""
+        form = f'<form method=post action=/pair>{hidden(nonce, phone=phone)}'
         if phone == active:
-            actions = '<div class=cell><span class=main><span>正在使用 CarPlay。对方断开 Wi-Fi 后，才能接入其他手机或删除它。</span></span></div>'
-        else:
-            form = f'<form method=post action=/pair>{hidden(nonce, phone=phone)}'
-            if idle:
-                actions += form + '<button class="cell action" name=action value=use>接入 CarPlay</button></form>'
-            actions += (form + f'<button class="cell destructive" name=action value=remove '
-                        f'onclick="return confirm(\'从盒子上删除「{escape(name)}」？以后要用需要重新配对。\')">删除此手机</button></form>')
+            actions += form + '<button class="cell action" name=action value=disconnect>断开 CarPlay</button></form>'
+            actions += '<p class=foot>断开会保留配对，并暂停这部手机自动连接；点击「接入 CarPlay」可恢复。</p>'
+        elif phone != connecting:
+            # One button for both cases (2026-10-31): with a phone in use it takes CarPlay from it, exactly like
+            # tapping its row in the CarPlay box settings; idle, it is simply the invitation.
+            label = '接入 CarPlay' if idle else '切换到这部手机'
+            actions += form + f'<button class="cell action" name=action value=switch>{label}</button></form>'
+            if not idle:
+                actions += ('<p class=foot>会结束正在用的那部手机的 CarPlay；它保留配对和 Wi-Fi，随时可以切回来。</p>')
+        confirmation = escape('return confirm(' + json.dumps(f'从盒子上删除「{name}」？当前连接会结束，以后要用需要重新配对。', ensure_ascii=False) + ')', quote=True)
+        actions += (form + f'<button class="cell destructive" name=action value=remove '
+                    f'onclick="{confirmation}">删除此手机</button></form>')
         html += f'<details>{summary}<div class=inner>{actions}</div></details>'
     return html
 
@@ -294,17 +307,6 @@ def pairing_panel(pair, nonce, address=""):
     return None, False
 
 
-def mode_cards(nonce, modes, selected=None):
-    """First-run step 1: the three ways of use as radio cards (modes: [(key, icon, title, text, note)])."""
-    cards = "".join(
-        f'<label class=role><input class=pick type=radio name=mode value={key} required{" checked" if key == selected else ""}>'
-        f'<span class=glyph>{ICONS[icon]}</span><span class=main><b>{escape(title)}</b><span>{escape(text)}</span>'
-        f'<span class=note>{escape(note)}</span></span>{CHECK}</label>'
-        for key, icon, title, text, note in modes)
-    return (f'<form method=post action=/setup>{hidden(nonce)}<div class=roles>{cards}</div>'
-            '<button class=btn name=action value=mode>下一步</button></form>')
-
-
 WIRED_STATES = {
     None: ("off", "未启动", "CarPlay 接收服务启动后可用。"),
     "cable": ("off", "等待插线", "用数据线把 iPhone 插到盒子上。"),
@@ -319,8 +321,8 @@ def wired_block(phase, title="用数据线", foot=""):
     state, value, detail = WIRED_STATES.get(phase, WIRED_STATES[None])
     status = (f'<div class="cell{" on" if state == "on" else ""}"><span class=main><b>有线 CarPlay</b>'
               f'<span>{escape(detail)}</span></span><span class=value>{escape(value)}</span></div>')
-    steps = ('<ol class=steps><li>用 iPhone 的数据线（能传数据的线，不是只能充电的线）插到盒子上'
-             '<b>远离网口</b>的那个 USB 口。</li>'
+    steps = ('<ol class=steps><li>用 iPhone 的数据线（能传数据的线，不是只能充电的线）插到盒子的 USB 口：'
+             '玩客云插<b>远离网口</b>的那个 USB 口，N1 两个 USB 口都行。</li>'
              '<li>第一次插上时，iPhone 会问「要信任此电脑吗？」，点「信任」并输入锁屏密码，以后插上即用。</li>'
              '<li>在车机浏览器打开 CarPlay 画面的地址。</li></ol>')
     return group(title, status, foot) + (steps if phase != "live" else "")

@@ -50,6 +50,12 @@ class BrowserAccessTest(unittest.TestCase):
     def test_tesla_browser_can_leave_audio_in_the_webpage(self):
         self.assertEqual(self.page_flags(tesla_browser=True), {"tesla": True, "carMusic": False})
 
+    def test_calls_over_the_car_bluetooth_reach_the_page(self):
+        # The page greys out its Siri and call levels then: those sounds are the car's (2026-10-29).
+        self.assertEqual(self.page_flags(car_voice=True), {"carVoice": True})
+        self.assertEqual(self.page_flags(tesla=True, car_voice=True), {"carMusic": True, "tesla": True, "carVoice": True})
+        self.assertEqual(self.page_flags(tesla_browser=True, car_voice=True), {"tesla": True, "carMusic": False, "carVoice": True})
+
     def test_rejects_an_unexpected_token(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(ValueError):

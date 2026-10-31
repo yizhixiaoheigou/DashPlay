@@ -1,0 +1,141 @@
+Normalize all visible audio sliders to 0–100 while retaining stored gain values and sound levels.
+
+diff --git a/web/src/audio-mix.ts b/web/src/audio-mix.ts
+--- a/web/src/audio-mix.ts
++++ b/web/src/audio-mix.ts
+@@ -1,7 +1,7 @@
+ /** Volume relative to the level this page has always used, for each sound CarPlay sends.
+  *
+  *  Navigation prompts ("default") already carry a boost when music goes to the car over Bluetooth
+- *  (the ×3 in main.ts, or ?promptgain=): 100 % in this panel means that existing level, not an unboosted one.
++ *  (the ×3 in main.ts, or ?promptgain=): 100 % internally means that existing level, not an unboosted one. The UI normalizes the range to 0–100.
+  *  Alerts ("alert"), Siri, calls and media start at ×1. Media is played through a media element whose
+  *  volume stops at 1, so it can only be turned down.
+  */
+@@ -22,6 +22,17 @@
+ 
+ export function clampPercent(name: string, percent: number): number {
+   return Math.min(maxPercent(name), Math.max(0, Number.isFinite(percent) ? percent : 100));
++}
++
++/** A common slider position: 0 is muted, 100 is this category's existing maximum. */
++export function volumePercent(name: string, percent: number): number {
++  return clampPercent(name, percent) / maxPercent(name) * 100;
++}
++
++/** Translate the UI position back to the existing gain/storage format. */
++export function gainPercent(name: string, volume: number): number {
++  if (!Number.isFinite(volume)) return 100;
++  return Math.min(100, Math.max(0, volume)) / 100 * maxPercent(name);
+ }
+ 
+ /** What the audio engine applies: the base times the percentage, capped like the old ?promptgain= (×8). */
+diff --git a/web/src/main.ts b/web/src/main.ts
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -1,6 +1,6 @@
+ import { startup, startupStats } from './startup';
+ import { AudioEngine } from './audio';
+-import { AUDIO_CATEGORIES, STORAGE_KEY as AUDIO_MIX_KEY, clampPercent, maxPercent, mixPercent, parseMix, type AudioCategory } from './audio-mix';
++import { AUDIO_CATEGORIES, STORAGE_KEY as AUDIO_MIX_KEY, gainPercent, volumePercent, mixPercent, parseMix, type AudioCategory } from './audio-mix';
+ import { InputController } from './input';
+ import { MicrophoneUplink } from './mic';
+ import { VideoPlayer } from './video';
+@@ -268,9 +268,8 @@
+ // Music the iPhone still sends here is played: it sends music to one place at a time, and after Siri from the
+ // CarPlay screen it sent it here for ~27 s before going back to the car's Bluetooth, silent while it was dropped.
+ const audio = new AudioEngine(error, { promptBoost: promptGain, idleClose: carMusic });
+-// The sound-level panel: each category is a percentage of the level the page has always used. Navigation's
+-// 100 % already includes the ×3 boost above when music goes to the car over Bluetooth; media stops at 100 %
+-// because it is played through a media element (see audio-mix.ts). Kept in this browser, like the master volume.
++// Every visible slider uses 0–100. Keep the existing gain/storage values underneath, so opening an
++// upgraded page never changes the sound. Navigation's existing baseline still includes its prompt boost.
+ const AUDIO_LABELS: Record<AudioCategory, Key> = {
+   default: 'audioNav', alert: 'audioAlert', media: 'audioMedia', speechrecognition: 'audioSiri', telephony: 'audioCalls',
+ };
+@@ -278,9 +277,9 @@
+ for (const category of AUDIO_CATEGORIES) audio.setCategoryPercent(category, mixPercent(audioMix, category));
+ function renderAudioMix() {
+   for (const category of AUDIO_CATEGORIES) {
+-    const percent = mixPercent(audioMix, category);
++    const percent = Math.round(volumePercent(category, mixPercent(audioMix, category)));
+     const input = el<HTMLInputElement>(`audio-${category}`);
+-    input.max = String(maxPercent(category));
++    input.max = '100';
+     if (Number(input.value) !== percent) input.value = String(percent);
+     input.setAttribute('aria-label', t(AUDIO_LABELS[category]));
+     // Over the car's Bluetooth this page plays none of it: the slider would change nothing (2026-10-29).
+@@ -293,7 +292,7 @@
+ for (const category of AUDIO_CATEGORIES) {
+   const input = el<HTMLInputElement>(`audio-${category}`);
+   input.oninput = () => {
+-    audioMix = { ...audioMix, [category]: clampPercent(category, Number(input.value)) };
++    audioMix = { ...audioMix, [category]: gainPercent(category, Number(input.value)) };
+     localStorage.setItem(AUDIO_MIX_KEY, JSON.stringify(audioMix));
+     audio.setCategoryPercent(category, mixPercent(audioMix, category));
+     renderAudioMix();
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -18,7 +18,7 @@
+   sound: ['轻点启用声音', 'Tap to enable sound'], volume: ['声音', 'Sound'], volumeAll: ['总音量', 'All sounds'],
+   audioMix: ['各声音的音量', 'Each sound'], audioNav: ['导航播报', 'Navigation'], audioAlert: ['提示音', 'Alerts'], audioMedia: ['媒体音乐', 'Media'], audioSiri: ['Siri', 'Siri'], audioCalls: ['通话', 'Calls'],
+   audioOnCar: ['走车机蓝牙，请用车机音量调', 'Over the car’s Bluetooth: use the car’s volume'],
+-  audioMixHint: ['总音量管全部；下面各项单独调：100% 是默认，往左小、往右大，调大时自动防破音，媒体最高 100%。走车机蓝牙的声音请用车机音量调。设置保存在此浏览器。', 'All sounds sets everything; each sound below on its own: 100% is the default, left is quieter, right is louder (kept from clipping), media tops out at 100%. Sounds over the car’s Bluetooth follow the car’s volume. Kept in this browser.'],
++  audioMixHint: ['所有滑块统一为 0–100%：0% 静音，100% 是该项最大音量。总音量控制本页全部声音，下方各项单独调整；各路原有音量保持不变。走车机蓝牙的声音请用车机音量调。设置保存在此浏览器。', 'Every slider uses 0–100%: 0% is muted and 100% is that control’s maximum. All sounds controls this page’s audio; the rows below adjust each sound. Existing sound levels are preserved. Sounds over the car’s Bluetooth follow the car’s volume. Kept in this browser.'],
+   display: ['画面', 'Display'], fullscreen: ['全屏', 'Fullscreen'], exitFullscreen: ['退出全屏', 'Exit fullscreen'], fullscreenHint: ['已全屏。退出全屏：点 CarPlay 主屏幕上的「盒子设置」图标，再点「退出全屏」。', 'Fullscreen on. To exit, tap the Box settings icon on the CarPlay home screen, then Exit fullscreen.'], fullscreenFail: ['此浏览器不允许全屏，画面仍会自动适配窗口。', 'Fullscreen unavailable. The picture still fits this window.'], tapFullscreen: ['轻点画面恢复全屏', 'Tap the picture to go back to fullscreen'],
+   teslaFullscreenOffline: ['全屏要经腾讯视频跳转，特斯拉现在上不了网。画面照常可用。', 'Fullscreen goes through a video site and the car is offline. The picture keeps working.'],
+   autoHint: ['上面的开关改了立即生效，CarPlay 会重连一下；「画面参数」里的项要点「应用并重连」。自定义分辨率只在一个显示端开启。', 'The switches above take effect at once and reconnect CarPlay; Display settings need Apply and reconnect. Use a custom resolution on one display only.'],
+diff --git a/web/index.html b/web/index.html
+--- a/web/index.html
++++ b/web/index.html
+@@ -32,11 +32,11 @@
+   <p class="group-title" data-i18n="volume"></p>
+   <div class="group" id="audio-mix">
+     <div class="cell volume audio-row"><span class="main"><b data-i18n="volumeAll"></b></span><input id="volume" type="range" min="0" max="100" value="100"/><output id="volume-value">100%</output></div>
+-    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioNav"></b><span id="audio-default-base"></span></span><input id="audio-default" type="range" min="0" max="300" step="5" value="100"/><output id="audio-default-value">100%</output></div>
+-    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioAlert"></b><span id="audio-alert-base"></span></span><input id="audio-alert" type="range" min="0" max="300" step="5" value="100"/><output id="audio-alert-value">100%</output></div>
+-    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioMedia"></b><span id="audio-media-base"></span></span><input id="audio-media" type="range" min="0" max="100" step="5" value="100"/><output id="audio-media-value">100%</output></div>
+-    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioSiri"></b><span id="audio-speechrecognition-base"></span></span><input id="audio-speechrecognition" type="range" min="0" max="300" step="5" value="100"/><output id="audio-speechrecognition-value">100%</output></div>
+-    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioCalls"></b><span id="audio-telephony-base"></span></span><input id="audio-telephony" type="range" min="0" max="300" step="5" value="100"/><output id="audio-telephony-value">100%</output></div>
++    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioNav"></b><span id="audio-default-base"></span></span><input id="audio-default" type="range" min="0" max="100" step="1" value="33"/><output id="audio-default-value">33%</output></div>
++    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioAlert"></b><span id="audio-alert-base"></span></span><input id="audio-alert" type="range" min="0" max="100" step="1" value="33"/><output id="audio-alert-value">33%</output></div>
++    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioMedia"></b><span id="audio-media-base"></span></span><input id="audio-media" type="range" min="0" max="100" step="1" value="100"/><output id="audio-media-value">100%</output></div>
++    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioSiri"></b><span id="audio-speechrecognition-base"></span></span><input id="audio-speechrecognition" type="range" min="0" max="100" step="1" value="33"/><output id="audio-speechrecognition-value">33%</output></div>
++    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioCalls"></b><span id="audio-telephony-base"></span></span><input id="audio-telephony" type="range" min="0" max="100" step="1" value="33"/><output id="audio-telephony-value">33%</output></div>
+   </div>
+   <p class="foot" data-i18n="audioMixHint"></p>
+   <p id="audio-status" class="foot"></p>
+diff --git a/web/check-audio-mix.mjs b/web/check-audio-mix.mjs
+--- a/web/check-audio-mix.mjs
++++ b/web/check-audio-mix.mjs
+@@ -28,3 +28,29 @@
+ assert.equal(mix.mixPercent({ default: 150 }, 'default'), 150);
+ assert.equal(mix.mixPercent({}, 'telephony'), 100, 'unset categories keep today’s level');
+ console.log('Sound-level checks passed: base levels, percentage, caps and saved values');
++
++// UI percentages are positions on one common 0–100 scale; stored gain percentages stay compatible.
++for (const name of mix.AUDIO_CATEGORIES) {
++  assert.equal(mix.volumePercent(name, 0), 0);
++  assert.equal(mix.volumePercent(name, mix.maxPercent(name)), 100);
++  assert.equal(mix.gainPercent(name, 0), 0);
++  assert.equal(mix.gainPercent(name, 100), mix.maxPercent(name));
++  assert.equal(mix.gainPercent(name, -20), 0);
++  assert.equal(mix.gainPercent(name, 200), mix.maxPercent(name));
++  for (const gain of [0, 25, 100, 150, 300]) {
++    assert(Math.abs(mix.gainPercent(name, mix.volumePercent(name, gain)) - mix.clampPercent(name, gain)) < 1e-10);
++  }
++}
++assert.equal(Math.round(mix.volumePercent('default', 100)), 33);
++assert.equal(mix.volumePercent('default', 150), 50);
++assert.equal(mix.volumePercent('media', 100), 100);
++assert.equal(mix.gainPercent('default', 50), 150);
++const saved = mix.parseMix('{"default":100,"alert":150,"media":70,"telephony":240}');
++assert.deepEqual(saved, {default:100, alert:150, media:70, telephony:240});
++assert.equal(mix.effectiveGain(3, mix.mixPercent(saved, 'default')), 3, 'opening the new UI must not change the saved sound');
++const html = readFileSync(new URL('./index.html', import.meta.url), 'utf8');
++for (const name of mix.AUDIO_CATEGORIES) {
++  const input = html.match(new RegExp('<input id="audio-' + name + '"[^>]*>'))?.[0];
++  assert(input?.includes('min="0"') && input.includes('max="100"'), name + ' uses the same UI range');
++}
++console.log('Normalized volume scale: endpoints, roundtrip and unchanged saved gains passed');

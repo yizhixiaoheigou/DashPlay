@@ -23,7 +23,7 @@ class SetupFlowTests(unittest.TestCase):
     def answer(self, action, **fields):
         return self.page.apply('/setup-flow', dict(fields, action=action, nonce=self.page.pairing.nonce))
 
-    def until_iphone(self, internet='none', same=True):
+    def until_iphone(self, internet='none'):
         self.answer('vehicle', value='tesla')
         self.assertNotIn('value="car_hotspot"', self.page.render(''))
         self.answer('mode', value='no')
@@ -31,7 +31,10 @@ class SetupFlowTests(unittest.TestCase):
         self.answer('network', ssid='Box', password='synthetic-box')
         self.answer('internet', value=internet)
         if internet == 'phone_hotspot':
-            self.answer('uplink', ssid='Phone', password='synthetic-uplink', uplink_phone='same' if same else 'other')
+            html = self.page.render('')
+            self.assertNotIn('name=uplink_phone', html, 'which phone hosts the hotspot changes nothing')
+            self.assertIn('也可以是随身 WiFi', html)
+            self.answer('uplink', ssid='Phone', password='synthetic-uplink')
         self.answer('sound', value='no')
 
     def test_network_step_shows_at_once_while_the_scan_runs_and_its_fields_are_visible(self):
@@ -195,7 +198,8 @@ class SetupFlowTests(unittest.TestCase):
         self.answer('iphone', value='any')
         html = self.page.render('')
         self.assertIn('配置总结', html)
-        self.assertIn('未实车验证', html)
+        self.assertIn('个人热点', html)
+        self.assertIn('CarPlay 的画面和声音只在盒子与 iPhone 之间传，不经外网、不耗流量', html)
         self.assertNotIn('synthetic-uplink', html)
         self.assertNotIn('synthetic-box', html)
         self.assertFalse((self.state/'options.json').exists())
@@ -236,13 +240,54 @@ class SetupFlowTests(unittest.TestCase):
 
     def test_same_phone_uplink_keeps_wireless_preference_without_confirmation(self):
         setup_wizard.save(self.state, {'done':True,'mode':'box_hotspot','iphone':'wireless'})
-        form = {'car_internet':'phone_hotspot','uplink_phone':'same','ssid':'Phone','password':'synthetic-secret',
+        form = {'car_internet':'phone_hotspot','ssid':'Phone','password':'synthetic-secret',
                 'nonce':self.page.pairing.nonce}
         self.page.apply('/internet', form)
         self.assertEqual(self.page.setup()['iphone'], 'wireless')
+        html = self.page.render('')
+        self.assertNotIn('name=uplink_phone', html)
+        self.assertIn('不耗流量', html)
         self.assertNotIn('synthetic-secret', self.page.render(''))
         self.assertIn('Phone', self.page.render(''))
         self.page.apply('/iphone', {'iphone':'wireless','nonce':self.page.pairing.nonce})
+
+    def test_usb_internet_is_a_third_choice_only_with_a_usb_port(self):
+        setup_wizard.save(self.state, {'done':True,'mode':'box_hotspot','iphone':'wired'})
+        self.assertIn('value=usb_tether', self.page.render(''))
+        self.page.apply('/internet', {'car_internet':'usb_tether','nonce':self.page.pairing.nonce})
+        self.assertEqual(setup_wizard.options(self.state)['car_internet'], 'usb_tether')
+        self.assertFalse((self.state / 'uplink-hotspot.json').exists(), 'no hotspot name or password needed')
+        html = self.page.render('')
+        self.assertIn('打开「个人热点」', html)
+        self.assertIn('安卓手机打开「USB 网络共享」', html)
+        self.assertIn('随身 WiFi', html)
+        self.status['wired_capable'] = False
+        self.assertNotIn('value=usb_tether', self.page.render(''))
+        with self.assertRaises(ValueError):
+            self.page.apply('/internet', {'car_internet':'usb_tether','nonce':self.page.pairing.nonce})
+
+    def test_internet_settings_say_nothing_about_where_carplay_runs(self):
+        # 2026-10-31: "the cable only feeds the box, CarPlay goes wireless" was a checkbox under car internet, so
+        # moving CarPlay off the cable meant changing a network setting. The cable's CarPlay is the viewer's
+        # wired / wireless rows now; car internet only says how the box gets online.
+        setup_wizard.save(self.state, {'done':True,'mode':'box_hotspot','iphone':'any'})
+        html = self.page.render('')
+        self.assertNotIn('usb_tether_only', html)
+        self.assertNotIn('线只用来上网', html)
+        self.assertIn('USB 共享网络', html)
+        self.assertIn('连接 WiFi 热点（手机或随身 WiFi）', html)
+        self.assertNotIn('借手机热点', html)
+        # A posted leftover does not come back as an option either.
+        self.page.apply('/internet', {'car_internet':'usb_tether','usb_tether_only':'1','nonce':self.page.pairing.nonce})
+        self.assertNotIn('usb_tether_only', setup_wizard.options(self.state))
+
+    def test_tesla_without_internet_says_what_it_means(self):
+        setup_wizard.save(self.state, {'done':True,'mode':'box_hotspot','iphone':'any'})
+        (self.state / 'options.json').write_text('{"tesla": true}')
+        self.assertTrue(setup_wizard.options(self.state).get('tesla'))
+        html = self.page.render('')
+        self.assertNotIn('替特斯拉回答联网检查', html)
+        self.assertIn('不上网（特斯拉保持连接，自带音乐、地图不能用）', html)
 
     def test_capability_questions_follow_video_tree_and_back_recomputes_branch(self):
         self.answer('vehicle', value='other')

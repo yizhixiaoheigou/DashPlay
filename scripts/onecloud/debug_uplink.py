@@ -8,11 +8,19 @@ box back to its normal network. The window also ends by itself after MINUTES, or
 """
 import json
 from pathlib import Path
+import shutil
 import time
 
 MINUTES = 30
 FILE = "debug-uplink.json"   # in RUN
 HOTSPOT = "debug-hotspot.json"   # in state/
+REMOTE = ("tailscale", "tailscaled")   # not in the public images: without it nobody can log in over the phone hotspot
+SEARCH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def reachable(search=SEARCH):
+    """Whether someone helping can log in once the box is online: Tailscale is installed."""
+    return any(shutil.which(name, path=search) for name in REMOTE)
 
 
 def hotspot(state, filename=HOTSPOT):

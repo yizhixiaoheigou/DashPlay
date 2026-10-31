@@ -19,6 +19,20 @@ import time
 
 RUN = Path("/run/dashplay")
 STA_NETWORK = Path("/run/systemd/network/60-onecloud-sta.network")
+# USB shared network (iPhone ipheth, Android/MiFi rndis_host, cdc_ether, cdc_ncm), options.json car_internet "usb_tether"; sorted
+# before any image-wide match so its route stays behind the Ethernet cable (default metric 1024).
+USB_TETHER_NETWORK = Path("/run/systemd/network/05-dashplay-usb-tether.network")
+# Armbian N1 images hand every Ethernet-like device to NetworkManager (netplan renderer), which would otherwise give
+# the iPhone a default profile with the cable's priority; this profile, matched on the driver, wins (dp-0017, NM 1.52).
+USB_TETHER_PROFILE = Path("/run/NetworkManager/system-connections/dashplay-usb-tether.nmconnection")
+USB_TETHER_METRIC = 1536
+# "USB shared network": any phone or MiFi that shares its internet over USB (2026-10-31): iPhone (ipheth), Android
+# (rndis_host on most, cdc_ncm on newer ones) and USB MiFis (rndis_host or cdc_ether). All built as modules in the
+# N1/onecloud 6.12 kernel (dp-0017, CONFIG_USB_NET_RNDIS_HOST/CDCETHER/CDC_NCM=m). The iPhone's own CarPlay NCM
+# functions are cdc_ncm too; the USB bridge claims them for CarPlay or releases them, so they never take a lease.
+# The box's Ethernet adapters (r8152, asix, ...) are not listed: their own profile keeps the image's metric.
+PUBLIC_DNS = ("223.5.5.5", "1.12.12.12")
+USB_TETHER_DRIVERS = ("ipheth", "rndis_host", "cdc_ether", "cdc_ncm")
 # Second interface on the same radio for the box hotspot while the first one is a client of the car
 # hotspot (one channel shared; needs the rtw88 build from scripts/onecloud/wifi/).
 AP_VIF = "dpap0"
@@ -250,8 +264,10 @@ def parse_stations(text):
 
 
 class DebianPlatform:
-    def __init__(self, interface="", run=RUN, sta_network=STA_NETWORK):
+    def __init__(self, interface="", run=RUN, sta_network=STA_NETWORK, tether_network=USB_TETHER_NETWORK,
+                 tether_profile=USB_TETHER_PROFILE):
         self.interface, self.run, self.sta_network = interface, Path(run), Path(sta_network)
+        self.tether_network, self.tether_profile = Path(tether_network), Path(tether_profile)
         # The box hotspot runs here: the Wi-Fi interface itself, or AP_VIF next to a car-hotspot client.
         self.ap_interface = interface
         self.children = []
@@ -331,13 +347,30 @@ class DebianPlatform:
                         os.killpg(entry[1].pid, signal.SIGKILL)
                         entry[1].wait()
 
+    def check_lan_children(self):
+        """Catch immediate process exits before declaring the LAN ready.
+
+        Receiver is optional until identity is installed. Later failures remain
+        supervised; this short check is not a guarantee of a live CarPlay session.
+        """
+        time.sleep(0.25)
+        present = {name for name, _ in self.children}
+        if not {'hostapd', 'dnsmasq'} <= present:
+            raise RuntimeError('LAN processes missing')
+        for name, child in self.children:
+            if name in ('hostapd', 'dnsmasq', 'receiver') and child.poll() is not None:
+                raise RuntimeError(name + ' exited during LAN startup')
+
     def ap_ready(self):
         # hostapd's own word only. Realtek's 8821cu driver (concurrent STA + AP build) reports no channel
         # for an AP while its station interface is idle (2026-10-11), and the N1's brcmfmac reports type
         # AP with a channel as soon as hostapd starts, before it fails on an 80 MHz channel (2026-10-12):
         # iw cannot tell. The log is rewritten on every start.
+        if any(name == 'hostapd' and child.poll() is not None for name, child in self.children):
+            return False
         try:
-            return "AP-ENABLED" in (self.run / "hostapd.log").read_text(errors="replace")
+            log = (self.run / "hostapd.log").read_text(errors="replace")
+            return log.rfind('AP-ENABLED') > log.rfind('AP-DISABLED')
         except OSError:
             return False
 
@@ -520,10 +553,18 @@ class DebianPlatform:
 
     def find_hotspot(self, ssid, frequency=None, timeout=30):
         from setup_wizard import _unescape_ssid
+        began = time.monotonic()
         result = self.scan(ap=True, frequency=frequency, timeout=timeout)
-        # iw escapes UTF-8 bytes; compare decoded names, preserving meaningful spaces.
-        found = any(_unescape_ssid(name) == ssid
-                    for name in re.findall(r"^\s*SSID: ?(.*)$", result.stdout, re.M))
+        # iw escapes UTF-8 bytes; compare decoded names, preserving meaningful spaces. Cached results from
+        # earlier scans are skipped (see phone_hotspot_frequency): a stale hit would take the AP down to join.
+        fresh_ms = (time.monotonic() - began + 1) * 1000
+        found = False
+        for block in re.split(r"^BSS ", result.stdout, flags=re.M)[1:] or [result.stdout]:
+            age = re.search(r"^\s*last seen: (\d+) ms ago", block, re.M)
+            freq = re.search(r"^\s*freq: (\d+)", block, re.M)
+            if age and int(age[1]) > fresh_ms or frequency and freq and int(freq[1]) != int(frequency):
+                continue
+            found = found or any(_unescape_ssid(name) == ssid for name in re.findall(r"^\s*SSID: ?(.*)$", block, re.M))
         return result.returncode == 0, found, result.stderr
 
     def unique_wifi_address(self):
@@ -660,7 +701,8 @@ class DebianPlatform:
             return False
         return hostapd.poll() is None
 
-    def start_dhcp(self, address, portal, names=(), query_log=None, upstream=None, router=False):
+    def start_dhcp(self, address, portal, names=(), query_log=None, upstream=None, router=False,
+                   upstream_file=None):
         """names: answered with the box's address on its hotspot (the owner's own domain, so that a car without
         internet finds it, 2026-10-15); every other name is REFUSED, which sends a resolver on to its next server.
         router: hand out the box as default gateway with those names (Tesla offline checks, supervisor.hotspot_router)."""
@@ -672,7 +714,10 @@ class DebianPlatform:
                        (f"--address=/{name}/{address.ip}", f"--local=/{name}/")]
         # First-run setup only: a router and a DNS server that answers every name with the box make
         # phones detect a captive portal and open the setup page by themselves.
-        if upstream:
+        if upstream_file is not None:
+            dns = ["--port=53", "--no-hosts", f"--resolv-file={upstream_file}", *local_names,
+                   f"--dhcp-option=3,{address.ip}" if router else "--dhcp-option=3", f"--dhcp-option=6,{address.ip}"]
+        elif upstream:
             dns = ["--port=53", "--no-resolv", "--no-hosts", f"--server={upstream}", "--server=223.5.5.5",
                    *local_names,
                    f"--dhcp-option=3,{address.ip}", f"--dhcp-option=6,{address.ip}"]
@@ -697,6 +742,108 @@ class DebianPlatform:
                                 capture_output=True, text=True, check=True, timeout=5)
         routes = json.loads(result.stdout)
         return next((str(ipaddress.IPv4Address(route['gateway'])) for route in routes if route.get('gateway')), None)
+
+    @property
+    def phone_resolv(self):
+        """Upstream resolvers for the hotspot's dnsmasq (--resolv-file). dnsmasq reads it as "nobody", and the run
+        directory is 0700 (the service's umask), so it lives beside it ("/run/dashplay-dns"): inside, every forwarded
+        name was REFUSED (dp-0017, 2026-10-30). Only public resolver addresses."""
+        return self.run.with_name(self.run.name + '-dns') / 'phone-resolv.conf'
+
+    def set_phone_dns(self, gateway):
+        """dnsmasq polls this file: upstream changes never restart DHCP or the LAN."""
+        servers = ([str(ipaddress.IPv4Address(gateway))] if gateway else []) + list(PUBLIC_DNS)
+        path = self.phone_resolv
+        text = ''.join(f'nameserver {server}\n' for server in dict.fromkeys(servers))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.chmod(0o755)
+        if path.exists() and path.read_text() == text and path.stat().st_mode & 0o004:
+            return
+        temporary = path.with_suffix('.tmp')
+        temporary.write_text(text)
+        temporary.chmod(0o644)
+        temporary.replace(path)
+
+    def phone_hotspot_frequency(self, ssid, frequency=None, timeout=5):
+        """One bounded scan, retaining each SSID's frequency (including escaped UTF-8).
+        frequency: scan only that channel (the phone hotspot's last one, phone_uplink.HotspotSearch)."""
+        from setup_wizard import _unescape_ssid
+        subprocess.run(['ip', 'link', 'set', 'dev', self.interface, 'up'],
+                       check=True, capture_output=True, timeout=5)
+        began = time.monotonic()
+        result = self.scan(frequency=frequency, timeout=timeout) if frequency else self.scan(timeout=timeout)
+        if result.returncode:
+            raise OSError('station scan unavailable')
+        # iw also prints the kernel's cached results: a scan of 5180 listed a hotspot last seen on 5745 9 s earlier
+        # (dp-0017, 2026-10-30). Only what this scan saw counts, or a switched-off hotspot is chased every 10 s.
+        fresh_ms = (time.monotonic() - began + 1) * 1000
+        found = []
+        for block in re.split(r'^BSS ', result.stdout, flags=re.M)[1:]:
+            name = re.search(r'^\s*SSID: ?(.*)$', block, re.M)
+            freq = re.search(r'^\s*freq: (\d+)', block, re.M)
+            strength = re.search(r'^\s*signal: (-?[\d.]+)', block, re.M)
+            age = re.search(r'^\s*last seen: (\d+) ms ago', block, re.M)
+            if age and int(age[1]) > fresh_ms or frequency and freq and int(freq[1]) != int(frequency):
+                continue
+            if name and freq and _unescape_ssid(name[1]) == ssid:
+                found.append((float(strength[1]) if strength else -1000, int(freq[1])))
+        return max(found)[1] if found else None
+
+    def start_phone_station(self, hotspot, frequency):
+        """Start association/DHCP without waiting for either; never touch the AP address.
+
+        Restrict association as well as scans to the selected frequency, so wpa_supplicant
+        cannot silently roam the shared radio onto another channel during CarPlay.
+        """
+        self.stop_phone_station()
+        frequency = int(frequency)
+        network = '\n'.join(wpa_network_lines(hotspot['ssid'], hotspot['passphrase']))
+        conf = self.run / 'wpa.conf'
+        conf.write_text(f'ctrl_interface={self.run}/wpa\nnetwork={{\n{network}\n'
+                        f' key_mgmt=WPA-PSK SAE\n ieee80211w=1\n scan_freq={frequency}\n'
+                        f' freq_list={frequency}\n}}\n')
+        conf.chmod(0o600)
+        self.sta_network.write_text(f'[Match]\nName={self.interface}\n[Network]\nDHCP=ipv4\n'
+                                    '[DHCPv4]\nRouteMetric=2048\n')
+        self.sta_network.chmod(0o644)
+        subprocess.run(['ip', 'link', 'set', 'dev', self.interface, 'up'],
+                       check=True, capture_output=True, timeout=5)
+        self.start('wpa_supplicant', ['wpa_supplicant', '-D', 'nl80211', '-i', self.interface, '-c', str(conf)])
+        self.iw('set', 'power_save', 'off')
+        for argv in (['networkctl', 'reload'], ['networkctl', 'reconfigure', self.interface]):
+            subprocess.run(argv, check=True, capture_output=True, timeout=5)
+
+    def stop_phone_station(self):
+        self.stop_child('wpa_supplicant')
+        # Removing the .network file alone can leave networkd's old DHCP client alive.
+        # Explicitly disable it without bringing the shared radio or AP down.
+        self.sta_network.write_text(f'[Match]\nName={self.interface}\n[Network]\n'
+                                    'DHCP=no\nLinkLocalAddressing=no\n')
+        self.sta_network.chmod(0o644)
+        for argv in (['networkctl', 'reload'], ['networkctl', 'reconfigure', self.interface]):
+            subprocess.run(argv, check=True, capture_output=True, timeout=5)
+        subprocess.run(['ip', '-4', 'route', 'flush', 'dev', self.interface],
+                       check=True, capture_output=True, timeout=5)
+        subprocess.run(['ip', '-4', 'addr', 'flush', 'dev', self.interface],
+                       check=True, capture_output=True, timeout=5)
+
+    def phone_link(self):
+        result = subprocess.run(['iw', 'dev', self.interface, 'link'],
+                                check=True, capture_output=True, text=True, timeout=3)
+        freq = re.search(r'freq: (\d+)', result.stdout)
+        signal_dbm = re.search(r'signal: (-?\d+)', result.stdout)
+        return {'connected': 'Connected to' in result.stdout,
+                'frequency': int(freq[1]) if freq else None,
+                'signal_dbm': int(signal_dbm[1]) if signal_dbm else None}
+
+    def phone_station_address(self):
+        result = subprocess.run(['ip', '-j', '-4', 'addr', 'show', 'dev', self.interface],
+                                check=True, capture_output=True, text=True, timeout=3)
+        for item in json.loads(result.stdout):
+            for address in item.get('addr_info', []):
+                if address.get('scope') == 'global':
+                    return ipaddress.ip_interface(f"{address['local']}/{address['prefixlen']}")
+        return None
 
     def default_route_devices(self):
         """Interfaces holding an IPv4 default route; the cable (anything but the Wi-Fi) may be the uplink."""
@@ -776,6 +923,175 @@ class DebianPlatform:
                 ([], ['FORWARD', '!', '-i', 'ap0', '-o', 'ap0', '-d', str(network),
                       '-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED',
                       '-m', 'comment', '--comment', 'dashplay-phone-uplink', '-j', 'ACCEPT'])]
+
+    def usb_tether_rules(self, network):
+        """Box hotspot clients out through whatever holds the default route (the iPhone's USB interface in the car,
+        the cable at home), never back onto the hotspot itself."""
+        ap, tag = self.ap_interface, ['-m', 'comment', '--comment', 'dashplay-usb-tether']
+        return [(['-t', 'nat'], ['POSTROUTING', '-s', str(network), '!', '-o', ap, *tag, '-j', 'MASQUERADE']),
+                ([], ['FORWARD', '-i', ap, '!', '-o', ap, '-s', str(network), *tag, '-j', 'ACCEPT']),
+                ([], ['FORWARD', '!', '-i', ap, '-o', ap, '-d', str(network),
+                      '-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED', *tag, '-j', 'ACCEPT'])]
+
+    def begin_usb_tether(self, network):
+        """The fast half: the marker the receiver's USB bridge reads at start, and the journal stop_usb_sharing
+        needs. The rest (manager profiles, forwarding, NAT) is [finish_usb_tether], run after the receiver is
+        up so CarPlay is not held back by it (C5 vs C1 cold boot, 2026-10-31: 5 s)."""
+        from setup_wizard import save_json
+        self.stop_usb_sharing()
+        forward = subprocess.run(['sysctl', '-n', 'net.ipv4.ip_forward'], capture_output=True, text=True,
+                                 timeout=5).stdout.strip() or '0'
+        save_json(self.run / 'usb-tether.json', {'network': str(network), 'forward': forward,
+                                                 'interface': self.ap_interface})
+        (self.run / 'usb-tether').write_text('on\n')
+
+    def finish_usb_tether(self):
+        """Profiles, forwarding and NAT for the sharing [begin_usb_tether] announced."""
+        try:
+            saved = json.loads((self.run / 'usb-tether.json').read_text())
+            network = ipaddress.ip_network(saved['network'])
+        except (OSError, ValueError, KeyError):
+            raise ValueError('USB 共享网络未准备好，请稍后重试。') from None
+        self._usb_tether_rules_for(network)
+
+    def enable_usb_tether(self, network):
+        """Use the iPhone's internet over the CarPlay cable and share it on the box hotspot.
+
+        The marker tells iphone-usb-bridge.py to leave the ipheth interface bound (it releases it otherwise);
+        systemd-networkd then takes the lease and the route when the iPhone is plugged in and drops them when it
+        is unplugged, so nothing here follows the cable. Journalled in usb-tether.json for stop_usb_sharing."""
+        self.begin_usb_tether(network)
+        self._usb_tether_rules_for(network)
+
+    def _usb_tether_rules_for(self, network):
+        # Only the manager the image runs: with both, NetworkManager and networkd each took a lease on the
+        # iPhone's interface (two addresses, dp-0017 2026-10-30). networkd also runs on the N1 images (the
+        # car-hotspot client), so ask NetworkManager.
+        if not self.network_manager_running():
+            self.tether_network.parent.mkdir(parents=True, exist_ok=True)
+            # UseDNS=no keeps the phone's own resolver out; DNS= gives the box's own resolver (systemd-resolved)
+            # public servers, or it resolved nothing at all when the cable was the only uplink (dp-0017,
+            # 2026-10-31). The hotspot's dnsmasq gets the same list through phone-resolv.
+            self.tether_network.write_text(f'[Match]\nDriver={" ".join(USB_TETHER_DRIVERS)}\n'
+                                           f'[Network]\nDHCP=ipv4\nIPv6AcceptRA=no\nDNS={" ".join(PUBLIC_DNS)}\n'
+                                           f'[DHCPv4]\nRouteMetric={USB_TETHER_METRIC}\nUseDNS=no\n')
+            self.tether_network.chmod(0o644)
+        # multi-connect=3 (multiple): one profile is otherwise active on one device only; with the iPhone on
+        # eth1 a Xiaomi plugged into the other port stayed "disconnected" on usb0 (dp-0017 2026-10-31).
+        self.tether_profile.parent.mkdir(parents=True, exist_ok=True)
+        self.tether_profile.write_text('[connection]\nid=dashplay-usb-tether\ntype=ethernet\nautoconnect=true\nmulti-connect=3\n'
+                                       f'autoconnect-priority=100\n[match]\ndriver={";".join(USB_TETHER_DRIVERS)};\n'
+                                       f'[ipv4]\nmethod=auto\nroute-metric={USB_TETHER_METRIC}\nignore-auto-dns=true\n'
+                                       f'dns={";".join(PUBLIC_DNS)};\n'
+                                       '[ipv6]\nmethod=ignore\n')
+        self.tether_profile.chmod(0o600)   # NetworkManager ignores keyfiles others can read
+        self.reload_network_managers()
+        self.reapply_tether_links()
+        subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=1'], check=True, capture_output=True, timeout=5)
+        for table, rule in self.usb_tether_rules(network):
+            subprocess.run(['iptables', *table, '-I', *rule], check=True, capture_output=True, timeout=5)
+        self.set_phone_dns(None)   # public resolvers; the hotspot's dnsmasq reads phone_resolv
+        (self.run / 'usb-tether').write_text('on\n')
+
+    def wired_carrier(self):
+        """True when a wired interface is up with a cable in it.
+
+        At boot the cable's DHCP lease can arrive seconds after dashplay starts, so a route-only check said "no
+        cable" and the box joined the phone hotspot anyway, dragging its own hotspot onto 2.4 GHz while the
+        cable was the real uplink (C8 cold boot, dp-0017 2026-10-31). Carrier is there immediately.
+        """
+        try:
+            entries = sorted(Path('/sys/class/net').iterdir())
+        except OSError:
+            return False
+        for entry in entries:
+            name = entry.name
+            if name in (self.interface, self.ap_interface, 'lo') or name.startswith(('wl', 'ap', 'docker', 'veth', 'br-')):
+                continue
+            try:
+                if (entry / 'carrier').read_text().strip() == '1':
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def reapply_tether_links(self):
+        """Push a rewritten profile onto links that are already up.
+
+        A manager "reload" only re-reads the files; a link that is already active keeps the settings it was
+        activated with, so the new DNS never reached the box's own resolver after a service restart with the
+        cable plugged in (dp-0017, 2026-10-31). Both commands are no-ops when that manager is not running.
+        """
+        try:
+            links = sorted(Path('/sys/class/net').iterdir())
+        except OSError:
+            return
+        for entry in links:
+            try:
+                driver = (entry / 'device' / 'driver').resolve().name
+            except OSError:
+                continue
+            if driver not in USB_TETHER_DRIVERS:
+                continue
+            for command in (['nmcli', 'device', 'reapply', entry.name],
+                            ['networkctl', 'reconfigure', entry.name]):
+                try:
+                    subprocess.run(command, capture_output=True, timeout=15)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+
+    @staticmethod
+    def network_manager_running():
+        try:
+            return subprocess.run(['systemctl', 'is-active', '--quiet', 'NetworkManager'],
+                                  capture_output=True, timeout=10).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    @staticmethod
+    def reload_network_managers():
+        for command in (['networkctl', 'reload'], ['nmcli', 'connection', 'reload']):
+            try:
+                subprocess.run(command, capture_output=True, timeout=20)
+            except (OSError, subprocess.SubprocessError):
+                pass   # that manager is not installed
+
+    def disable_usb_tether(self, ipheth=Path('/sys/bus/usb/drivers/ipheth')):
+        """The option is off: stop sharing, release a bound iPhone hotspot interface, then drop the profiles.
+
+        Release first: without our profile NetworkManager gives any new Ethernet-like device a default profile
+        with the cable's priority ("Wired connection 2", dp-0017 2026-10-31)."""
+        self.stop_usb_sharing()
+        if not (self.tether_network.exists() or self.tether_profile.exists()):
+            return
+        for interface in sorted(ipheth.glob('[0-9]*-*')) if ipheth.is_dir() else []:
+            try:
+                (ipheth / 'unbind').write_text(interface.name)
+            except OSError:
+                pass
+        self.tether_network.unlink(missing_ok=True)
+        self.tether_profile.unlink(missing_ok=True)
+        self.reload_network_managers()
+
+    def stop_usb_sharing(self):
+        """Undo the hotspot's sharing (NAT, forwarding, the bridge marker); the option's profiles stay. On every
+        service stop: the iPhone stays plugged in, and a dropped profile would leave it to NetworkManager's
+        default one (see disable_usb_tether)."""
+        (self.run / 'usb-tether').unlink(missing_ok=True)
+        path = self.run / 'usb-tether.json'
+        try:
+            saved = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return
+        ap, self.ap_interface = self.ap_interface, saved.get('interface') or self.ap_interface
+        try:
+            for table, rule in reversed(self.usb_tether_rules(ipaddress.ip_network(saved['network']))):
+                subprocess.run(['iptables', *table, '-D', *rule], capture_output=True, timeout=5)
+        finally:
+            self.ap_interface = ap
+        subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=' + str(saved.get('forward', '0'))],
+                       capture_output=True, timeout=5)
+        path.unlink(missing_ok=True)
 
     def enable_phone_nat(self, network):
         from setup_wizard import save_json

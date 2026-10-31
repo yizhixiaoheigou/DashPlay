@@ -1,0 +1,158 @@
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+index f2325cd..3e026b7 100644
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -151,10 +151,18 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+ 
+     /** The viewer's box settings: paired phones with their BlueZ names and who is using CarPlay now. */
+     fun phonesJson(): String {
+-        if (presenceHelper == null) return PhoneList.body(supported = false, raw = null)
++        // The iPhone on the cable is not a Bluetooth pairing, so the presence helper never lists it: name it here,
++        // or the settings showed no phone at all while it was in use (N1, 2026-10-31).
++        val cable = if (wiredSessionActive()) wiredName ?: "iPhone" else null
++        if (presenceHelper == null) {
++            return if (cable != null) PhoneList.body(supported = true, raw = null, cable = cable)
++            else PhoneList.body(supported = false, raw = null)
++        }
+         // BlueZ busy or not yet up: hide the section instead of showing an empty, wrong list.
+-        val raw = presenceResult("devices") ?: return PhoneList.body(supported = false, raw = null)
+-        return PhoneList.body(supported = true, raw = raw)
++        val raw = presenceResult("devices")
++            ?: return if (cable != null) PhoneList.body(supported = true, raw = null, cable = cable)
++            else PhoneList.body(supported = false, raw = null)
++        return PhoneList.body(supported = true, raw = raw, cable = cable)
+     }
+ 
+     /**
+@@ -310,6 +318,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+ 
+         override fun onDeviceInfo(session: AirPlaySession, info: AirPlayDeviceInfo) {
+             log.info("iPhone connected name={} model={} deviceId={}", info.name, info.model, info.deviceId)
++            if (session === wiredSession) wiredName = info.name
+             hub.setSessionState(true, info.name)
+         }
+ 
+@@ -396,6 +405,8 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+     /** An iPhone on the USB cable (WiredBootstrap): no wireless invitations until it is unplugged. */
+     @Volatile private var cablePhone = false
+     @Volatile private var wiredSession: AirPlaySession? = null
++    /** The wired iPhone's name from its CarPlay device info (for the settings' phone list). */
++    @Volatile private var wiredName: String? = null
+ 
+     /** The iPhone on the cable has opened CarPlay (AirPlay over its NCM link) and is the active session. */
+     fun wiredSessionActive(): Boolean = wiredSession.let { it != null && it === activeSession }
+diff --git a/server/src/main/kotlin/com/playport/server/WebHub.kt b/server/src/main/kotlin/com/playport/server/WebHub.kt
+index 63c76d7..5d4688e 100644
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -94,7 +94,12 @@ data class PhoneEntry(
+ )
+ 
+ @Serializable
+-data class PhoneListBody(val supported: Boolean = false, val phones: List<PhoneEntry> = emptyList())
++data class PhoneListBody(
++    val supported: Boolean = false,
++    val phones: List<PhoneEntry> = emptyList(),
++    /** The iPhone using CarPlay over the USB cable (its name), or null: shown in use, nothing can be switched. */
++    val cable: String? = null,
++)
+ 
+ @Serializable
+ data class PhoneSwitchRequest(val address: String = "")
+@@ -124,6 +129,11 @@ object PhoneList {
+ 
+     fun body(supported: Boolean, raw: String?): String =
+         json.encodeToString(PhoneListBody.serializer(), PhoneListBody(supported, parse(raw)))
++
++    /** As [body], with the wired iPhone (its CarPlay name, bounded like the BlueZ ones) when one is in use. */
++    fun body(supported: Boolean, raw: String?, cable: String?): String =
++        json.encodeToString(PhoneListBody.serializer(), PhoneListBody(supported, parse(raw),
++            cable?.trim()?.take(64)?.ifBlank { "iPhone" }))
+ }
+ 
+ @Serializable
+diff --git a/server/src/test/kotlin/com/playport/server/PhoneListTest.kt b/server/src/test/kotlin/com/playport/server/PhoneListTest.kt
+index 5f0a5f6..54d7756 100644
+--- a/server/src/test/kotlin/com/playport/server/PhoneListTest.kt
++++ b/server/src/test/kotlin/com/playport/server/PhoneListTest.kt
+@@ -31,6 +31,13 @@ class PhoneListTest {
+         assertTrue(body.contains("\"phones\":[]"))
+     }
+ 
++    @Test fun theWiredIPhoneIsListedWithItsName() {
++        val body = PhoneList.body(supported = true, raw = "[]", cable = "Alex 的 iPhone")
++        assertTrue(body.contains("\"cable\":\"Alex 的 iPhone\""))
++        assertTrue(PhoneList.body(supported = true, raw = "[]", cable = "  ").contains("\"cable\":\"iPhone\""))
++        assertTrue(PhoneList.body(supported = true, raw = "[]", cable = null).contains("\"cable\":null"))
++    }
++
+     @Test fun theAddressIsWhatTheSwitchUses() {
+         assertTrue(PhoneList.ADDRESS.matches(PhoneList.normalize(" 02:00:00:00:00:0a ")))
+         assertFalse(PhoneList.ADDRESS.matches("02:00:00:00:00"))
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+index e34aefd..f637129 100644
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -8,6 +8,7 @@ const messages = {
+   deviceSwitching: ['正在切换到「{name}」，现在这部会先断开 CarPlay…', 'Switching to “{name}”; the current CarPlay ends first…'],
+   deviceUnsupported: ['这部盒子不能切换手机。', 'This box cannot switch phones.'], deviceNotPaired: ['这部手机没有配对，请先在盒子的设置页添加。', 'This phone is not paired; add it on the box settings page.'],
+   deviceCable: ['现在用数据线连着 CarPlay，拔掉数据线后再切换。', 'CarPlay is using the cable; unplug it before switching.'],
++  deviceCableDetail: ['数据线连接', 'On the USB cable'],
+   deviceBusy: ['正在切换，请稍等。', 'A switch is already in progress.'], deviceFail: ['切换失败，请稍后重试。', 'Switch failed. Try again later.'],
+   deviceNoPhones: ['还没有配对的手机。', 'No paired phones yet.'],
+   playerSettings: ['画面与声音', 'Display and sound'], displaySettings: ['画面参数', 'Display settings'], performanceMode: ['高清画质', 'Sharper picture'], performanceModeHint: ['开：按 iPhone 能给的最清楚尺寸解码，再缩到窗口里，更清楚但更吃车机性能，画面卡就关掉；关：按窗口实际尺寸（最小宽度 720），更省但可能偏软', 'On: decode the sharpest size the iPhone offers and shrink it into the window, sharper but heavier (turn it off if the picture stutters); off: the window own size (min width 720), lighter but may look soft'], customSize: ['自定义分辨率', 'Custom resolution'], customSizeHint: ['关：跟随窗口。开：在下面「画面参数」里填宽度、高度，点「应用并重连」生效', 'Off: follow the window. On: enter width and height under Display settings below, then Apply and reconnect'], language: ['语言', 'Language'],
+diff --git a/web/src/main.ts b/web/src/main.ts
+index 6749bdd..b59e1e3 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -94,17 +94,41 @@ function render() {
+ // The box's paired phones, for switching CarPlay without touching the Wi-Fi: the current phone stays
+ // connected to the hotspot, only its CarPlay session ends and the chosen phone is invited over Bluetooth.
+ interface BoxPhone { address: string; name: string; active?: boolean; last?: boolean; }
+-interface BoxPhones { supported?: boolean; phones?: BoxPhone[]; }
++interface BoxPhones { supported?: boolean; phones?: BoxPhone[]; cable?: string | null; }
+ const devicesBlock = el('devices-block');
+ const deviceList = el('device-list');
+ const devicesStatus = el('devices-status');
+ let boxPhones: BoxPhone[] = [];
++/** The iPhone using CarPlay over the cable (its name), or null. Not a Bluetooth pairing; nothing switches meanwhile. */
++let cablePhone: string | null = null;
+ let devicesLoading = false;
+ let switchingTo: string | null = null;
+ let deviceNotice = '';
+ const deviceAddress = (phone: BoxPhone) => `蓝牙 …${phone.address.slice(-5)}`;
+ function renderDevices() {
+   deviceList.textContent = '';
++  if (cablePhone) {
++    const row = document.createElement('div'); row.className = 'cell on';
++    const main = document.createElement('span'); main.className = 'main';
++    const name = document.createElement('b'); name.textContent = cablePhone;
++    const detail = document.createElement('span'); detail.textContent = t('deviceCableDetail');
++    main.append(name, detail);
++    const value = document.createElement('span'); value.className = 'value'; value.textContent = t('deviceInUse');
++    row.append(main, value); deviceList.append(row);
++    // The paired phones stay listed, as information only: switching waits until the cable is unplugged.
++    for (const phone of boxPhones) {
++      if (phone.name === cablePhone) continue;
++      const other = document.createElement('div'); other.className = 'cell';
++      const otherMain = document.createElement('span'); otherMain.className = 'main';
++      const otherName = document.createElement('b'); otherName.textContent = phone.name || phone.address;
++      const otherDetail = document.createElement('span'); otherDetail.textContent = deviceAddress(phone);
++      otherMain.append(otherName, otherDetail);
++      const otherValue = document.createElement('span'); otherValue.className = 'value'; otherValue.textContent = t('deviceIdle');
++      other.append(otherMain, otherValue); deviceList.append(other);
++    }
++    devicesStatus.textContent = deviceNotice || t('deviceCable');
++    return;
++  }
+   if (!boxPhones.length) {
+     const row = document.createElement('div'); row.className = 'cell';
+     const main = document.createElement('span'); main.className = 'main';
+@@ -148,6 +172,7 @@ async function loadDevices() {
+     const body = await r.json() as BoxPhones;
+     if (!body.supported) { devicesBlock.hidden = true; return; }
+     boxPhones = Array.isArray(body.phones) ? body.phones : [];
++    cablePhone = typeof body.cable === 'string' && body.cable ? body.cable : null;
+     devicesBlock.hidden = false;
+     renderDevices();
+   } catch {

@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -57,12 +58,22 @@ def options(state):
     except (OSError, ValueError):
         value = {}
     value = dict(value) if isinstance(value, dict) else {}
-    if value.get("car_internet") not in ("none", "phone_hotspot"):
+    # usb_tether (2026-10-30): the iPhone on the CarPlay cable shares its mobile data (platform_debian.enable_usb_tether).
+    if value.get("car_internet") not in ("none", "phone_hotspot", "usb_tether"):
         value["car_internet"] = "none"
     # The identity is for explanatory text; both phones may use wireless CarPlay.
     if value.get("uplink_phone") not in ("same", "other"):
         value["uplink_phone"] = "same"
     return value
+
+
+def answers_own_name(chosen, ddns):
+    """Whether the box answers its own domain on its own hotspot (supervisor.hotspot_names, phone_uplink). On unless
+    the owner turned it off ("own_name_on_hotspot": false, settings page, 2026-10-29); always for Tesla mode and for a
+    deSEC name. The older "local_dns" is not read: older pages saved it false with every car or sound group."""
+    if (ddns or {}).get("provider") == "desec" or chosen.get("tesla"):
+        return True
+    return chosen.get("own_name_on_hotspot") is not False
 
 
 def tesla_offline(setup, chosen, online=False):
@@ -159,16 +170,22 @@ def load(state: Path):
     return value
 
 
+_SAVING = threading.Lock()
+
+
 def save_json(path: Path, value):
-    """Replace a small state file so that a power cut leaves the old or the new content."""
-    temporary = path.with_suffix(".tmp")
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as out:
-        json.dump(value, out)
-        out.flush()
-        os.fsync(out.fileno())
-    temporary.replace(path)
-    os.sync()   # the root fs commits only every 120 s; setup progress must survive switching the car off
+    """Replace a small state file (0600) so that a power cut leaves the old or the new content. The settings page
+    saves through here too (settings_page._save): requests run in threads, so one save at a time, each with its own
+    temporary file (a double-click on save wrote both into one .tmp and failed the second rename; review 2026-10-12)."""
+    with _SAVING:
+        fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as out:
+            json.dump(value, out)
+            out.flush()
+            os.fsync(out.fileno())
+        Path(name).replace(path)
+        os.sync()   # the root fs commits only every 120 s; saved settings must survive switching the car off
 
 
 def save(state: Path, value):

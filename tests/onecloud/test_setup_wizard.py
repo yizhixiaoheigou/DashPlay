@@ -9,6 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts/onecloud'))
 import setup_wizard
 import mdns_name
+import settings_page
 from pairing_window import save_json, read_json
 from settings_page import SettingsPage
 
@@ -168,36 +169,31 @@ class WizardPageTests(unittest.TestCase):
         setup_wizard.save(self.state, {"done": False})  # legacy unfinished setup
 
     def choose(self, mode):
-        return self.page.apply('/setup', {'action': 'mode', 'mode': mode, 'nonce': self.nonce})
+        """The way of use as an unfinished setup holds it before its network is set (the old step 1 is gone)."""
+        setup_wizard.save(self.state, {'done': False, 'mode': mode})
 
     def set_up_done(self, mode='car_hotspot'):
         (self.state / 'car-hotspot.json').write_text('{"ssid": "xiaomi", "passphrase": "12345678"}')
         setup_wizard.save(self.state, {'done': True, 'mode': mode})
 
-    def test_step_one_offers_three_ways_of_use(self):
-        html = self.page.render('')
-        self.assertIn('第 1 步，共 3 步', html)
-        for text in ('方式一：车机热点', '方式二：随身 WiFi', '方式三：车机连盒子热点', '0.12 Mbit/s', '不能上网'):
-            self.assertIn(text, html)
-        self.assertNotIn('连接方式（测试）', html)
-        with self.assertRaises(ValueError):
-            self.choose('relay')
-        with self.assertRaises(ValueError):
-            self.page.apply('/setup', {'action': 'mode', 'mode': 'mifi', 'nonce': 'bad'})
-        with self.assertRaises(ValueError):   # not the hotspot step yet
-            self.page.apply('/setup', {'action': 'car', 'ssid': 'xiaomi', 'password': '12345678', 'nonce': self.nonce})
-        with self.assertRaises(ValueError):
-            self.page.apply('/netmode', {'mode': 'relay', 'nonce': self.nonce})
-        self.assertEqual(self.choose('mifi'), '')
-        self.assertEqual(setup_wizard.load(self.state), {'done': False, 'mode': 'mifi', 'iphone': 'any'})
+    def test_an_unfinished_older_setup_continues_in_first_run_setup(self):
+        # The three-step setup (way of use -> network -> iPhone) gave way to one question per page on 2026-10-15;
+        # its first two pages are gone. A box left half way, before its network was set, asks again from the start.
+        for leftover in ({'done': False}, {'done': False, 'mode': 'box_hotspot'}):
+            setup_wizard.save(self.state, leftover)
+            html = self.page.render('')
+            self.assertIn('什么车', html)
+            self.assertNotIn('第 1 步，共 3 步', html)
+            with self.assertRaises(ValueError):
+                self.page.apply('/setup', {'action': 'mode', 'mode': 'mifi', 'nonce': self.nonce})
+            with self.assertRaises(ValueError):
+                self.page.apply('/setup', {'action': 'hotspot', 'ssid': 'Box', 'password': 'boxpass1', 'nonce': self.nonce})
+        self.assertEqual(self.changes, [])   # nothing on the air changes until a network is set
+        # Joining a hotspot (car or MiFi) still goes through its own page: the box shows what it tried.
+        self.choose('mifi')
         html = self.page.render('')
         self.assertIn('<h1>连接随身 WiFi</h1>', html)
         self.assertIn('选取随身 WiFi', html)
-        self.assertIn('第 2 步，共 3 步', html)
-        self.assertIn('value=back', html)
-        self.page.apply('/setup', {'action': 'back', 'nonce': self.nonce})
-        self.assertIn('第 1 步，共 3 步', self.page.render(''))
-        self.assertEqual(self.changes, [])   # nothing on the air changes until a network is set
 
     def test_music_and_calls_can_go_over_the_car_bluetooth(self):
         # Found in a Tesla (2026-10-14), for any car paired with the iPhone: the choice lands in state/options.json
@@ -207,15 +203,23 @@ class WizardPageTests(unittest.TestCase):
         self.set_up_done()
         (self.state / 'options.json').write_text(json.dumps({'idle_release': 0}))
         html = self.page.render('')
-        self.assertIn('音乐走车机蓝牙', html)
-        self.assertIn('通话与 Siri 走车机蓝牙', html)
+        self.assertIn('name="audio_route_navigation"', html)
+        self.assertNotIn('name="audio_route_main"', html, 'the media/Siri/calls choice changed nothing on the iPhone')
         self.assertEqual(car_audio_args(self.state), [])
         self.page.apply('/audio', {'car_music': 'on', 'nonce': self.nonce})
         self.assertEqual(json.loads((self.state / 'options.json').read_text()),
-                         {'idle_release': 0, 'tesla': False, 'car_music': True, 'car_voice': False, 'local_dns': False})
+                         {'idle_release': 0, 'tesla': False, 'car_music': True, 'car_voice': False})
         self.assertEqual(car_audio_args(self.state), ['--car-music'])
         self.assertEqual(self.changes, ['car audio changed'])
-        self.assertIn('name=car_music value=on checked', self.page.render(''))
+        # The sound group changes the receiver's options only: the receiver restarts, Wi-Fi stays (2026-10-29).
+        message = self.page.apply('/audio', {'scope': 'sound', 'car_voice': 'on', 'nonce': self.nonce})
+        self.assertEqual(self.changes[-1], 'receiver options changed')
+        self.assertIn('WiFi 不断', message)
+        setup_wizard.save(self.state, {'done': True, 'mode': 'box_hotspot', 'box': True})
+        self.page.apply('/audio', {'scope': 'car', 'tesla': 'on', 'nonce': self.nonce})
+        self.assertEqual(self.changes[-1], 'car audio changed', 'Tesla mode moves the hotspot: a full restart')
+        self.assertIn('name="audio_route_navigation"><option value="carplay" selected>', self.page.render(''),
+                      'Tesla mode keeps the sound on CarPlay; the iPhone Control Center picks the Tesla')
         self.page.apply('/audio', {'car_voice': 'on', 'nonce': self.nonce})
         self.assertEqual(car_audio_args(self.state), ['--car-voice'])
         with self.assertRaises(ValueError):
@@ -235,27 +239,116 @@ class WizardPageTests(unittest.TestCase):
         # Saved again unchanged: no talk of a new address.
         self.assertNotIn('网段', self.page.apply('/audio', {'tesla': 'on', 'car_music': 'on', 'nonce': self.nonce}))
 
-    def test_box_answers_its_own_domain_on_its_hotspot_when_chosen(self):
+    def test_tesla_mode_leaves_the_sound_switch_alone(self):
+        # 2026-10-31: the sound output is one switch (CarPlay keeps its sound / none through CarPlay); turning Tesla
+        # on does not change it. The page still plays Tesla's way (prompt boost, no media session).
+        setup_wizard.save(self.state, {'done': True, 'mode': 'box_hotspot', 'box': True})
+        self.page.apply('/audio', {'scope': 'sound', 'audio_route_navigation': 'carplay', 'nonce': self.nonce})
+        self.page.apply('/audio', {'scope': 'car', 'tesla': 'on', 'nonce': self.nonce})
+        self.assertEqual(self.page.sound_routes()['navigation'], 'carplay')
+        self.assertEqual(self.page.sound_routes()['media'], 'bluetooth', 'car-music page behaviour')
+        self.assertIn('控制中心', self.page.render(''))
+
+    def test_box_answers_its_own_domain_on_its_hotspot_by_default(self):
         # A car that gets no DNS of its own on the box hotspot (no internet; the Xpeng did not fall back to its
-        # LTE, 2026-10-12) still opens the own domain with the trusted certificate (2026-10-15).
+        # LTE, 2026-10-12) still opens the own domain with the trusted certificate (2026-10-15). On by default since
+        # 2026-10-29: an own domain set in this way of use is meant to open; the switch only turns it off.
         import json
         from supervisor import hotspot_names
+        name = 'mycar.duckdns.org'
         setup_wizard.save(self.state, {'done': True, 'mode': 'box_hotspot', 'box': True})
-        self.assertIn('盒子热点里解析自己的域名', self.page.render(''))
-        self.assertEqual(hotspot_names(self.state, 'mycar.duckdns.org', 'box_hotspot'), [])
-        self.page.apply('/audio', {'tesla': 'on', 'local_dns': 'on', 'nonce': self.nonce})
-        self.assertIs(json.loads((self.state / 'options.json').read_text())['local_dns'], True)
-        self.assertNotIn('name=local_dns', self.page.render(''))
-        self.assertEqual(hotspot_names(self.state, 'mycar.duckdns.org', 'box_hotspot'), list(setup_wizard.TESLA_CHECK_NAMES) + ['mycar.duckdns.org'])
+        self.assertNotIn('name=own_name_on_hotspot', self.page.render(''), 'no own domain, no switch')
+        self.assertEqual(hotspot_names(self.state, None, 'box_hotspot'), [])
+        (self.state / 'ddns.json').write_text(json.dumps({'domain': 'mycar', 'token': '0a1b2c3d-1111-2222-3333-444455556666'}))
+        # Older pages wrote local_dns=false with every save of the car or sound group: not the owner's choice.
+        (self.state / 'options.json').write_text(json.dumps({'local_dns': False}))
+        html = self.page.render('')
+        self.assertIn('name=own_name_on_hotspot value=on checked', html)
+        self.assertNotIn('>域名解析<', html)
+        self.assertEqual(hotspot_names(self.state, name, 'box_hotspot'), [name])
+        self.page.apply('/audio', {'scope': 'own_name', 'nonce': self.nonce})   # unticked
+        self.assertIs(json.loads((self.state / 'options.json').read_text())['own_name_on_hotspot'], False)
+        self.assertEqual(hotspot_names(self.state, name, 'box_hotspot'), [])
+        self.page.apply('/audio', {'scope': 'sound', 'car_music': 'on', 'nonce': self.nonce})
+        self.assertIs(json.loads((self.state / 'options.json').read_text())['own_name_on_hotspot'], False,
+                      'saving another group keeps the choice')
+        self.page.apply('/audio', {'tesla': 'on', 'scope': 'car', 'nonce': self.nonce})
+        self.assertNotIn('name=own_name_on_hotspot', self.page.render(''), 'Tesla mode always answers it')
+        self.assertEqual(hotspot_names(self.state, name, 'box_hotspot'), list(setup_wizard.TESLA_CHECK_NAMES) + [name])
         self.assertEqual(hotspot_names(self.state, None, 'box_hotspot'), list(setup_wizard.TESLA_CHECK_NAMES), 'checks without own domain')
         self.assertEqual(hotspot_names(self.state, 'mycar.duckdns.org', 'mifi'), [],
                          'a joined hotspot has its own DNS; the fallback hotspot is not where the car looks')
+
+    def test_the_own_name_switch_is_only_where_it_works(self):
+        import json
+        (self.state / 'ddns.json').write_text(json.dumps({'domain': 'mycar', 'token': '0a1b2c3d-1111-2222-3333-444455556666'}))
+        self.set_up_done('car_hotspot')
+        self.assertNotIn('name=own_name_on_hotspot', self.page.render(''), 'the car hotspot answers names there')
+        # deSEC names have no public address of their own to fall back to: always answered, no switch.
+        (self.state / 'ddns.json').write_text(json.dumps({'provider': 'desec', 'domain': 'box01.car.example.com',
+                                                          'token': 'A1b2C3d4E5f6G7h8J9kMnPqRsTuV'}))
+        setup_wizard.save(self.state, {'done': True, 'mode': 'box_hotspot', 'box': True})
+        (self.state / 'options.json').write_text(json.dumps({'own_name_on_hotspot': False}))
+        self.assertNotIn('name=own_name_on_hotspot', self.page.render(''))
+        from supervisor import hotspot_names
+        self.assertEqual(hotspot_names(self.state, 'box01.car.example.com', 'box_hotspot'), ['box01.car.example.com'])
 
     def test_tesla_mode_on_a_joined_hotspot_says_where_the_address_is_set(self):
         self.set_up_done('mifi')
         self.assertIn('自己的后台把局域网地址改成 100.96.0.1', self.page.render(''))
         self.status['tesla_warning'] = '随身 WiFi分给盒子的地址是 192.168.0.5'
         self.assertIn('分给盒子的地址是 192.168.0.5', self.page.render(''))
+
+    def test_tesla_domain_advice_goes_once_the_own_certificate_is_served(self):
+        import hashlib
+        setup_wizard.save(self.state, {'done': True, 'mode': 'box_hotspot', 'box': True})
+        self.page.apply('/audio', {'tesla': 'on', 'nonce': self.nonce})
+        self.assertIn('特斯拉建议回家插网线后设置自己的网址', self.page.render(''))
+        own = self.state / 'tls' / 'own'; own.mkdir(parents=True)
+        (own / 'fullchain.pem').write_bytes(b'chain')
+        (self.state / 'tls' / 'leaf.san.json').write_text(json.dumps({'own': hashlib.sha256(b'chain').hexdigest()[:16]}))
+        self.assertNotIn('特斯拉建议回家插网线后设置自己的网址', self.page.render(''))
+
+    def test_car_hotspot_with_the_direct_hotspot_does_not_ask_for_the_cable(self):
+        self.set_up_done('car_hotspot')
+        setup_wizard.save(self.state, dict(setup_wizard.load(self.state), iphone='any'))
+        self.status.update(mode='sta', direct_capable=True)
+        self.assertNotIn('插数据线使用', self.page.render(''))
+        # Chosen cable only (also what an older setup without the choice means here).
+        setup_wizard.save(self.state, dict(setup_wizard.load(self.state), iphone='wired'))
+        self.assertIn('插数据线使用', self.page.render(''))
+        setup_wizard.save(self.state, dict(setup_wizard.load(self.state), iphone='any'))
+        # The direct hotspot fell back (2.4 GHz car hotspot): the cable again.
+        self.status['direct_phone'] = '车机热点在 2.4 GHz，这次已改用数据线。'
+        self.assertIn('插数据线使用', self.page.render(''))
+        # A box that cannot keep both hotspots: cable only.
+        self.status.update(direct_capable=False, direct_phone='')
+        self.assertIn('插数据线使用', self.page.render(''))
+
+    def test_the_screen_port_is_under_advanced(self):
+        self.set_up_done('box_hotspot')
+        self.status['entries'] = ['https://192.168.78.1:18443/']
+        html = self.page.render('')
+        carplay, advanced = html.index('>CarPlay 画面<'), html.index('>高级<')
+        self.assertGreater(html.index('name=viewer_port'), advanced)
+        self.assertNotIn('name=viewer_port', html[carplay:advanced])
+        self.assertIn('https://192.168.78.1:18443/', html[carplay:advanced])
+        self.assertIn('action=/viewer-port', html, 'still offered without a CarPlay address yet')
+        # The button had no handler since the setting came in (9c5c6fc): saving it raised AttributeError.
+        import json, viewer_port
+        self.assertIn('1 分钟', self.page.apply('/viewer-port', {'viewer_port': '18444', 'nonce': self.nonce}))
+        self.assertEqual(viewer_port.resolve(self.state), 18444)
+        self.assertEqual(self.changes, ['viewer port changed'])
+        for bad in ('80', '443', '7000', '1023', 'x'):
+            with self.assertRaises(ValueError):
+                self.page.apply('/viewer-port', {'viewer_port': bad, 'nonce': self.nonce})
+        self.assertEqual(json.loads((self.state / 'options.json').read_text())['viewer_port'], 18444)
+
+    def test_cable_steps_name_the_port_for_each_box(self):
+        self.set_up_done('box_hotspot')
+        html = self.page.render('')
+        self.assertIn('玩客云插<b>远离网口</b>的那个 USB 口', html)
+        self.assertIn('N1 两个 USB 口都行', html)
 
     def test_the_box_hotspot_address_in_tesla_mode(self):
         import ipaddress
@@ -329,6 +422,16 @@ class WizardPageTests(unittest.TestCase):
         self.assertIsNone(self.page.portal_reply('captive.apple.com', '/hotspot-detect.html', other))
         self.assertIsNone(self.page.portal_reply('captive.apple.com', '/hotspot-detect.html', phone))
 
+    def test_retyping_the_car_hotspot_keeps_the_answers_of_first_run_setup(self):
+        # After the one-question-per-page setup the box tries the car hotspot; a wrong password brings the car step
+        # back. Saving it again dropped the confirmed answers, and the iPhone fell back to cable only.
+        setup_wizard.save(self.state, {'done': False, 'wizard_version': 2, 'confirmed': True, 'mode': 'car_hotspot',
+                                       'iphone': 'any', 'box': False, 'car': 'xiaomi', 'failed': 'wrong_password'})
+        self.assertIn('没有连上「xiaomi」', self.page.render(''))
+        self.page.apply('/setup', {'action': 'car', 'ssid': 'xiaomi', 'password': '12345678', 'nonce': self.nonce})
+        self.assertEqual(setup_wizard.load(self.state), {'done': False, 'wizard_version': 2, 'confirmed': True,
+                                                        'mode': 'car_hotspot', 'iphone': 'any', 'box': False, 'car': 'xiaomi'})
+
     def test_car_hotspot_step_lists_networks_and_saves_choice(self):
         self.choose('car_hotspot')
         html = self.page.render('')
@@ -376,7 +479,7 @@ class WizardPageTests(unittest.TestCase):
         setup_wizard.save(self.state, {'done': False, 'mode': 'car_hotspot', 'car': 'xiaomi'})
         self.status.update(mode='sta', ssid='xiaomi', entries=['https://192.168.5.80:18443/'])
         html = self.page.render('')
-        self.assertIn('第 3 步，共 3 步', html)
+        self.assertIn('<h1>连接 iPhone</h1>', html)
         self.assertIn('有线 CarPlay', html)
         self.assertIn('远离网口', html)
         self.assertIn('未启动', html)
@@ -424,26 +527,20 @@ class WizardPageTests(unittest.TestCase):
         self.assertIn('<h1>随身 WiFi</h1>', self.page.render('view=car'))
 
     def test_box_hotspot_way_sets_the_box_hotspot_then_the_iphone(self):
-        self.choose('box_hotspot')
-        html = self.page.render('')
-        self.assertIn('<h1>盒子热点</h1>', html)
-        self.assertIn('第 2 步，共 3 步', html)
-        self.assertIn('不能上网', html)
-        self.assertIn('https://192.168.78.1:18443/', html)
-        with self.assertRaises(ValueError):
-            self.page.apply('/setup', {'action': 'hotspot', 'ssid': 'Box', 'password': 'short', 'nonce': self.nonce})
-        kind, html = self.page.apply('/setup', {'action': 'hotspot', 'ssid': 'Box', 'password': 'boxpass1', 'nonce': self.nonce})
-        self.assertIn('「Box」', html)
-        self.assertEqual(read_json(self.state / 'hotspot.json'), {'ssid': 'Box', 'passphrase': 'boxpass1'})
-        self.assertEqual(setup_wizard.load(self.state), {'done': False, 'mode': 'box_hotspot', 'box': True, 'iphone': 'any'})
-        self.assertEqual(self.changes, ['setup box hotspot set'])
+        # First-run setup has set the box hotspot (setup_flow): the next page is the iPhone.
+        (self.state / 'hotspot.json').write_text('{"ssid": "Box", "passphrase": "boxpass1"}')
+        setup_wizard.save(self.state, {'done': False, 'wizard_version': 2, 'confirmed': True, 'mode': 'box_hotspot',
+                                       'iphone': 'any', 'box': True})
         self.assertIsNone(self.page.portal_reply('captive.apple.com', '/hotspot-detect.html', '192.168.78.20'))
         self.status.update(box_ssid='Box', entries=['https://192.168.78.1:18443/'])
         html = self.page.render('')
-        self.assertIn('第 3 步，共 3 步', html)
+        self.assertIn('<h1>连接 iPhone</h1>', html)
         self.assertIn('用数据线（推荐）', html)
         self.assertIn('value=start', html)
-        self.page.apply('/setup', {'action': 'finish', 'nonce': self.nonce})
+        with self.assertRaises(ValueError):   # chose wireless or either: an iPhone has to be added first
+            self.page.apply('/setup', {'action': 'finish', 'nonce': self.nonce})
+        with patch.object(self.page.pairing, 'devices', return_value={'02:00:00:00:00:01': 'A'}):
+            self.page.apply('/setup', {'action': 'finish', 'nonce': self.nonce})
         full = self.page.render('')
         self.assertIn('方式三：车机连盒子热点', full)
         self.assertNotIn('href="/?view=car"', full)
@@ -474,15 +571,79 @@ class WizardPageTests(unittest.TestCase):
             def poll(self): return 0
         self.page.pairing.process = Done()
         A = '02:00:00:00:00:01'
-        with patch.object(self.page.pairing, 'devices', return_value={A: 'A'}):
+        with patch.object(self.page.pairing, 'devices', return_value={A: 'A'}), \
+                patch.object(self.page.pairing, 'pending_phone', return_value=A):
             html = self.page.render('')
-            self.assertIn('正在引导手机', html)
+            self.assertIn('蓝牙已配对，正在尝试连接 CarPlay', html)
             self.assertIn('value=finish', html)
             save_json(self.root / 'state/receiver/phone-presence.json', {'active': A})
             html = self.page.render('')
-        self.assertNotIn('正在引导手机', html)
+        self.assertNotIn('正在尝试连接 CarPlay', html)
         self.assertNotIn('http-equiv=refresh', html)
         self.assertIn('>完成设置<', html)
+
+    def test_adding_a_phone_is_explained_in_one_place_where_the_button_was(self):
+        # Two reasons stop adding: a phone using CarPlay over Wi-Fi, or CarPlay on the cable (which pauses
+        # every wireless invitation). Both used to show up elsewhere (a flash at the top of the page), so a
+        # tap looked like nothing happened (2026-10-31, owner's XS). Both now replace the add button.
+        self.set_up_done('box_hotspot')
+        self.status.update(mode='ap', box_ssid='DashPlay')
+        (self.state / 'hotspot.json').write_text('{"ssid": "DashPlay", "passphrase": "boxpass1"}')
+        save_json(self.page.pairing.status_file, {'phase': 'paired'})
+        class Done:
+            def poll(self): return 0
+        self.page.pairing.process = Done()
+        A = '02:00:00:00:00:01'
+        save_json(self.root / 'state/receiver/phone-presence.json', {'active': A})
+        # A phone is using CarPlay over Wi-Fi: the reason takes the button's place, in the phone block.
+        with patch.object(self.page.pairing, 'devices', return_value={A: 'XS'}):
+            html = self.page.render('')
+            self.assertIn('正在使用 CarPlay。要换手机，在下面点另一部的「切换到这部手机」', html)
+            self.assertNotIn('value=start', html, 'nothing to tap while adding is impossible')
+            # Where the button is: below the list, not in the space above it.
+            self.assertGreater(html.index('正在使用 CarPlay。要换手机'),
+                               html.index('我的手机'), 'the reason sits where the button was')
+        # The POST still refuses, with the same sentence (require_idle guards start()).
+        with self.assertRaises(ValueError) as caught:
+            self.page.pairing.require_idle()
+        self.assertIn('正在使用 CarPlay。要换手机', str(caught.exception))
+        # Nobody using CarPlay: the button is back.
+        save_json(self.root / 'state/receiver/phone-presence.json', {'active': None})
+        with patch.object(self.page.pairing, 'devices', return_value={A: 'XS'}):
+            self.assertIn('value=start', self.page.render(''))
+        # CarPlay live on the cable: the same place, the cable's own reason and the two ways out.
+        save_json(self.wired, {'phase': 'live'})
+        with patch.object(self.page.pairing, 'devices', return_value={A: 'XS'}):
+            html = self.page.render('')
+            self.assertIn('现在用数据线连着 CarPlay，无线连接是暂停的，所以暂时不能添加手机', html)
+            self.assertIn('拔掉数据线', html)
+            # The way out is this page's own switch button, not a trip to the viewer.
+            self.assertIn('切换到这部手机', html)
+            self.assertNotIn('线只用来上网', html)
+            self.assertNotIn('value=start', html)
+        with patch.object(self.page.pairing, 'start') as start:
+            with self.assertRaises(ValueError) as caught:
+                self.page.apply('/pair', {'action': 'start', 'nonce': self.nonce})
+            # Same sentence as the banner above: one situation, one wording, one place.
+            self.assertEqual(str(caught.exception), settings_page.CABLE_BLOCKS_ADDING)
+            start.assert_not_called()
+        # Off the cable: adding works again.
+        save_json(self.wired, {'phase': 'cable'})
+        with patch.object(self.page.pairing, 'start') as start:
+            self.assertEqual(self.page.apply('/pair', {'action': 'start', 'nonce': self.nonce}), '')
+            start.assert_called_once()
+        with patch.object(self.page.pairing, 'devices', return_value={A: 'XS'}):
+            self.assertIn('value=start', self.page.render(''))
+
+    def test_the_supervisor_hands_the_receiver_the_cable_marker_not_a_network_setting(self):
+        # The receiver owns whether the cable carries CarPlay (CableRole.kt); "wireless only" starts it off.
+        source = (Path(__file__).resolve().parents[2] / 'scripts/onecloud/supervisor.py').read_text()
+        self.assertIn('"--cable-off-file", str(CABLE_OFF)', source)
+        self.assertIn('"--cable-carplay", "off" if wireless_only else "on"', source)
+        self.assertIn("wireless_only = (setup.get('iphone') == 'wireless'", source)
+        self.assertNotIn('usb_tether_only', source)
+        receiver = (Path(__file__).resolve().parents[2] / 'scripts/onecloud/run-receiver.py').read_text()
+        self.assertIn('env["CARPLAY_CABLE_OFF_FILE"]', receiver)
 
     def test_settings_change_box_hotspot(self):
         (self.state / 'hotspot.json').write_text('{"ssid": "Box", "passphrase": "boxpass1"}')
@@ -592,6 +753,66 @@ class IdleReleaseOptionTests(unittest.TestCase):
             self.assertEqual(idle_release(state), 0)
             (state / "options.json").write_text("not json")
             self.assertEqual(idle_release(state), 300)
+
+    def test_a_running_receiver_takes_new_options_without_the_network(self):
+        # Sound and idle release are receiver options: the supervisor restarts the receiver with them and keeps
+        # the hotspot (2026-10-29); everything else in its command line stays.
+        import json, tempfile
+        from supervisor import receiver_options
+        argv = ["python3", "run-receiver.py", "--root", "/opt/dashplay", "--bind", "192.168.78.1", "--wired",
+                "--idle-release", "300", "--tesla-browser", "--car-music", "--channel", "149"]
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            (state / "options.json").write_text(json.dumps({"tesla": False, "car_voice": True, "idle_release": 0}))
+            self.assertEqual(receiver_options(argv, state),
+                             ["python3", "run-receiver.py", "--root", "/opt/dashplay", "--bind", "192.168.78.1", "--wired",
+                              "--channel", "149", "--idle-release", "0", "--car-voice"])
+
+    def test_receiver_restart_after_channel_change_uses_saved_sound_options(self):
+        # Exercise the supervisor's actual start closure: a channel-recovery callback
+        # still holds the original argv after a settings-only receiver restart.
+        import ast
+        import supervisor
+        from unittest.mock import Mock
+        source = ast.parse(Path(supervisor.__file__).read_text())
+        main = next(n for n in source.body if isinstance(n, ast.FunctionDef) and n.name == 'main')
+        start = next(n for n in main.body if isinstance(n, ast.FunctionDef) and n.name == 'start')
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            (state / 'options.json').write_text(json.dumps({'car_voice': True, 'idle_release': 0}))
+            platform = Mock()
+            scope = dict(vars(supervisor), state=state, platform=platform, have_identity=True,
+                         receiver_argv_now=[], mark=lambda _step: None)
+            exec(compile(ast.Module(body=[start], type_ignores=[]), supervisor.__file__, 'exec'), scope)
+            stale = ['python3', 'run-receiver.py', '--channel', '36', '--idle-release', '300', '--car-music']
+            scope['start']('receiver', stale)
+            actual = platform.start.call_args.args[1]
+            self.assertIn('--car-voice', actual)
+            self.assertNotIn('--car-music', actual)
+            self.assertEqual(actual[actual.index('--idle-release') + 1], '0')
+            self.assertEqual(actual[actual.index('--channel') + 1], '36')
+            self.assertEqual(scope['receiver_argv_now'], actual)
+
+    def test_idle_release_is_set_on_the_page(self):
+        # It was only in options.json on the N1 (LuCI has it on OpenWrt).
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'state'; state.mkdir()
+            (state / 'hotspot.json').write_text('{"ssid": "DashPlay", "passphrase": "installed1"}')
+            setup_wizard.save(state, {'done': True, 'mode': 'box_hotspot'})
+            changes = []
+            page = SettingsPage(state, lambda: {'mode': 'ap', 'home': 'http://192.168.78.1/', 'entries': []},
+                                changes.append, lambda: [])
+            page.apply_later = changes.append
+            html = page.render('')
+            self.assertGreater(html.index('name=idle_release'), html.index('>高级<'))
+            self.assertIn('value=300', html[html.index('name=idle_release'):][:80])
+            self.assertIn('WiFi 不断', page.apply('/idle-release', {'idle_release': '0', 'nonce': page.pairing.nonce}))
+            self.assertEqual(json.loads((state / 'options.json').read_text())['idle_release'], 0)
+            self.assertEqual(changes, ['receiver options changed'])
+            for bad in ('-1', 'x', '86401'):
+                with self.assertRaises(ValueError):
+                    page.apply('/idle-release', {'idle_release': bad, 'nonce': page.pairing.nonce})
 
 if __name__ == '__main__':
     unittest.main()

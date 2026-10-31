@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts/onecloud"))
 import debug_uplink
@@ -40,6 +41,13 @@ class WindowTests(unittest.TestCase):
             (self.state / 'debug-hotspot.json').write_text(bad)
             self.assertIsNone(debug_uplink.hotspot(self.state), bad)
 
+    def test_tailscale_is_found_in_the_system_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertFalse(debug_uplink.reachable(directory))
+            tool = Path(directory) / 'tailscaled'
+            tool.write_text('#!/bin/sh\n'); tool.chmod(0o755)
+            self.assertTrue(debug_uplink.reachable(directory))
+
 
 class ReceiverInputTests(unittest.TestCase):
     def test_debugging_from_box_hotspot_mode_reads_a_file_that_exists(self):
@@ -67,6 +75,8 @@ class PageTests(unittest.TestCase):
                                  root / 'wired-status.json', run=self.run)
         self.page.apply_later = self.changes.append
         self.nonce = self.page.pairing.nonce
+        reachable = patch.object(debug_uplink, 'reachable', return_value=True)
+        self.reachable = reachable.start(); self.addCleanup(reachable.stop)
 
     def debug(self, **form):
         return self.page.apply('/debug', dict(form, nonce=self.nonce))
@@ -101,6 +111,19 @@ class PageTests(unittest.TestCase):
         self.assertEqual(self.changes, ['remote debugging started', 'remote debugging stopped'])
         self.debug(action='forget')
         self.assertIsNone(debug_uplink.hotspot(self.state))
+
+    def test_not_offered_without_tailscale_but_an_open_window_can_still_end(self):
+        # The public images have no Tailscale: the window would only take the box's hotspot away for 30 minutes.
+        self.reachable.return_value = False
+        self.assertNotIn('远程调试', self.page.render(''))
+        (self.state / 'debug-hotspot.json').write_text(PHONE)
+        with self.assertRaises(ValueError):
+            self.debug(action='start')
+        self.assertEqual(self.changes, [])
+        debug_uplink.start(self.run)   # opened before Tailscale went away
+        self.assertIn('结束调试，回到原来的网络', self.page.render(''))
+        self.debug(action='stop')
+        self.assertEqual(debug_uplink.remaining(self.run), 0)
 
     def test_not_offered_without_the_runtime_directory_or_when_managed(self):
         # OpenWrt's LuCI manages the router's network; its page has no runtime directory for the window.

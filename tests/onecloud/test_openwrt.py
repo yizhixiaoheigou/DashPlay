@@ -549,9 +549,24 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(car_audio_args(read_config("dashplay.main.car_music='1'\ndashplay.main.car_voice='1'\n")),
                          ["--car-music", "--car-voice"])
 
-    def test_tesla_mode_is_all_of_them(self):
-        self.assertEqual(car_audio_args(read_config("dashplay.main.tesla_mode='1'\ndashplay.main.car_music='0'\n")),
-                         ["--tesla"])
+    def test_tesla_mode_defaults_the_car_bluetooth_but_does_not_force_it(self):
+        # Tesla mode turns both on when it is enabled (LuCI); afterwards the switches are the owner's choice, as on
+        # the box (2026-10-28).
+        self.assertEqual(car_audio_args(read_config(
+            "dashplay.main.tesla_mode='1'\ndashplay.main.car_music='1'\ndashplay.main.car_voice='1'\n")),
+            ["--tesla"])
+        self.assertEqual(car_audio_args(read_config(
+            "dashplay.main.tesla_mode='1'\ndashplay.main.car_music='1'\ndashplay.main.car_voice='0'\n")),
+            ["--tesla-browser", "--car-music"])
+        self.assertEqual(car_audio_args(read_config(
+            "dashplay.main.tesla_mode='1'\ndashplay.main.car_music='0'\ndashplay.main.car_voice='1'\n")),
+            ["--tesla-browser", "--car-voice"])
+        self.assertEqual(car_audio_args(read_config(
+            "dashplay.main.tesla_mode='1'\ndashplay.main.car_music='0'\ndashplay.main.car_voice='0'\n")),
+            ["--tesla-browser"])
+        # A uci command that only turns Tesla mode on leaves the page as the audio source; the LuCI switch and the
+        # install docs turn both switches on with it.
+        self.assertEqual(car_audio_args(read_config("dashplay.main.tesla_mode='1'\n")), ["--tesla-browser"])
 
     def test_uci_options_override_defaults(self):
         config = read_config("dashplay.main=dashplay\ndashplay.main.wifi='wwan'\ndashplay.main.settings_port='18090'\n")
@@ -586,6 +601,11 @@ class ManagedPageTests(unittest.TestCase):
             self.assertNotIn(text, html)
         # The settings page runs on 18080; a relative link stayed there and got a 404 (review 2026-10-12).
         self.assertIn('href="http://192.168.1.1/cgi-bin/luci/admin/network/wireless"', html)
+
+    def test_the_tesla_internet_banner_is_shown_once(self):
+        self.status["tesla_internet"] = "上游在线，局域网 CarPlay 常在线"
+        html = self.page.render("")
+        self.assertEqual(html.count("上游在线，局域网 CarPlay 常在线"), 1)
 
     def test_network_changes_are_refused(self):
         nonce = self.page.pairing.nonce

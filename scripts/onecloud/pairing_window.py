@@ -59,19 +59,39 @@ class PairingWindow:
                 return status
         return {'phase': 'closed'}
 
+    def in_use_message(self):
+        """Why a phone cannot be added while another one is using CarPlay, or None.
+
+        Shared with the settings page, which shows this text where the add button would be (2026-10-31): the
+        same sentence whether it is read before tapping or comes back as an error after a POST.
+        """
+        active = self.presence().get('active')
+        if not active:
+            return None
+        name = self.devices().get(active, f'iPhone（蓝牙 …{active[-5:]}）')
+        return (f'「{name}」正在使用 CarPlay。要换手机，在下面点另一部的「切换到这部手机」；'
+                '要添加新手机，先断开或切换。')
+
+    def require_idle(self):
+        message = self.in_use_message()
+        if message:
+            raise ValueError(message)
+
     def start(self):
         with self.lock:
-            if read_json(self.root / 'state/receiver/phone-presence.json').get('active'):
-                raise ValueError('当前有人使用 CarPlay，请先断开后再添加手机。')
+            self.require_idle()
             if self.process and self.process.poll() is None:
                 return
             self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.confirm_file.unlink(missing_ok=True)
             self.pick_file.unlink(missing_ok=True)
             save_json(self.status_file, {'phase': 'starting'})
-            self.process = subprocess.Popen(['python3', str(self.root / 'pair-phone.py'), '--root', str(self.root),
-                                             '--incoming', '--timeout', '180'],
-                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # One bounded worker log per window, private and replaced on the next attempt.
+            fd = os.open(self.directory / 'worker.log', os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, 'wb') as log:
+                self.process = subprocess.Popen(['python3', str(self.root / 'pair-phone.py'), '--root', str(self.root),
+                                                 '--incoming', '--timeout', '180'],
+                                                stdout=subprocess.DEVNULL, stderr=log)
 
     def confirm(self, request_id, accepted):
         with self.lock:
@@ -84,14 +104,40 @@ class PairingWindow:
         """Box-initiated pairing with a phone seen while its Bluetooth settings page is open."""
         with self.lock:
             status = self.status()
-            if self.presence().get('active'):
-                raise ValueError('当前有人使用 CarPlay，请先断开后再添加手机。')
+            self.require_idle()
             if status.get('phase') != 'waiting' or address not in {d['address'] for d in status.get('found', [])}:
                 raise ValueError('这部手机已不在列表中，请刷新页面。')
             save_json(self.pick_file, {'address': address})
 
     def presence(self):
-        return read_json(self.root / 'state/receiver/phone-presence.json')
+        state = read_json(self.root / 'state/receiver/phone-presence.json')
+        # Read the durable pause list directly: the receiver's snapshot may lag a page action.
+        state['paused'] = read_json(self.root / 'state/receiver/phone-paused.json').get('phones', [])
+        return state
+
+    def pending_phone(self):
+        """A bounded invitation, not proof that Bluetooth or CarPlay is already connected."""
+        request = read_json(self.root / 'state/receiver/pairing-request.json')
+        if not request.get('phone'):
+            return None
+        try:
+            if request.get('boot') == get_platform().boot_id() and time.monotonic() < request['expires']:
+                return request.get('phone')
+        except (KeyError, TypeError, OSError):
+            pass
+        return None
+
+    def switch_pending(self):
+        """The phone a settings-page switch is still waiting for, or None.
+
+        The receiver consumes the request within a couple of seconds; until then nothing else on the page shows
+        that a switch is under way, so the page stayed still until a manual reload (2026-10-31).
+        """
+        request = read_json(self.root / 'state/receiver/phone-switch.json')
+        phone = str(request.get('phone') or '').upper()
+        if phone and time.monotonic() < request.get('expires', 0):
+            return phone
+        return None
 
     def devices(self):
         """Paired, unblocked BlueZ devices as {address: name}; empty when BlueZ is unavailable."""
@@ -101,6 +147,43 @@ class PairingWindow:
         except Exception:
             return {}
 
+    def _pause_phone(self, phone, paused):
+        """Caller holds the presence lock; shared with the receiver's presence helper."""
+        path = self.root / 'state/receiver/phone-paused.json'
+        phones = set(read_json(path).get('phones', []))
+        if paused:
+            phones.add(phone)
+        else:
+            phones.discard(phone)
+        save_json(path, {'phones': sorted(phones)})
+        with path.open('rb') as saved:
+            os.fsync(saved.fileno())
+
+    def _disconnect(self, phone):
+        state_path = self.root / 'state/receiver/phone-presence.json'
+        with state_path.with_suffix('.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            state = read_json(state_path)
+            self._pause_phone(phone, True)
+            grant = state_path.with_name('pairing-request.json')
+            if read_json(grant).get('phone') == phone:
+                grant.unlink(missing_ok=True)
+            if state.get('active') == phone:
+                save_json(state_path.with_name('phone-disconnect.json'),
+                          {'phone':phone, 'boot':state.get('boot')})
+        # The receiver closes the actual session and clears active. Never delete a bond on a timeout.
+        for _ in range(40):
+            if self.presence().get('active') != phone:
+                return
+            time.sleep(.25)
+        raise ValueError('接收端尚未完成断开，配对记录已保留。请稍后重试。')
+
+    def disconnect(self, phone):
+        with self.lock:
+            if not PHONE.fullmatch(phone) or phone not in self.devices():
+                raise ValueError('这部手机已不在已配对列表中，请刷新页面。')
+            self._disconnect(phone)
+
     def use(self, phone):
         """Give one already-paired phone the next bounded invitation, e.g. on a new hotspot."""
         with self.lock:
@@ -108,23 +191,49 @@ class PairingWindow:
                 raise ValueError('当前有人使用 CarPlay，不会自动抢占；请对方先断开 Wi-Fi 或 CarPlay。')
             if not PHONE.fullmatch(phone) or phone not in self.devices():
                 raise ValueError('这部手机未配对，请先添加新手机。')
-            save_json(self.root / 'state/receiver/pairing-request.json', {
-                'phone': phone, 'boot': get_platform().boot_id(),
-                'expires': time.monotonic() + GRANT_SECONDS})
+            state_path = self.root / 'state/receiver/phone-presence.json'
+            with state_path.with_suffix('.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                self._pause_phone(phone, False)
+                save_json(state_path.with_name('pairing-request.json'), {
+                    'phone': phone, 'boot': get_platform().boot_id(),
+                    'expires': time.monotonic() + GRANT_SECONDS})
+
+    def switch_to(self, phone):
+        """Hand CarPlay to another paired phone from the settings page, even while one is using it (2026-10-31).
+
+        The receiver does the switch itself (ends that session or the cable's CarPlay, then invites this phone),
+        through the same path as tapping its row in the CarPlay box settings; here we only write the request it
+        polls. The request is one-shot: the helper deletes it when the receiver asks.
+        """
+        with self.lock:
+            if not PHONE.fullmatch(phone) or phone not in self.devices():
+                raise ValueError('这部手机已不在已配对列表中，请刷新页面。')
+            if phone == self.presence().get('active'):
+                return
+            state_path = self.root / 'state/receiver/phone-presence.json'
+            with state_path.with_suffix('.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                # The presence state carries its own boot key (boot id plus network epoch); the receiver's
+                # switch-request check compares against that, not the bare boot id (2026-10-31: the first
+                # version wrote the bare id, so every request was dropped as another boot's).
+                boot = read_json(state_path).get('boot', '')
+                save_json(state_path.with_name('phone-switch.json'), {
+                    'phone': phone, 'boot': boot, 'expires': time.monotonic() + 30})
 
     def remove(self, phone):
         """Forget a phone on the box too: BlueZ pairing, Wi-Fi identities, back-off and any grant."""
         with self.lock:
             if not PHONE.fullmatch(phone) or phone not in self.devices():
                 raise ValueError('这部手机已不在已配对列表中，请刷新页面。')
-            if self.presence().get('active') == phone:
-                raise ValueError('这部手机正在使用 CarPlay，请先断开后再删除。')
+            self._disconnect(phone)
             import asyncio
             asyncio.run(asyncio.wait_for(remove_device(self.root, phone), 5))
             state_path = self.root / 'state/receiver/phone-presence.json'
             with state_path.with_suffix('.lock').open('a') as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 state = read_json(state_path)
+                self._pause_phone(phone, False)
                 state.get('phones', {}).pop(phone, None)
                 state.get('declined', {}).pop(phone, None)
                 if state.get('last_phone') == phone:
@@ -233,8 +342,17 @@ async def run_incoming(root, timeout):
     confirmed = False
     pairing = None
     error = ''
+    error_code = ''
+    attempt_generation = 0
     opened = time.monotonic()
     deadline = opened + min(timeout, 180)
+
+    def trace(event, code=''):
+        # No passkey, device address/name, exception message or Bluetooth key in diagnostics.
+        code = str(code).rsplit('.', 1)[-1]
+        print(json.dumps({'event': event, 'elapsed': round(time.monotonic() - opened, 3),
+                          'code': code if re.fullmatch(r'[A-Za-z_]{1,64}', code) else ''}),
+              file=sys.stderr, flush=True)
 
     def busy():
         return bool(read_json(root / 'state/receiver/phone-presence.json').get('active'))
@@ -260,26 +378,34 @@ async def run_incoming(root, timeout):
 
         @method()
         async def RequestConfirmation(self, device: 'o', passkey: 'u'):
-            nonlocal selected, confirmed, deadline
+            nonlocal selected, confirmed, deadline, attempt_generation
             if (not device.startswith(adapter_path + '/dev_') or stopped.is_set() or
                     (selected is not None and selected != device) or busy()):
                 raise DBusError('org.bluez.Error.Rejected', 'Receiver busy')
+            if selected is None:
+                attempt_generation += 1
+            generation = attempt_generation
             selected = device
             deadline = attempt_deadline(deadline, time.monotonic(), opened)
             request_id = secrets.token_urlsafe(20)
+            trace('confirmation_requested')
             device_props = await proxy(device, 'org.bluez.Device1')
             name = await device_props.get_alias()
+            if generation != attempt_generation or stopped.is_set():
+                raise DBusError('org.bluez.Error.Rejected', 'Pairing attempt ended')
             save_json(status_file, {'phase':'confirm', 'name':name, 'passkey':f'{passkey:06d}', 'request_id':request_id})
-            while time.monotonic() < deadline and not stopped.is_set():
+            while time.monotonic() < deadline and not stopped.is_set() and generation == attempt_generation:
                 reply = read_json(confirm_file)
                 if reply.get('request_id') == request_id:
                     if reply.get('accepted') is True:
                         confirmed = True
+                        trace('box_confirmed')
                         save_json(status_file, {'phase':'finishing'})
                         return
                     break
                 await asyncio.sleep(0.25)
-            selected = None
+            if generation == attempt_generation:
+                selected = None
             raise DBusError('org.bluez.Error.Rejected', 'Passkey not confirmed')
 
         @method()
@@ -288,32 +414,54 @@ async def run_incoming(root, timeout):
 
         @method()
         def AuthorizeService(self, device: 'o', uuid: 's'):
+            trace('authorize_iap2' if uuid.lower() == '00000000-deca-fade-deca-deafdecacafe' else 'authorize_other_service')
             if device != selected or not confirmed or uuid.lower() != '00000000-deca-fade-deca-deafdecacafe':
                 raise DBusError('org.bluez.Error.Rejected', 'Unexpected service')
 
         @method()
         def Cancel(self):
-            pass
+            nonlocal selected, confirmed, error, error_code, attempt_generation
+            # BlueZ has its own confirmation timeout. Invalidate the prompt immediately; a delayed
+            # coroutine/reply from this attempt must not confirm or clear the next phone's request.
+            attempt_generation += 1
+            trace('bluez_canceled')
+            selected, confirmed = None, False
+            error_code = 'Canceled'
+            error = '配对请求已取消或超时。请重新发起，并及时在手机和盒子页面确认相同数字。'
+            save_json(status_file, {'phase':'waiting', 'found':[], 'error':error, 'error_code':error_code})
 
         @method()
         def Release(self):
             stopped.set()
 
     async def pair(path):
-        nonlocal selected, confirmed, error
+        nonlocal selected, confirmed, error, error_code
+        generation = attempt_generation
         try:
             await (await proxy(path, 'org.bluez.Device1')).call_pair()
-        except Exception:
+        except Exception as exc:
+            trace('pair_failed', getattr(exc, 'type', type(exc).__name__))
+            if generation != attempt_generation:
+                return
             try:
                 done = await (await proxy(path, 'org.bluez.Device1')).get_paired()
             except Exception:
                 done = False
+            if generation != attempt_generation:
+                return
             if not done:
-                # Also when the page already confirmed: the iPhone never answered (it only shows the
-                # request while Settings > Bluetooth is open). Go back to the list instead of waiting.
+                # A failed Pair call does not tell us that the phone failed to confirm: the box's
+                # agent may itself have timed out. Keep the safe BlueZ code, never raw exception text.
+                code = str(getattr(exc, 'type', '')).removeprefix('org.bluez.Error.')
+                error_code = code if code in {'AuthenticationTimeout', 'AuthenticationCanceled',
+                    'AuthenticationRejected', 'AuthenticationFailed', 'ConnectionAttemptFailed',
+                    'InProgress', 'Failed'} else 'Failed'
+                if error_code == 'AuthenticationTimeout':
+                    error = '蓝牙配对确认超时。请重新发起，并及时在手机和盒子页面确认相同数字。'
+                else:
+                    error = '蓝牙配对未完成或已取消。请保持手机停在蓝牙页面，重试时在手机和盒子页面都确认相同数字。'
                 selected, confirmed = None, False
-                error = '手机没有确认配对。请让 iPhone 停在「设置 → 蓝牙」页面，再点一次它的名字。'
-                save_json(status_file, {'phase': 'waiting', 'found': [], 'error': error})
+                save_json(status_file, {'phase': 'waiting', 'found': [], 'error': error, 'error_code': error_code})
                 confirm_file.unlink(missing_ok=True)
 
     agent_path = '/onecloud/incoming_pair_agent'
@@ -352,6 +500,7 @@ async def run_incoming(root, timeout):
             if selected and confirmed:
                 device = await proxy(selected, 'org.bluez.Device1')
                 if await device.get_paired():
+                    trace('bluez_paired')
                     await device.set_trusted(True)
                     # BlueZ keeps link keys under /var/lib/bluetooth; flush them before the car is switched off.
                     os.sync()
@@ -371,14 +520,20 @@ async def run_incoming(root, timeout):
                 pick = read_json(pick_file).get('address')
                 pick_file.unlink(missing_ok=True)
                 if pick and not busy() and pick in {item['address'] for item in found}:
+                    attempt_generation += 1
+                    error_code = ''
                     selected, error = f"{adapter_path}/dev_{pick.replace(':', '_')}", ''
                     deadline = attempt_deadline(deadline, time.monotonic(), opened)
                     save_json(status_file, {'phase':'pairing', 'name':next(i['name'] for i in found if i['address'] == pick)})
                     pairing = asyncio.ensure_future(pair(selected))
                 else:
-                    save_json(status_file, {'phase':'waiting', 'found':found, 'error':error})
+                    save_json(status_file, {'phase':'waiting', 'found':found, 'error':error, 'error_code':error_code})
             await asyncio.sleep(1)
         save_json(status_file, {'phase':'closed'})
+    except Exception as exc:
+        trace('worker_failed', getattr(exc, 'type', type(exc).__name__))
+        save_json(status_file, {'phase':'closed', 'error':'配对连接中断，请重新发起。'})
+        raise RuntimeError('Bluetooth pairing worker failed; see diagnostic event code') from None
     finally:
         if pairing and not pairing.done():
             pairing.cancel()

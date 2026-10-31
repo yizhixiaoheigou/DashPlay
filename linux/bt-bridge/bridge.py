@@ -281,7 +281,11 @@ async def connect(bus, objects, adapter, args, stopped, owner):
         if opening not in done:
             opening.cancel()
             await asyncio.gather(opening, return_exceptions=True)
-            await recover_stale_link(bus, adapter, target)
+            # A timed-out ConnectProfile can leave a pending BlueZ request even though the
+            # phone is disconnected. Clear that now, so the next normal invitation need not
+            # fail with br-connection-busy first. Keep the existing connected-link fallback.
+            if not await clear_stale_request(bus, adapter, target):
+                await recover_stale_link(bus, adapter, target)
             raise BridgeError('RFCOMM connection timed out')
         fd = opening.result()
         print('bt-bridge: RFCOMM connected', file=sys.stderr)

@@ -1,0 +1,602 @@
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AudioRoutes.kt b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AudioRoutes.kt
+new file mode 100644
+--- /dev/null
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AudioRoutes.kt
+@@ -0,0 +1,27 @@
++package com.shilapi.xcertplay.airplay
++
++/** Destinations requested by the owner; actual iPhone route selection still needs device validation. */
++object AudioRoutes {
++    val names = setOf("media", "navigation", "alert", "siri", "calls")
++    val destinations = setOf("carplay", "bluetooth")
++    fun valid(routes: Map<String, String>) = routes.keys == names && routes.values.all { it in destinations }
++    fun parse(text: String): Map<String, String> {
++        val pairs = text.split(',').map { it.split('=') }
++        require(pairs.size == names.size && pairs.all { it.size == 2 }) { "Invalid audio routes" }
++        return pairs.associate { it[0] to it[1] }.also { require(valid(it)) { "Invalid audio routes" } }
++    }
++    fun category(type: Int, name: String?): String? = when {
++        type == 102 -> "media"
++        type == 101 -> "navigation"
++        else -> when (name) {
++            "media" -> "media"
++            "default" -> "navigation"
++            "alert" -> "alert"
++            "telephony" -> "calls"
++            "speechRecognition" -> "siri"
++            else -> null // Main compatibility format remains available for session negotiation.
++        }
++    }
++    fun allows(routes: Map<String, String>, type: Int, name: String?): Boolean =
++        routes[category(type, name)] != "bluetooth"
++}
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayConfig.kt b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayConfig.kt
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayConfig.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayConfig.kt
+@@ -60,6 +60,7 @@
+     val entertainmentSampleRate: Int = 48000,
+     val hevc: Boolean = false,
+     val disableAudioOutput: Boolean = false,
++    val audioRoutes: Map<String, String> = emptyMap(),
+     val microphone: Boolean = false,
+     /** false: offer no call and no Siri audio, so the iPhone keeps them on the car's own Bluetooth (DashPlay car_voice). */
+     val callsAndSiri: Boolean = true,
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt
+@@ -25,6 +25,12 @@
+     private const val CONSTRAINT_ANYTIME = 100
+ 
+     fun build(config: AirPlayConfig): Map<String, Any?> {
++        require(config.audioRoutes.isEmpty() || AudioRoutes.valid(config.audioRoutes))
++        val noAudio = config.disableAudioOutput || (config.audioRoutes.isNotEmpty() &&
++            config.audioRoutes.values.all { it == "bluetooth" })
++        fun selected(entries: List<Map<String, Any?>>) = entries.filter {
++            AudioRoutes.allows(config.audioRoutes, (it["type"] as Number).toInt(), it["audioType"] as? String)
++        }
+         val displays = arrayListOf<Any?>(
+             displayEntry(config.main, STREAM_TYPE_MAIN_SCREEN, MAIN_UUID),
+         )
+@@ -32,7 +38,7 @@
+ 
+         val info = linkedMapOf<String, Any?>(
+             "sourceVersion" to config.sourceVersion,
+-            "features" to if (config.disableAudioOutput) CARPLAY_FEATURES_NO_AUDIO else CARPLAY_FEATURES,
++            "features" to if (noAudio) CARPLAY_FEATURES_NO_AUDIO else CARPLAY_FEATURES,
+             "statusFlags" to 4L,
+             "model" to config.model,
+             "manufacturer" to config.manufacturer,
+@@ -44,9 +50,9 @@
+             "keepAliveSendStatsAsBody" to false,
+             "modes" to modes(),
+         )
+-        if (!config.disableAudioOutput) {
+-            info["audioLatencies"] = audioLatencies()
+-            info["audioFormats"] = audioFormats(config.entertainmentSampleRate, config.microphone, config.callsAndSiri)
++        if (!noAudio) {
++            info["audioLatencies"] = selected(audioLatencies())
++            info["audioFormats"] = selected(audioFormats(config.entertainmentSampleRate, config.microphone, config.callsAndSiri))
+         }
+         info["extendedFeatures"] = listOf("vocoderInfo", "enhancedRequestCarUI")
+         info["displays"] = displays
+diff --git a/protocol/src/test/java/com/shilapi/xcertplay/airplay/AudioRoutesTest.kt b/protocol/src/test/java/com/shilapi/xcertplay/airplay/AudioRoutesTest.kt
+new file mode 100644
+--- /dev/null
++++ b/protocol/src/test/java/com/shilapi/xcertplay/airplay/AudioRoutesTest.kt
+@@ -0,0 +1,45 @@
++package com.shilapi.xcertplay.airplay
++
++import org.junit.Assert.*
++import org.junit.Test
++
++class AudioRoutesTest {
++    private val base = AirPlayConfig(deviceName = "test", deviceId = "02:00:00:00:00:02",
++        btMac = "02:00:00:00:00:02", sourceVersion = "366.0",
++        main = AirPlayDisplayConfig(widthPixels = 1280, heightPixels = 720), microphone = true)
++
++    @Test fun eachChoiceChangesOnlyItsDeclaredAudioCategory() {
++        val original = AirPlayInfoPlist.build(base)["audioFormats"] as List<*>
++        for (name in AudioRoutes.names) {
++            val routes = AudioRoutes.names.associateWith { if (it == name) "bluetooth" else "carplay" }
++            val actual = AirPlayInfoPlist.build(base.copy(audioRoutes = routes))["audioFormats"] as List<*>
++            val expected = original.filter {
++                val f = it as Map<*, *>
++                AudioRoutes.category((f["type"] as Number).toInt(), f["audioType"] as? String) != name
++            }
++            assertEquals(name, expected, actual)
++        }
++    }
++    @Test fun allThirtyTwoCombinationsHaveConsistentFormatsAndLatencies() {
++        val names = AudioRoutes.names.toList()
++        for (mask in 0..31) {
++            val routes = names.mapIndexed { i, n -> n to if (mask and (1 shl i) != 0) "bluetooth" else "carplay" }.toMap()
++            val info = AirPlayInfoPlist.build(base.copy(audioRoutes = routes))
++            if (mask == 31) {
++                assertFalse(info.containsKey("audioFormats"))
++                assertFalse(info.containsKey("audioLatencies"))
++                assertNotEquals(AirPlayInfoPlist.build(base)["features"], info["features"])
++            } else for (key in listOf("audioFormats", "audioLatencies")) {
++                for (entry in info[key] as List<*>) {
++                    val f = entry as Map<*, *>
++                    assertTrue(AudioRoutes.allows(routes, (f["type"] as Number).toInt(), f["audioType"] as? String))
++                }
++            }
++        }
++    }
++    @Test fun routeParserRejectsIncompleteDuplicateOrUnknownChoices() {
++        for (text in listOf("media=bluetooth", "media=carplay,media=bluetooth", "media=bad,navigation=carplay,alert=carplay,siri=carplay,calls=carplay")) {
++            assertThrows(IllegalArgumentException::class.java) { AudioRoutes.parse(text) }
++        }
++    }
++}
+diff --git a/server/src/main/kotlin/com/playport/server/ServerConfig.kt b/server/src/main/kotlin/com/playport/server/ServerConfig.kt
+--- a/server/src/main/kotlin/com/playport/server/ServerConfig.kt
++++ b/server/src/main/kotlin/com/playport/server/ServerConfig.kt
+@@ -20,9 +20,9 @@
+     /** View areas of the display (the page's window shapes) and the one CarPlay starts in. */
+     val displayAreas: List<ViewArea> = emptyList(),
+     val displayArea: Int = 0,
+-    /** Calls and Siri on the car's own Bluetooth (DashPlay car_voice, part of Tesla mode; 2026-10-14): no microphone,
+-     *  no call or Siri audio. */
++    /** Legacy UI preference. Explicit audioRoutes selects each advertised audio category independently. */
+     val carVoice: Boolean = false,
++    val audioRoutes: Map<String, String> = emptyMap(),
+     val rightHandDrive: Boolean = false,
+     val bindAddress: String? = null,
+     val identityDir: Path,
+@@ -82,6 +82,7 @@
+                     "--ui-scale" -> config = config.copy(uiScale = com.shilapi.xcertplay.airplay.CarPlayUiScale.sanitize(nextValue(flag).toInt()))
+                     "--hevc" -> config = config.copy(hevc = true)
+                     "--car-voice" -> config = config.copy(carVoice = true)
++                    "--audio-routes" -> config = config.copy(audioRoutes = com.shilapi.xcertplay.airplay.AudioRoutes.parse(nextValue(flag)))
+                     "--rhd" -> config = config.copy(rightHandDrive = true)
+                     "--bind" -> config = config.copy(bindAddress = nextValue(flag))
+                     "--identity-dir" -> config = config.copy(identityDir = Path.of(nextValue(flag)))
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -262,8 +262,11 @@
+             port = config.airPlayPort,
+             entertainmentSampleRate = 48_000,
+             hevc = display.hevc,
+-            microphone = !config.carVoice,
+-            callsAndSiri = !config.carVoice,
++            // Keep the complete audio device declaration even when Bluetooth voice is preferred.
++            // Omitting duplex formats also sends navigation away from CarPlay on some iPhones.
++            microphone = true,
++            callsAndSiri = true,
++            audioRoutes = config.audioRoutes,
+             manufacturer = config.manufacturer,
+             model = config.model,
+             oemLabel = "盒子设置",
+@@ -338,9 +341,24 @@
+         }
+     }
+ 
++    private fun audioRoutesJson(category: String?, destination: String?): String? {
++        val helper = System.getenv("CARPLAY_AUDIO_ROUTES_HELPER") ?: return null
++        return runCatching {
++            val args = if (category == null) listOf("get") else listOf("set", category, destination.orEmpty())
++            val process = ProcessBuilder(listOf("/usr/bin/python3", helper) + args)
++                .redirectError(ProcessBuilder.Redirect.DISCARD).start()
++            if (!process.waitFor(12, java.util.concurrent.TimeUnit.SECONDS)) {
++                process.destroyForcibly()
++                return@runCatching null
++            }
++            if (process.exitValue() == 0) process.inputStream.bufferedReader().readText().take(4096) else null
++        }.getOrNull()
++    }
++
+     fun start() {
+         hub.inputHandler = ::routeInput
+         hub.onApplyDisplay = ::applyDisplay
++        hub.onAudioRoutes = ::audioRoutesJson
+         hub.onPhones = ::phonesJson
+         hub.onSwitchPhone = ::switchPhone
+         hub.onMicrophoneData = { opus, payload -> bridge.sendMicrophonePayload(payload, opus) }
+diff --git a/server/src/main/kotlin/com/playport/server/WebHub.kt b/server/src/main/kotlin/com/playport/server/WebHub.kt
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -100,6 +100,9 @@
+ data class PhoneSwitchRequest(val address: String = "")
+ 
+ @Serializable
++data class AudioRouteRequest(val category: String, val destination: String)
++
++@Serializable
+ data class PhoneSwitchError(val error: String)
+ 
+ /** Parsing and encoding for the phone list the presence helper prints (`devices`: a JSON array). */
+@@ -205,6 +208,7 @@
+ 
+     /** Paired phones for the box settings (a [PhoneListBody] as JSON), from the presence helper. */
+     @Volatile var onPhones: (() -> String)? = null
++    @Volatile var onAudioRoutes: ((String?, String?) -> String?)? = null
+ 
+     /** Explicitly switch CarPlay to a paired phone: null on success, or an error code for the page. */
+     @Volatile var onSwitchPhone: ((String) -> String?)? = null
+@@ -423,6 +427,33 @@
+                 }
+                 call.respondText(if (outcome.deferred) """{"ok":true,"deferred":true}""" else """{"ok":true}""",
+                     io.ktor.http.ContentType.Application.Json)
++            }
++            get("/api/audio-routes") {
++                if (call.request.queryParameters["token"] != config.accessToken || !call.fromOwnPage()) {
++                    call.respondText("forbidden", status = io.ktor.http.HttpStatusCode.Forbidden)
++                    return@get
++                }
++                val body = withContext(Dispatchers.IO) { onAudioRoutes?.invoke(null, null) }
++                call.respondText(body ?: "{\"supported\":false}", io.ktor.http.ContentType.Application.Json)
++            }
++            post("/api/audio-routes") {
++                if (call.request.queryParameters["token"] != config.accessToken || !call.fromOwnPage()) {
++                    call.respondText("forbidden", status = io.ktor.http.HttpStatusCode.Forbidden)
++                    return@post
++                }
++                val request = runCatching {
++                    val text = call.receiveText()
++                    require(text.length <= 1024)
++                    json.decodeFromString(AudioRouteRequest.serializer(), text)
++                }.getOrNull()
++                if (request == null || request.category !in com.shilapi.xcertplay.airplay.AudioRoutes.names ||
++                    request.destination !in com.shilapi.xcertplay.airplay.AudioRoutes.destinations) {
++                    call.respondText("invalid", status = io.ktor.http.HttpStatusCode.BadRequest)
++                    return@post
++                }
++                val body = withContext(Dispatchers.IO) { onAudioRoutes?.invoke(request.category, request.destination) }
++                call.respondText(body ?: "{\"error\":\"save failed\"}", io.ktor.http.ContentType.Application.Json,
++                    if (body == null) io.ktor.http.HttpStatusCode.Conflict else io.ktor.http.HttpStatusCode.OK)
+             }
+             get("/api/phones") {
+                 if (call.request.queryParameters["token"] != config.accessToken || !call.fromOwnPage()) {
+diff --git a/server/src/test/kotlin/com/playport/server/AudioCapabilitiesTest.kt b/server/src/test/kotlin/com/playport/server/AudioCapabilitiesTest.kt
+--- a/server/src/test/kotlin/com/playport/server/AudioCapabilitiesTest.kt
++++ b/server/src/test/kotlin/com/playport/server/AudioCapabilitiesTest.kt
+@@ -2,12 +2,26 @@
+ 
+ import com.shilapi.xcertplay.airplay.AirPlayInfoPlist
+ import org.junit.Assert.assertTrue
++import org.junit.Assert.assertEquals
+ import org.junit.Rule
+ import org.junit.Test
+ import org.junit.rules.TemporaryFolder
+ 
+ class AudioCapabilitiesTest {
+     @get:Rule val temporary = TemporaryFolder()
++
++    @Test fun bluetoothVoicePreferenceKeepsCompleteAudioCapabilities() {
++        fun formats(carVoice: Boolean): Any? {
++            val root = temporary.newFolder(if (carVoice) "bluetooth" else "browser").toPath()
++            return CarPlayServer(ServerConfig(identityDir = root, stateDir = root.resolve("state"),
++                bindAddress = "127.0.0.1", carVoice = carVoice)).use { server ->
++                AirPlayInfoPlist.build(server.airPlayConfig)["audioFormats"]
++            }
++        }
++        // Removing duplex formats also diverted navigation to Bluetooth on the real iPhone.
++        // A Bluetooth output preference must not change the receiver's supported audio formats.
++        assertEquals(formats(false), formats(true))
++    }
+ 
+     @Test fun declaresDuplexFormatsForTheEnabledMicrophoneUplink() {
+         val root = temporary.root.toPath()
+diff --git a/server/src/test/kotlin/com/playport/server/AudioRoutesApiTest.kt b/server/src/test/kotlin/com/playport/server/AudioRoutesApiTest.kt
+new file mode 100644
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/AudioRoutesApiTest.kt
+@@ -0,0 +1,50 @@
++package com.playport.server
++
++import io.ktor.server.engine.embeddedServer
++import io.ktor.server.netty.Netty
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.runBlocking
++import org.junit.Assert.*
++import org.junit.Test
++import java.net.URI
++import java.net.http.HttpClient
++import java.net.http.HttpRequest
++import java.net.http.HttpResponse
++import java.nio.file.Files
++
++class AudioRoutesApiTest {
++    @Test fun onlyAuthenticatedOwnPageCanReadAndChangeKnownRoutes() {
++        val dir = Files.createTempDirectory("audio-routes")
++        val scope = CoroutineScope(Dispatchers.Default)
++        val token = "0123456789abcdef0123456789abcdef"
++        val hub = WebHub(ServerConfig(identityDir=dir,stateDir=dir,accessToken=token),DisplayState(640,480,30,100),scope)
++        val changes = mutableListOf<Pair<String?,String?>>()
++        hub.onAudioRoutes = { category, destination ->
++            changes.add(category to destination)
++            """{"supported":true,"routes":{"media":"bluetooth","navigation":"carplay","alert":"carplay","siri":"carplay","calls":"carplay"}}"""
++        }
++        val server = embeddedServer(Netty,port=0,host="127.0.0.1") { hub.install(this,dir) }.start(false)
++        try {
++            val port = runBlocking { server.engine.resolvedConnectors().first().port }
++            val client = HttpClient.newHttpClient()
++            fun request(body: String? = null, credential: String = token, origin: String = "http://127.0.0.1:$port"): Int {
++                val builder = HttpRequest.newBuilder(URI("http://127.0.0.1:$port/api/audio-routes?token=$credential")).header("Origin",origin)
++                if (body != null) builder.header("Content-Type","application/json").POST(HttpRequest.BodyPublishers.ofString(body))
++                return client.send(builder.build(),HttpResponse.BodyHandlers.ofString()).statusCode()
++            }
++            assertEquals(403,request(credential="bad"))
++            assertEquals(403,request(origin="https://outside.example"))
++            assertEquals(403,request("""{"category":"media","destination":"bluetooth"}""",origin="https://outside.example"))
++            assertEquals(400,request("""{"category":"unknown","destination":"bluetooth"}"""))
++            assertEquals(400,request("""{"category":"media","destination":"unknown"}"""))
++            assertTrue(changes.isEmpty())
++            assertEquals(200,request())
++            assertEquals(200,request("""{"category":"media","destination":"bluetooth"}"""))
++            assertEquals(listOf(null to null,"media" to "bluetooth"),changes)
++            hub.onAudioRoutes = { _, _ -> null }
++            assertEquals(409,request("""{"category":"media","destination":"bluetooth"}"""))
++        } finally { server.stop(0,1000); scope.cancel(); dir.toFile().deleteRecursively() }
++    }
++}
+diff --git a/web/index.html b/web/index.html
+--- a/web/index.html
++++ b/web/index.html
+@@ -32,13 +32,14 @@
+   <p class="group-title" data-i18n="volume"></p>
+   <div class="group" id="audio-mix">
+     <div class="cell volume audio-row"><span class="main"><b data-i18n="volumeAll"></b></span><input id="volume" type="range" min="0" max="100" value="100"/><output id="volume-value">100%</output></div>
+-    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioNav"></b><span id="audio-default-base"></span></span><input id="audio-default" type="range" min="0" max="100" step="1" value="33"/><output id="audio-default-value">33%</output></div>
+-    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioAlert"></b><span id="audio-alert-base"></span></span><input id="audio-alert" type="range" min="0" max="100" step="1" value="33"/><output id="audio-alert-value">33%</output></div>
+-    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioMedia"></b><span id="audio-media-base"></span></span><input id="audio-media" type="range" min="0" max="100" step="1" value="100"/><output id="audio-media-value">100%</output></div>
+-    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioSiri"></b><span id="audio-speechrecognition-base"></span></span><input id="audio-speechrecognition" type="range" min="0" max="100" step="1" value="33"/><output id="audio-speechrecognition-value">33%</output></div>
+-    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioCalls"></b><span id="audio-telephony-base"></span></span><input id="audio-telephony" type="range" min="0" max="100" step="1" value="33"/><output id="audio-telephony-value">33%</output></div>
++    <div class="cell volume audio-row with-route"><span class="main"><b data-i18n="audioNav"></b><span id="audio-default-base"></span></span><input id="audio-default" type="range" min="0" max="100" step="1" value="33"/><output id="audio-default-value">33%</output><div class="audio-route" role="group"><button id="route-default-carplay" type="button" aria-pressed="true" disabled><span class="route-check" aria-hidden="true">✓</span>CarPlay</button><button id="route-default-bluetooth" type="button" aria-pressed="false" disabled><span class="route-check" aria-hidden="true">✓</span><span data-i18n="audioBluetooth">蓝牙</span></button></div></div>
++    <div class="cell volume audio-row with-route"><span class="main"><b data-i18n="audioAlert"></b><span id="audio-alert-base"></span></span><input id="audio-alert" type="range" min="0" max="100" step="1" value="33"/><output id="audio-alert-value">33%</output><div class="audio-route" role="group"><button id="route-alert-carplay" type="button" aria-pressed="true" disabled><span class="route-check" aria-hidden="true">✓</span>CarPlay</button><button id="route-alert-bluetooth" type="button" aria-pressed="false" disabled><span class="route-check" aria-hidden="true">✓</span><span data-i18n="audioBluetooth">蓝牙</span></button></div></div>
++    <div class="cell volume audio-row with-route"><span class="main"><b data-i18n="audioMedia"></b><span id="audio-media-base"></span></span><input id="audio-media" type="range" min="0" max="100" step="1" value="100"/><output id="audio-media-value">100%</output><div class="audio-route" role="group"><button id="route-media-carplay" type="button" aria-pressed="true" disabled><span class="route-check" aria-hidden="true">✓</span>CarPlay</button><button id="route-media-bluetooth" type="button" aria-pressed="false" disabled><span class="route-check" aria-hidden="true">✓</span><span data-i18n="audioBluetooth">蓝牙</span></button></div></div>
++    <div class="cell volume audio-row with-route"><span class="main"><b data-i18n="audioSiri"></b><span id="audio-speechrecognition-base"></span></span><input id="audio-speechrecognition" type="range" min="0" max="100" step="1" value="33"/><output id="audio-speechrecognition-value">33%</output><div class="audio-route" role="group"><button id="route-speechrecognition-carplay" type="button" aria-pressed="true" disabled><span class="route-check" aria-hidden="true">✓</span>CarPlay</button><button id="route-speechrecognition-bluetooth" type="button" aria-pressed="false" disabled><span class="route-check" aria-hidden="true">✓</span><span data-i18n="audioBluetooth">蓝牙</span></button></div></div>
++    <div class="cell volume audio-row with-route"><span class="main"><b data-i18n="audioCalls"></b><span id="audio-telephony-base"></span></span><input id="audio-telephony" type="range" min="0" max="100" step="1" value="33"/><output id="audio-telephony-value">33%</output><div class="audio-route" role="group"><button id="route-telephony-carplay" type="button" aria-pressed="true" disabled><span class="route-check" aria-hidden="true">✓</span>CarPlay</button><button id="route-telephony-bluetooth" type="button" aria-pressed="false" disabled><span class="route-check" aria-hidden="true">✓</span><span data-i18n="audioBluetooth">蓝牙</span></button></div></div>
+   </div>
+   <p class="foot" data-i18n="audioMixHint"></p>
++  <p id="audio-route-status" class="foot" role="status"></p>
+   <p id="audio-status" class="foot"></p>
+   <p class="group-title" data-i18n="display"></p>
+   <div class="group">
+diff --git a/web/check-audio-mix.mjs b/web/check-audio-mix.mjs
+--- a/web/check-audio-mix.mjs
++++ b/web/check-audio-mix.mjs
+@@ -54,3 +54,20 @@
+   assert(input?.includes('min="0"') && input.includes('max="100"'), name + ' uses the same UI range');
+ }
+ console.log('Normalized volume scale: endpoints, roundtrip and unchanged saved gains passed');
++
++const routeSource = readFileSync(new URL('./src/audio-routes.ts', import.meta.url), 'utf8');
++const routeJs = ts.transpileModule(routeSource, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText;
++const routes = await import(`data:text/javascript;base64,${Buffer.from(routeJs).toString('base64')}`);
++assert.equal(routes.validRoutes({ media: 'bluetooth' }), false);
++const previous = routes.initialRoutes(null, true, true);
++assert.deepEqual(previous, { media:'bluetooth', navigation:'carplay', alert:'carplay', siri:'bluetooth', calls:'bluetooth' });
++for (const category of mix.AUDIO_CATEGORIES) {
++  const saved = 25;
++  assert.equal(routes.displayedVolume('bluetooth', saved), 100);
++  assert.equal(routes.displayedVolume('carplay', saved), saved, 'switching back restores the saved browser volume');
++  assert(routes.ROUTE_NAMES.includes(routes.CATEGORY_ROUTE[category]));
++  for (const target of ['carplay', 'bluetooth']) assert(html.includes(`id="route-${category}-${target}"`));
++}
++assert(routes.sameRoutes(previous, { ...previous }));
++assert(!routes.sameRoutes(previous, { ...previous, navigation: 'bluetooth' }));
++console.log('Independent sound destinations and Bluetooth display preserve saved volume');
+diff --git a/web/src/audio-routes.ts b/web/src/audio-routes.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/audio-routes.ts
+@@ -0,0 +1,19 @@
++export const ROUTE_NAMES = ['media', 'navigation', 'alert', 'siri', 'calls'] as const;
++export type RouteName = typeof ROUTE_NAMES[number];
++export type Destination = 'carplay' | 'bluetooth';
++export type AudioRoutes = Record<RouteName, Destination>;
++export const CATEGORY_ROUTE = { default: 'navigation', media: 'media', alert: 'alert', speechrecognition: 'siri', telephony: 'calls' } as const;
++export function validRoutes(value: unknown): value is AudioRoutes {
++  return !!value && typeof value === 'object' && ROUTE_NAMES.every(name =>
++    ['carplay', 'bluetooth'].includes((value as AudioRoutes)[name]));
++}
++export function initialRoutes(value: unknown, music: boolean, voice: boolean): AudioRoutes {
++  return validRoutes(value) ? { ...value } : { media: music ? 'bluetooth' : 'carplay', navigation: 'carplay', alert: 'carplay', siri: voice ? 'bluetooth' : 'carplay', calls: voice ? 'bluetooth' : 'carplay' };
++}
++export function sameRoutes(a: AudioRoutes, b: AudioRoutes): boolean {
++  return ROUTE_NAMES.every(name => a[name] === b[name]);
++}
++// Bluetooth's 100% is only a disabled display. Never write it into saved browser gain.
++export function displayedVolume(destination: Destination, savedPercent: number): number {
++  return destination === 'bluetooth' ? 100 : savedPercent;
++}
+diff --git a/web/src/boot.ts b/web/src/boot.ts
+--- a/web/src/boot.ts
++++ b/web/src/boot.ts
+@@ -13,14 +13,15 @@
+   try {
+     const response = await fetch('./receiver-access.json', { cache: 'no-store', credentials: 'same-origin' });
+     if (!response.ok) return;
+-    const value = await response.json() as { token?: string; settingsPort?: number; carMusic?: boolean; carVoice?: boolean; tesla?: boolean };
++    const value = await response.json() as { token?: string; settingsPort?: number; carMusic?: boolean; carVoice?: boolean; tesla?: boolean; audioRoutes?: unknown };
+     if (typeof value.token === 'string' && /^[0-9a-f]{32}$/.test(value.token)) localStorage.setItem('playport-token', value.token);
+     if (Number.isInteger(value.settingsPort)) (window as unknown as { playportBoxSettingsPort?: number }).playportBoxSettingsPort = value.settingsPort;
+     // Set on the box: carMusic, the music goes over the car's own Bluetooth (OpenWrt dashplay.main.car_music, settings
+     // page); tesla, the Tesla browser's ways (fullscreen through a listed video site, a quieter microphone). Tesla
+     // mode (dashplay.main.tesla_mode) sets both.
+     // carVoice: calls and Siri go over the car's Bluetooth (dashplay.main.car_voice, settings page).
+-    const flags = window as unknown as { playportCarMusic?: boolean; playportCarVoice?: boolean; playportTeslaMode?: boolean };
++    const flags = window as unknown as { playportCarMusic?: boolean; playportCarVoice?: boolean; playportTeslaMode?: boolean; playportAudioRoutes?: unknown };
++    flags.playportAudioRoutes = value.audioRoutes;
+     flags.playportTeslaMode = value.tesla === true;
+     flags.playportCarMusic = value.carMusic === true || (value.carMusic === undefined && value.tesla === true);
+     flags.playportCarVoice = value.carVoice === true;
+diff --git a/web/src/main.ts b/web/src/main.ts
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -1,3 +1,4 @@
++import { CATEGORY_ROUTE, initialRoutes, validRoutes, sameRoutes, displayedVolume, type AudioRoutes, type Destination, type RouteName } from './audio-routes';
+ import { startup, startupStats } from './startup';
+ import { AudioEngine } from './audio';
+ import { AUDIO_CATEGORIES, STORAGE_KEY as AUDIO_MIX_KEY, gainPercent, volumePercent, mixPercent, parseMix, type AudioCategory } from './audio-mix';
+@@ -259,11 +260,14 @@
+ // with the iPhone): the steering wheel, media card and volume are the car's own; this page plays prompts (boosted)
+ // and whatever else the iPhone still sends. ?promptgain=1..8 overrides the boost. Tesla mode sets it too, and adds
+ // the Tesla browser's ways (fullscreen below, microphone gain in mic.ts).
+-const boxFlags = window as unknown as { playportCarMusic?: boolean; playportCarVoice?: boolean; playportTeslaMode?: boolean };
++const boxFlags = window as unknown as { playportCarMusic?: boolean; playportCarVoice?: boolean; playportTeslaMode?: boolean; playportAudioRoutes?: unknown };
+ const carMusic = boxFlags.playportCarMusic === true;
+ const teslaMode = boxFlags.playportTeslaMode === true;
+ // Calls and Siri over the car's Bluetooth (box: car_voice): their sound is the car's, not this page's.
+ const carVoice = boxFlags.playportCarVoice === true;
++const bootRoutes = initialRoutes(boxFlags.playportAudioRoutes, carMusic, carVoice);
++let audioRoutes = { ...bootRoutes }, routesSupported = false, routesBusy = false, routesLoading = false;
++let routeMessage: Key | null = null;
+ const promptGain = Number(new URLSearchParams(location.search).get('promptgain')) || (carMusic ? 3 : 1);
+ // Music the iPhone still sends here is played: it sends music to one place at a time, and after Siri from the
+ // CarPlay screen it sent it here for ~27 s before going back to the car's Bluetooth, silent while it was dropped.
+@@ -277,20 +281,72 @@
+ for (const category of AUDIO_CATEGORIES) audio.setCategoryPercent(category, mixPercent(audioMix, category));
+ function renderAudioMix() {
+   for (const category of AUDIO_CATEGORIES) {
+-    const percent = Math.round(volumePercent(category, mixPercent(audioMix, category)));
++    const destination = audioRoutes[CATEGORY_ROUTE[category]];
++    const percent = displayedVolume(destination, Math.round(volumePercent(category, mixPercent(audioMix, category))));
+     const input = el<HTMLInputElement>(`audio-${category}`);
+     input.max = '100';
+     if (Number(input.value) !== percent) input.value = String(percent);
+     input.setAttribute('aria-label', t(AUDIO_LABELS[category]));
+     // Over the car's Bluetooth this page plays none of it: the slider would change nothing (2026-10-29).
+-    const onCar = category === 'media' ? carMusic : (category === 'telephony' || category === 'speechrecognition') && carVoice;
++    const onCar = destination === 'bluetooth';
+     input.disabled = onCar;
+     el(`audio-${category}-base`).textContent = onCar ? t('audioOnCar') : '';
+     el(`audio-${category}-value`).textContent = `${percent}%`;
+-  }
+-}
++    for (const target of ['carplay', 'bluetooth'] as const) {
++      const button = el<HTMLButtonElement>(`route-${category}-${target}`);
++      button.disabled = !routesSupported || routesBusy;
++      button.setAttribute('aria-pressed', String(destination === target));
++      button.setAttribute('aria-label', `${t(AUDIO_LABELS[category])} · ${target === 'carplay' ? 'CarPlay' : t('audioBluetooth')}`);
++    }
++  }
++  el('audio-route-status').textContent = routeMessage ? t(routeMessage) : '';
++}
++async function loadAudioRoutes() {
++  if (routesLoading || routesBusy) return;
++  routesLoading = true;
++  try {
++    const response = await fetch(`/api/audio-routes?token=${encodeURIComponent(token)}`, { cache: 'no-store' });
++    if (!response.ok) throw new Error();
++    const body = await response.json();
++    routesSupported = body.supported === true && validRoutes(body.routes);
++    if (routesSupported) {
++      audioRoutes = body.routes;
++      if (routeMessage === 'audioRouteUnavailable') routeMessage = null;
++      // Backend edits also refresh boot-time audio behaviour, once the receiver has applied them.
++      if (!sameRoutes(audioRoutes, bootRoutes)) await reloadAppliedRoutes(audioRoutes);
++    } else routeMessage = 'audioRouteUnavailable';
++  } catch { routeMessage = 'audioRouteUnavailable'; }
++  finally { routesLoading = false; renderAudioMix(); }
++}
++async function reloadAppliedRoutes(expected: AudioRoutes) {
++  try {
++    const response = await fetch('./receiver-access.json', { cache: 'no-store' });
++    if (!response.ok) return;
++    const flags = await response.json();
++    if (validRoutes(flags.audioRoutes) && sameRoutes(flags.audioRoutes, expected)) location.reload();
++  } catch { /* Keep controls and retry after the receiver reconnects. */ }
++}
++async function saveAudioRoute(category: RouteName, destination: Destination) {
++  if (routesBusy || !routesSupported || audioRoutes[category] === destination) return;
++  routesBusy = true; routeMessage = 'audioRouteSaving'; renderAudioMix();
++  try {
++    const response = await fetch(`/api/audio-routes?token=${encodeURIComponent(token)}`, {
++      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ category, destination }),
++    });
++    const body = await response.json();
++    if (!response.ok || !validRoutes(body.routes)) throw new Error();
++    audioRoutes = body.routes; routeMessage = 'audioRouteSaved';
++    window.setTimeout(() => { void loadAudioRoutes(); }, 3000);
++  } catch { routeMessage = 'audioRouteFailed'; }
++  finally { routesBusy = false; renderAudioMix(); }
++}
++window.setInterval(() => { if (!document.hidden && (panel.open || !sameRoutes(audioRoutes, bootRoutes))) void loadAudioRoutes(); }, 5000);
++window.addEventListener('focus', () => { if (panel.open) void loadAudioRoutes(); });
+ for (const category of AUDIO_CATEGORIES) {
+   const input = el<HTMLInputElement>(`audio-${category}`);
++  for (const target of ['carplay', 'bluetooth'] as const) {
++    el<HTMLButtonElement>(`route-${category}-${target}`).onclick = () => { void saveAudioRoute(CATEGORY_ROUTE[category], target); };
++  }
+   input.oninput = () => {
+     audioMix = { ...audioMix, [category]: gainPercent(category, Number(input.value)) };
+     localStorage.setItem(AUDIO_MIX_KEY, JSON.stringify(audioMix));
+@@ -299,6 +355,7 @@
+   };
+ }
+ renderAudioMix();
++void loadAudioRoutes();
+ /** Music over the car's Bluetooth: the car's media card shows the page's title and address whenever the page sounds
+  *  (Siri, prompts, calls; a Tesla, 2026-10-14); name it instead. The last voice stream to start wins; the title goes back when none is left. */
+ const voiceLabels: Record<string, string> = { speechrecognition: 'Siri', telephony: '通话', default: '导航播报' };
+@@ -405,6 +462,7 @@
+   if (!panel.open) { panel.classList.remove('closing'); panel.showModal(); }
+   void loadDisplay();
+   void loadDevices();
++  void loadAudioRoutes();
+ }
+ /** Leave along the path it came in (to the right), unless motion is reduced. */
+ function closePanel() {
+diff --git a/web/src/style.css b/web/src/style.css
+--- a/web/src/style.css
++++ b/web/src/style.css
+@@ -83,9 +83,22 @@
+ .volume { gap:14px; }
+ .volume input[type=range] { flex:1; min-width:0; height:32px; margin:0; accent-color:#fff; }
+ .volume output { min-width:3.2em; text-align:right; color:var(--secondary); font-variant-numeric:tabular-nums; }
+-/* One row per sound: the label and its base need room, the slider takes what is left. */
+-.audio-row .main { flex:1 1 9em; min-width:6em; }
+-.audio-row input[type=range] { flex:2 1 7em; }
++/* Volume and its shared destination remain one row; on narrow screens the choice wraps. */
++.audio-row { display:grid; grid-template-columns:minmax(7em, 1.1fr) minmax(4em, 1fr) 3.2em; gap:12px; }
++.audio-row .main { min-width:0; }
++.audio-row.with-route { grid-template-columns:minmax(7em, 1.1fr) minmax(4em, 1fr) 3.2em auto; }
++.audio-route { display:flex; gap:4px; padding:4px; border-radius:10px; background:var(--fill); }
++.audio-route button { min-height:44px; padding:8px 10px; border:0; border-radius:7px; background:transparent; color:var(--secondary); font-size:14px; white-space:nowrap; }
++.audio-route button[aria-pressed=true] { background:var(--cell-hi); color:var(--label); }
++.audio-route button:disabled { opacity:.55; cursor:default; }
++.audio-route button:active:not(:disabled) { opacity:.7; }
++.audio-route button:focus-visible { outline:2px solid var(--tint); outline-offset:2px; }
++.route-check { display:inline-block; width:1.1em; visibility:hidden; }
++[aria-pressed=true] .route-check { visibility:visible; }
++@media(max-width:850px) {
++  .audio-row.with-route { grid-template-columns:minmax(6em, 1fr) minmax(3em, 1fr) 3.2em; }
++  .audio-route { grid-column:1 / -1; justify-self:end; }
++}
+ 
+ .btn { display:block; width:100%; min-height:50px; margin:14px 0 0; padding:13px 16px; border:0; border-radius:12px; background:var(--tint);
+   color:#fff; font-weight:600; text-align:center; transition:transform .1s ease-out; }
+@@ -130,7 +143,7 @@
+ [data-fullscreen=true] .ico .collapse { display:block; }
+ 
+ /* Settings sheet: slides in from the right edge and leaves the same way. */
+-dialog { margin:0 0 0 auto; height:100%; max-height:100%; width:min(480px,100vw); max-width:100%; padding:0; border:0;
++dialog { margin:0 0 0 auto; height:100%; max-height:100%; width:min(720px,100vw); max-width:100%; padding:0; border:0;
+   background:#000; color:inherit; overflow:auto; overscroll-behavior:contain; }
+ dialog[open] { animation:sheet-in .32s cubic-bezier(.2,.8,.2,1); }
+ dialog.closing { animation:sheet-out .2s cubic-bezier(.4,0,1,1) forwards; }
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -17,8 +17,13 @@
+   access: ['需要首次登录链接', 'First-time access link required'], accessHint: ['请使用私有访问资料中的完整链接打开一次，此浏览器会记住登录。', 'Open the complete link from your private access file once. This browser will remember it.'],
+   sound: ['轻点启用声音', 'Tap to enable sound'], volume: ['声音', 'Sound'], volumeAll: ['总音量', 'All sounds'],
+   audioMix: ['各声音的音量', 'Each sound'], audioNav: ['导航播报', 'Navigation'], audioAlert: ['提示音', 'Alerts'], audioMedia: ['媒体音乐', 'Media'], audioSiri: ['Siri', 'Siri'], audioCalls: ['通话', 'Calls'],
+-  audioOnCar: ['走车机蓝牙，请用车机音量调', 'Over the car’s Bluetooth: use the car’s volume'],
+-  audioMixHint: ['所有滑块统一为 0–100%：0% 静音，100% 是该项最大音量。总音量控制本页全部声音，下方各项单独调整；各路原有音量保持不变。走车机蓝牙的声音请用车机音量调。设置保存在此浏览器。', 'Every slider uses 0–100%: 0% is muted and 100% is that control’s maximum. All sounds controls this page’s audio; the rows below adjust each sound. Existing sound levels are preserved. Sounds over the car’s Bluetooth follow the car’s volume. Kept in this browser.'],
++  audioOnCar: ['蓝牙音量请在车机或耳机上调整', 'Adjust Bluetooth volume on the car or headphones'],
++  audioBluetooth: ['蓝牙', 'Bluetooth'],
++  audioRouteSaving: ['正在保存声音去向…', 'Saving sound destinations…'],
++  audioRouteSaved: ['已保存，CarPlay 将短暂重连。', 'Saved. CarPlay will reconnect briefly.'],
++  audioRouteFailed: ['未能保存声音去向，请重试。', 'Could not save. Please try again.'],
++  audioRouteUnavailable: ['暂时无法读取盒子的声音去向，请稍后重试。', 'Sound destinations are unavailable. Please retry shortly.'],
++  audioMixHint: ['音量为 0–100%，保存在此浏览器。声音去向与后台同步，修改后 CarPlay 会短暂重连。蓝牙项灰显 100% 仅表示本页不调节该声音，并非车机或耳机的实际音量。使用蓝牙播放时，请先将车机或耳机连接到 iPhone。如果声音仍从本页播放，请打开 iPhone 的「控制中心」，展开音乐播放卡片，点音频输出图标，再选择已连接的车机或耳机。', 'Volume uses 0–100% and is saved in this browser. Destinations are shared with box settings; changing one briefly reconnects CarPlay. A disabled 100% means this page does not adjust Bluetooth volume, not the device’s actual volume. For Bluetooth playback, connect the car or headphones to your iPhone. If sound still plays here, open Control Center on your iPhone, expand the music card, tap the audio output icon, and select the connected car or headphones.'],
+   display: ['画面', 'Display'], fullscreen: ['全屏', 'Fullscreen'], exitFullscreen: ['退出全屏', 'Exit fullscreen'], fullscreenHint: ['已全屏。退出全屏：点 CarPlay 主屏幕上的「盒子设置」图标，再点「退出全屏」。', 'Fullscreen on. To exit, tap the Box settings icon on the CarPlay home screen, then Exit fullscreen.'], fullscreenFail: ['此浏览器不允许全屏，画面仍会自动适配窗口。', 'Fullscreen unavailable. The picture still fits this window.'], tapFullscreen: ['轻点画面恢复全屏', 'Tap the picture to go back to fullscreen'],
+   teslaFullscreenOffline: ['全屏要经腾讯视频跳转，特斯拉现在上不了网。画面照常可用。', 'Fullscreen goes through a video site and the car is offline. The picture keeps working.'],
+   autoHint: ['上面的开关改了立即生效，CarPlay 会重连一下；「画面参数」里的项要点「应用并重连」。自定义分辨率只在一个显示端开启。', 'The switches above take effect at once and reconnect CarPlay; Display settings need Apply and reconnect. Use a custom resolution on one display only.'],

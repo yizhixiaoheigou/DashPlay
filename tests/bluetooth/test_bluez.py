@@ -285,6 +285,39 @@ class BlueZTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b'br-connection-busy', err)
         self.assertEqual((self.device_disconnects, self.powered), ([], []))
 
+    async def test_timeout_clears_pending_request_before_next_invitation(self):
+        self.mode = 'connect-hang'
+        self.data[DEVICE]['org.bluez.Device1']['Connected'] = Variant('b', False)
+        with tempfile.TemporaryDirectory() as directory:
+            env = {'BT_BRIDGE_RECOVERY_STATE': str(Path(directory) / 'recovery')}
+            code, out, err = await self.result('--timeout', '0.3', '--address', ADDRESS, env_extra=env)
+            self.assertEqual(code, 1)
+            self.assertIn(b'RFCOMM connection timed out', err)
+            self.assertEqual(self.device_disconnects, [DEVICE])
+            self.assertEqual(self.powered, [])
+            self.assertTrue(self.data[DEVICE]['org.bluez.Device1']['Paired'].value)
+            self.mode = 'held-request'
+            process = await self.launch('--address', ADDRESS, env_extra=env)
+            await asyncio.wait_for(self.connected.wait(), 3)
+            process.stdin.close()
+            out, err = await asyncio.wait_for(process.communicate(), 5)
+            self.assertEqual(process.returncode, 0, err)
+            self.assertNotIn(b'retrying', err)
+
+    async def test_timeout_does_not_cancel_during_pairing_or_discovery(self):
+        self.mode = 'connect-hang'
+        self.data[DEVICE]['org.bluez.Device1']['Connected'] = Variant('b', False)
+        with tempfile.TemporaryDirectory() as directory:
+            for key in ('Pairable', 'Discoverable', 'Discovering'):
+                with self.subTest(key=key):
+                    self.data[ADAPTER]['org.bluez.Adapter1'][key] = Variant('b', True)
+                    code, out, err = await self.result('--timeout', '0.3', '--address', ADDRESS,
+                        env_extra={'BT_BRIDGE_RECOVERY_STATE': str(Path(directory) / 'recovery')})
+                    self.assertEqual(code, 1)
+                    self.assertIn(b'RFCOMM connection timed out', err)
+                    self.assertEqual((self.device_disconnects, self.powered), ([], []))
+                    self.data[ADAPTER]['org.bluez.Adapter1'][key] = Variant('b', False)
+
     async def test_peer_eof_and_stdin_eof(self):
         for mode in ('peer', 'stdin'):
             with self.subTest(mode=mode):

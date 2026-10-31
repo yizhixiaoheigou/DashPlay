@@ -111,6 +111,7 @@ def choose_phone(state, present, paired, newly_paired=None, now=0.0):
     """
     if state.get('active'):
         return None
+    paired = paired - set(state.get('paused', []))
     if newly_paired in paired:
         return newly_paired
     declined = state.get('declined', {})
@@ -124,9 +125,38 @@ def choose_phone(state, present, paired, newly_paired=None, now=0.0):
 def invite_phone(state, paired):
     """Whom to invite without a presence proof (boot, cable just pulled): the last wireless user, or
     the only paired phone. A phone used on the USB cable only was never remembered (2026-10-12)."""
+    paired = paired - set(state.get('paused', []))
     if state.get('last_phone') in paired:
         return state['last_phone']
     return next(iter(paired)) if len(paired) == 1 else None
+
+
+def switch_grant(state, paired, phone, now):
+    """Explicit switch from the viewer: the receiver ends the active session itself, so unlike
+    choose_phone this may replace a phone that is using CarPlay. The old phone stays on the Wi-Fi;
+    only its CarPlay session ends. None when the phone is not paired."""
+    if phone not in paired:
+        return None
+    state.get('declined', {}).pop(phone, None)
+    return {'phone': phone, 'expires': now + GRANT_SECONDS}
+
+
+def phone_rows(state, names):
+    """Paired phones for the viewer's switch list; BlueZ aliases with what the box remembers."""
+    active, last = state.get('active'), state.get('last_phone')
+    return [{'address': address, 'name': names.get(address, address), 'active': address == active,
+             'last': address == last}
+            for address in sorted(names, key=lambda item: (names[item].lower(), item))]
+
+
+def grant_phone(path, value):
+    """One bounded invitation, the same file the receiver's pairing window writes (0600)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix('.tmp')
+    descriptor = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    with os.fdopen(descriptor, 'w') as stream:
+        json.dump(value, stream)
+    os.replace(temporary, path)
 
 
 def decline(state, phone, now):
@@ -174,7 +204,16 @@ class BluezNotReady(Exception):
     """The Bluetooth bus is not up yet (right after a restart): nobody can be invited before it is."""
 
 
-async def paired_phones():
+def is_phone(props):
+    """Major device class Phone (iPhones report 0x7a020c); headsets, TVs and computers stay out."""
+    value = props.get('Class')
+    return value is not None and (value.value >> 8) & 0x1f == 2
+
+
+async def bluez_devices(phones_only=False, known=()):
+    """Paired, unblocked devices as {address: name}; BlueZ aliases are what the settings page shows.
+    phones_only keeps headsets and computers out of the viewer's switch list: Major class Phone, or a
+    phone this box has already carried CarPlay for (known addresses)."""
     sys.path.insert(0, str(Path(__file__).resolve().parent / 'linux-bt-bridge/deps'))
     from dbus_next import BusType, Message, MessageType
     from dbus_next.aio import MessageBus
@@ -187,19 +226,26 @@ async def paired_phones():
         response = await asyncio.wait_for(bus.call(Message(destination='org.bluez', path='/',
             interface='org.freedesktop.DBus.ObjectManager', member='GetManagedObjects')), 2.5)
         if response.message_type == MessageType.ERROR:
-            return set()
-        result = set()
+            return {}
+        result = {}
         for interfaces in response.body[0].values():
             props = interfaces.get('org.bluez.Device1', {})
-            if (props.get('Paired') and props['Paired'].value and
-                    not (props.get('Blocked') and props['Blocked'].value)):
-                result.add(props['Address'].value.upper())
+            address = props['Address'].value.upper() if 'Address' in props else ''
+            if (address and props.get('Paired') and props['Paired'].value and
+                    not (props.get('Blocked') and props['Blocked'].value) and
+                    (not phones_only or is_phone(props) or address in known)):
+                result[address] = props['Alias'].value if 'Alias' in props else address
         return result
     finally:
         bus.disconnect()
 
 
+async def paired_phones():
+    return set(await bluez_devices())
+
+
 PAIRED_CACHE_SECONDS = 300
+GRANT_SECONDS = 90
 
 
 def paired_cached(state, now, lookup):
@@ -269,6 +315,8 @@ def main():
     with state_path.with_suffix('.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = load_state(state_path)
+        paused_path = state_path.with_name('phone-paused.json')
+        state['paused'] = _read_json(paused_path).get('phones', [])
         # Only who is known and who used the box last must survive a power cut; probes stay cheap.
         lasting = json.dumps([state.get(key) for key in LASTING], sort_keys=True)
         migrate(state, default_phone)
@@ -285,7 +333,8 @@ def main():
             ok = grant_boot(state, boot_key(boot, os.environ.get('CARPLAY_NETWORK_EPOCH', '')))
             if ok:
                 # The configured default phone only seeds the migration above; a reset box has none.
-                output = state.get('last_phone') or invite_phone(state, paired_cached(
+                previous = state.get('last_phone')
+                output = (previous if previous not in state['paused'] else None) or invite_phone(state, paired_cached(
                     state, now, lambda: asyncio.run(paired_phones())))
                 ok = bool(output)
         elif command == 'unplugged':
@@ -299,6 +348,42 @@ def main():
             if phone in state['phones'] or phone == pending_phone(request_path, boot, now):
                 decline(state, phone, now)
                 ok = True
+        elif command == 'disconnect-request':
+            path = state_path.with_name('phone-disconnect.json')
+            request = _read_json(path)
+            phone = request.get('phone')
+            if request.get('boot') == state.get('boot') and phone in state['paused'] and state.get('active') == phone:
+                output, ok = phone, True
+            else:
+                path.unlink(missing_ok=True)
+        elif command == 'switch-request':
+            # The settings page asking to hand CarPlay to another paired phone (2026-10-31). The receiver performs
+            # the switch; this only consumes the request once and names the phone.
+            path = state_path.with_name('phone-switch.json')
+            request = _read_json(path)
+            phone = str(request.get('phone') or '').upper()
+            path.unlink(missing_ok=True)
+            if request.get('boot') == state.get('boot') and phone and now <= request.get('expires', 0):
+                output, ok = phone, True
+        elif command == 'allowed':
+            phone = sys.argv[2].upper()
+            ok = phone not in state['paused'] and phone in paired_cached(state, now, lambda: asyncio.run(paired_phones()))
+        elif command == 'devices':
+            names = asyncio.run(asyncio.wait_for(
+                bluez_devices(phones_only=True, known=set(state.get('phones', {}))), 3))
+            output = json.dumps(phone_rows(state, names), ensure_ascii=False)
+            ok = True
+        elif command == 'switch':
+            phone = sys.argv[2].upper()
+            paired = paired_cached(state, now, lambda: asyncio.run(paired_phones()))
+            grant = switch_grant(state, paired, phone, now)
+            if grant:
+                state['paused'] = [item for item in state['paused'] if item != phone]
+                grant_phone(paused_path, {'phones':state['paused']})
+                grant_phone(request_path, dict(grant, boot=boot))
+                ok = True
+            else:
+                note(state_path, 'switch request for an unpaired phone')
         else:
             data = json.loads(subprocess.check_output(['ip', '-j', '-4', 'addr', 'show', 'dev', interface], timeout=1))
             address = next((a for d in data for a in d['addr_info'] if a['scope'] == 'global'), None)
@@ -375,12 +460,13 @@ def main():
                     ok = output is not None
                 else:
                     phone = sys.argv[2].upper()
-                    ok = phone in paired and (phone in present or phone == new_phone)
+                    ok = phone not in state['paused'] and phone in paired and (phone in present or phone == new_phone)
             else:
                 raise ValueError('Unknown presence command')
         save_state(state_path, state, lasting)
         if ok and output:
-            if not re.fullmatch(r'(?:[0-9A-F]{2}:){5}[0-9A-F]{2}', output):
+            # devices is a JSON list; every other command answers with one Bluetooth address.
+            if command != 'devices' and not re.fullmatch(r'(?:[0-9A-F]{2}:){5}[0-9A-F]{2}', output):
                 return 1
             print(output)
         return 0 if ok else 1

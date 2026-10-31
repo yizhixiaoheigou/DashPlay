@@ -18,11 +18,134 @@ class PairingTests(unittest.TestCase):
         # Bluetooth pairing is offered where wireless CarPlay is (mifi, box_hotspot; not car_hotspot).
         save_json(self.root/'state/setup.json',{'done':True,'mode':'mifi'})
         save_json(self.root/'state/car-hotspot.json',{'ssid':'Car','passphrase':'synthetic1'})
+    def test_worker_diagnostics_are_private_and_replaced_per_window(self):
+        with patch('pairing_window.subprocess.Popen') as launch:
+            self.window.start()
+            log = self.window.directory/'worker.log'
+            self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+            self.assertTrue(launch.call_args.kwargs['stderr'].closed)
+            log.write_text('previous attempt')
+            self.window.process.poll.return_value = 1
+            self.window.start()
+            self.assertEqual(log.read_text(), '')
+
+    def test_adding_a_phone_keeps_the_paired_and_active_phone_visible(self):
+        self.window.process = Mock()
+        self.window.process.poll.return_value = None
+        save_json(self.window.status_file, {'phase':'waiting', 'found':[{'address':'02:00:00:00:00:02', 'name':'New phone'}]})
+        save_json(self.root/'state/receiver/phone-presence.json', {'active':'02:00:00:00:00:01'})
+        with patch.object(self.window, 'devices', return_value={'02:00:00:00:00:01':'XS'}):
+            page = self.page.phones_block(self.window.nonce)[0]
+        self.assertIn('我的手机', page)
+        self.assertIn('<b>XS</b>', page)
+        self.assertIn('正在使用', page)
+        self.assertIn('New phone', page)
+
+    def test_busy_error_names_the_phone_and_unknown_active_stays_visible(self):
+        active = '02:00:00:00:00:01'
+        save_json(self.root/'state/receiver/phone-presence.json', {'active':active})
+        with patch.object(self.window, 'devices', return_value={active:'XS'}):
+            with self.assertRaisesRegex(ValueError, 'XS'):
+                self.window.start()
+            with self.assertRaisesRegex(ValueError, 'XS'):
+                self.window.pick('02:00:00:00:00:02')
+        with patch.object(self.window, 'devices', return_value={}):
+            page = self.page.phones_block(self.window.nonce)[0]
+        self.assertIn('正在使用', page)
+        self.assertIn('00:01', page)
+
     def test_start_rejected_while_someone_is_using_carplay(self):
         save_json(self.root/'state/receiver/phone-presence.json',{'active':'synthetic-A'})
         with patch('pairing_window.subprocess.Popen') as launch:
             with self.assertRaises(ValueError):self.window.start()
             launch.assert_not_called()
+
+    def test_switch_request_hands_carplay_to_another_phone(self):
+        active, other = '02:00:00:00:00:01', '02:00:00:00:00:02'
+        save_json(self.root/'state/receiver/phone-presence.json', {'active':active, 'boot':'boot-key/epoch'})
+        request = self.root/'state/receiver/phone-switch.json'
+        with patch.object(self.window,'devices',return_value={active:'XS', other:'Second'}):
+            message = self.page.apply('/pair', {'nonce':self.window.nonce, 'action':'switch', 'phone':other})
+        self.assertIn('切换', message)
+        self.assertEqual(read_json(request)['phone'], other)
+        self.assertEqual(read_json(request)['boot'], 'boot-key/epoch', 'the presence boot key, not the bare boot id')
+        self.assertEqual(request.stat().st_mode & 0o777, 0o600)
+        # While the switch is in flight the page keeps reloading and names the target as connecting, even
+        # though the old phone still counts as active (2026-10-31).
+        with patch.object(self.window,'devices',return_value={active:'XS', other:'Second'}):
+            html, refresh, _ = self.page.phones_block(self.window.nonce)
+        self.assertTrue(refresh)
+        self.assertIn('正在尝试连接', html)
+        with patch.object(self.window,'devices',return_value={active:'XS', other:'Second'}):
+            self.window.switch_to(active)   # already in use: nothing to ask the receiver for
+        self.assertEqual(read_json(request)['phone'], other)
+        with patch.object(self.window,'devices',return_value={active:'XS'}):
+            with self.assertRaises(ValueError):
+                self.window.switch_to(other)
+
+    def test_paused_phone_shows_persistent_status_after_pairing(self):
+        phone = '02:00:00:00:00:01'
+        self.window.process = Mock()
+        self.window.process.poll.return_value = 0
+        save_json(self.window.status_file, {'phase':'paired'})
+        save_json(self.root/'state/receiver/phone-presence.json', {'last_phone':phone})
+        save_json(self.root/'state/receiver/phone-paused.json', {'phones':[phone]})
+        with patch.object(self.window, 'devices', return_value={phone:'XS'}):
+            html, refresh, _ = self.page.phones_block(self.window.nonce)
+        self.assertIn('已断开 · 自动连接已暂停', html)
+        self.assertIn('接入 CarPlay', html)
+        self.assertNotIn('正在引导', html)
+        self.assertFalse(refresh)
+        self.assertEqual(self.page.phone_node({phone:'XS'}, None, 'paired'), ('off', 'iPhone', '已添加 1 部'))
+
+    def test_connecting_status_uses_live_invitation_not_stale_paired_flag(self):
+        phone = '02:00:00:00:00:01'
+        grant = self.root/'state/receiver/pairing-request.json'
+        self.window.process = Mock()
+        self.window.process.poll.return_value = 0
+        save_json(self.window.status_file, {'phase':'paired'})
+        with patch.object(self.window, 'devices', return_value={phone:'XS'}), patch('pairing_window.time.monotonic', return_value=100):
+            for request, expected in [
+                ({'phone':phone,'boot':'synthetic-boot','expires':150}, True),
+                ({'phone':phone,'boot':'synthetic-boot','expires':90}, False),
+                ({'phone':phone,'boot':'previous-boot','expires':150}, False),
+                ({'phone':phone,'boot':'synthetic-boot','expires':'bad'}, False),
+                ({'phone':'02:00:00:00:00:09','boot':'synthetic-boot','expires':150}, False),
+                ({}, False),
+            ]:
+                with self.subTest(request=request):
+                    save_json(grant, request)
+                    html, refresh, _ = self.page.phones_block(self.window.nonce)
+                    self.assertEqual('正在尝试连接 CarPlay' in html, expected)
+                    self.assertEqual(refresh, expected)
+
+    def test_active_phone_overrides_pending_invitation_and_paused_label(self):
+        phone = '02:00:00:00:00:01'
+        save_json(self.root/'state/receiver/phone-presence.json', {'active':phone})
+        save_json(self.root/'state/receiver/phone-paused.json', {'phones':[phone]})
+        with patch.object(self.window, 'devices', return_value={phone:'XS'}):
+            html, refresh, _ = self.page.phones_block(self.window.nonce)
+        self.assertIn('正在使用', html)
+        self.assertNotIn('已断开 · 自动连接已暂停', html)
+        self.assertFalse(refresh)
+
+    def test_manual_invitation_shows_target_and_does_not_offer_repeat_invite(self):
+        phone = '02:00:00:00:00:01'
+        save_json(self.root/'state/receiver/phone-presence.json', {})
+        with patch.object(self.window, 'devices', return_value={phone:'<XS>'}):
+            self.window.use(phone)
+            html, refresh, _ = self.page.phones_block(self.window.nonce)
+        self.assertIn('「&lt;XS&gt;」蓝牙已配对', html)
+        self.assertNotIn('&amp;lt;', html)
+        self.assertIn('等待接入 CarPlay', html)
+        self.assertNotIn('value=switch', html)
+        self.assertTrue(refresh)
+        save_json(self.root/'state/receiver/phone-paused.json', {'phones':[phone]})
+        with patch.object(self.window, 'devices', return_value={phone:'XS'}):
+            html, refresh, _ = self.page.phones_block(self.window.nonce)
+        self.assertIn('已断开 · 自动连接已暂停', html)
+        self.assertNotIn('正在尝试连接', html)
+        self.assertFalse(refresh)
     def test_no_start_or_confirmation_without_page_nonce(self):
         with patch.object(self.window,'start') as start:
             with self.assertRaises(ValueError):self.page.apply('/pair',{'action':'start','nonce':'wrong'})
@@ -45,6 +168,44 @@ class PairingTests(unittest.TestCase):
         self.assertIn('&lt;script&gt;',page)
         self.assertIn('value=yes',page)
 
+    def test_disconnect_retains_pairing_and_waits_for_receiver_ack(self):
+        phone = '02:00:00:00:00:01'
+        state = self.root/'state/receiver/phone-presence.json'
+        save_json(state, {'active':phone,'boot':'receiver-epoch','paired':[phone]})
+        def receiver_tick(_):
+            request = read_json(state.with_name('phone-disconnect.json'))
+            self.assertEqual(request['phone'], phone)
+            self.assertEqual(read_json(state.with_name('phone-paused.json'))['phones'], [phone])
+            save_json(state, {'boot':'receiver-epoch','paired':[phone]})
+        with patch.object(self.window,'devices',return_value={phone:'XS'}), patch('pairing_window.time.sleep',side_effect=receiver_tick):
+            self.page.apply('/pair',{'action':'disconnect','phone':phone,'nonce':self.window.nonce})
+            self.assertEqual(read_json(state)['paired'],[phone])
+            self.window.use(phone)
+        self.assertEqual(read_json(state.with_name('phone-paused.json'))['phones'], [])
+
+    def test_delete_active_phone_waits_for_disconnect_before_removing_bond(self):
+        phone = '02:00:00:00:00:01'
+        state = self.root/'state/receiver/phone-presence.json'
+        save_json(state, {'active':phone,'boot':'epoch','phones':{phone:{}},'paired':[phone]})
+        def receiver_tick(_): save_json(state, {'boot':'epoch','phones':{phone:{}},'paired':[phone]})
+        async def remove(root, target):
+            self.assertNotIn('active', read_json(state))
+            self.assertEqual(target, phone)
+        with patch.object(self.window,'devices',return_value={phone:'XS'}), \
+                patch('pairing_window.time.sleep',side_effect=receiver_tick), patch('pairing_window.remove_device',side_effect=remove):
+            self.window.remove(phone)
+        self.assertEqual(read_json(state)['phones'], {})
+        self.assertEqual(read_json(state)['paired'], [])
+
+    def test_delete_keeps_bond_if_receiver_does_not_ack_disconnect(self):
+        phone = '02:00:00:00:00:01'
+        save_json(self.root/'state/receiver/phone-presence.json', {'active':phone,'boot':'epoch'})
+        with patch.object(self.window,'devices',return_value={phone:'XS'}), patch('pairing_window.time.sleep'), \
+                patch('pairing_window.remove_device') as remove:
+            with self.assertRaisesRegex(ValueError,'断开'):
+                self.window.remove(phone)
+            remove.assert_not_called()
+
     def test_manual_use_never_preempts_and_requires_a_paired_phone(self):
         grant=self.root/'state/receiver/pairing-request.json'
         with patch.object(self.window,'devices',return_value={'02:00:00:00:00:02':'Synthetic B'}):
@@ -60,13 +221,15 @@ class PairingTests(unittest.TestCase):
         with patch.object(self.window,'devices',return_value={'02:00:00:00:00:01':'A','02:00:00:00:00:02':'<B>'}):
             page=self.page.render('')
             self.assertIn('<b>&lt;B&gt;</b><span>蓝牙 …00:02</span>',page)
-            self.assertEqual(page.count('value=use'),2)
+            self.assertEqual(page.count('value=switch'),2)
             save_json(self.root/'state/receiver/phone-presence.json',{'active':'02:00:00:00:00:01','last_phone':'02:00:00:00:00:01'})
             page=self.page.render('')
         self.assertIn('<b>A</b><span>蓝牙 …00:01</span></span><span class=value>正在使用</span>',page)
-        self.assertEqual(page.count('value=remove'),1)
+        self.assertEqual(page.count('value=remove'),2)
+        self.assertEqual(page.count('value=disconnect'),1)
         self.assertIn('删除「&lt;B&gt;」',page)
-        self.assertNotIn('value=use',page)
+        self.assertEqual(page.count('value=switch'),1)   # the other phone can take CarPlay over
+        self.assertIn('切换到这部手机',page)
 
     def test_pick_only_listed_phone_while_idle_and_waiting(self):
         self.window.process=Mock();self.window.process.poll.return_value=None
@@ -114,6 +277,76 @@ class PairingTests(unittest.TestCase):
         self.assertEqual(left['declined'],{})
         self.assertEqual(left['paired'],[A])
         self.assertFalse(grant.exists())
+
+class PairingAgentRegressionTests(unittest.IsolatedAsyncioTestCase):
+    """Exercise the real nested Agent/pair callbacks with a synthetic D-Bus transport."""
+    def setUp(self):
+        import ast, asyncio
+        import pairing_window
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.directory = Path(self.tmp.name)
+        class FakeError(Exception):
+            def __init__(self, kind, text):
+                self.type = kind
+                super().__init__(text)
+        class FakeInterface:
+            def __init__(self, name): pass
+        self.error = FakeError
+        self.pair_wait = asyncio.Future()
+        class Device:
+            async def get_alias(inner): return 'Synthetic phone'
+            async def call_pair(inner): return await self.pair_wait
+            async def get_paired(inner): return False
+        async def proxy(path, interface): return Device()
+        source = ast.parse(Path(pairing_window.__file__).read_text())
+        run = next(n for n in source.body if isinstance(n, ast.AsyncFunctionDef) and n.name == 'run_incoming')
+        callbacks = [n for n in run.body if isinstance(n, (ast.ClassDef, ast.AsyncFunctionDef)) and n.name in ('Agent', 'pair')]
+        wrapper = ast.parse("""def create():
+    selected = None
+    confirmed = False
+    deadline = time.monotonic() + 120
+    opened = time.monotonic()
+    error = ''
+    error_code = ''
+    attempt_generation = 0
+    def get_state():
+        return selected, confirmed, error
+    return Agent(), pair, get_state
+""").body[0]
+        wrapper.body[-1:-1] = callbacks
+        ns = dict(vars(pairing_window), ServiceInterface=FakeInterface, method=lambda: lambda f:f,
+                  DBusError=FakeError, asyncio=asyncio, proxy=proxy, stopped=asyncio.Event(),
+                  adapter_path='/synthetic', busy=lambda:False, trace=lambda *args:None,
+                  status_file=self.directory/'status.json', confirm_file=self.directory/'confirm.json')
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])), '<real pairing callbacks>', 'exec'), ns)
+        self.agent, self.pair, self.state = ns['create']()
+
+    async def test_bluez_cancel_invalidates_prompt_without_touching_a_new_request(self):
+        import asyncio
+        old = asyncio.create_task(self.agent.RequestConfirmation('/synthetic/dev_A', 123456))
+        await asyncio.sleep(.01)
+        old_id = read_json(self.directory/'status.json')['request_id']
+        self.agent.Cancel()
+        self.assertNotEqual(read_json(self.directory/'status.json').get('phase'), 'confirm')
+        new = asyncio.create_task(self.agent.RequestConfirmation('/synthetic/dev_B', 654321))
+        await asyncio.sleep(.01)
+        current = read_json(self.directory/'status.json')
+        self.assertNotEqual(current['request_id'], old_id)
+        save_json(self.directory/'confirm.json', {'request_id':current['request_id'], 'accepted':True})
+        with self.assertRaises(self.error): await old
+        await new
+        self.assertEqual(self.state()[:2], ('/synthetic/dev_B', True))
+        self.assertEqual(read_json(self.directory/'status.json')['phase'], 'finishing')
+
+    async def test_pairing_transport_failure_does_not_blame_the_phone(self):
+        self.pair_wait.set_exception(self.error('org.bluez.Error.AuthenticationTimeout', 'synthetic'))
+        await self.pair('/synthetic/dev_A')
+        status = read_json(self.directory/'status.json')
+        self.assertNotIn('手机没有确认', status['error'])
+        self.assertIn('超时', status['error'])
+        self.assertEqual(status['error_code'], 'AuthenticationTimeout')
+
 
 class AttemptDeadlineTests(unittest.TestCase):
     # 2026-10-19 (F50): a retry late in the 180 s window was cut off while the iPhone was confirming.

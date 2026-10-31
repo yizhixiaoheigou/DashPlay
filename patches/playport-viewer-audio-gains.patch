@@ -1,0 +1,399 @@
+Viewer: per-sound levels in the box settings (2026-10-27).
+
+Navigation, alerts, media, Siri and calls each get 0-300 % of the level the page already used (100 % is
+today's setting); navigation keeps its existing x3 boost when music goes over the car's Bluetooth as the
+base. Above 100 % a sound passes its own limiter; media is played through a media element and can only be
+turned down. Saved in this browser, like the master volume.
+
+diff --git a/web/check-audio-mix.mjs b/web/check-audio-mix.mjs
+new file mode 100644
+index 0000000..baeb3e8
+--- /dev/null
++++ b/web/check-audio-mix.mjs
+@@ -0,0 +1,30 @@
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import ts from 'typescript';
++
++// The sound-level panel rests on these numbers: 100 % must reproduce today's level, and the caps keep the
++// existing limiter behaviour (×8 for prompts) while media, played through a media element, only turns down.
++const source = readFileSync(new URL('./src/audio-mix.ts', import.meta.url), 'utf8');
++const { outputText } = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } });
++const mix = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
++
++assert.deepEqual(mix.AUDIO_CATEGORIES, ['default', 'media', 'speechrecognition', 'telephony', 'alert']);
++assert.equal(mix.baseGain('default', 3), 3, 'navigation keeps its existing ×3 boost as the base');
++assert.equal(mix.baseGain('default', 8), 8);
++assert.equal(mix.baseGain('default', 0), 1, 'the old ?promptgain= floor becomes the base');
++assert.equal(mix.baseGain('media', 3), 1, 'only navigation carries the prompt boost');
++assert.equal(mix.baseGain('speechrecognition', 3), 1);
++assert.equal(mix.maxPercent('media'), 100, 'a media element cannot go above 1');
++assert.equal(mix.maxPercent('telephony'), 300);
++assert.equal(mix.clampPercent('media', 250), 100);
++assert.equal(mix.clampPercent('telephony', -5), 0);
++assert.equal(mix.clampPercent('telephony', Number.NaN), 100);
++assert.equal(mix.effectiveGain(3, 150), 4.5, 'percentage is relative to the base');
++assert.equal(mix.effectiveGain(3, 0), 0);
++assert.equal(mix.effectiveGain(8, 300), 8, 'the existing ×8 ceiling still applies');
++assert.deepEqual(mix.parseMix(null), {});
++assert.deepEqual(mix.parseMix('not json'), {});
++assert.deepEqual(mix.parseMix('{"default":150,"media":250,"unknown":50}'), { default: 150, media: 100 });
++assert.equal(mix.mixPercent({ default: 150 }, 'default'), 150);
++assert.equal(mix.mixPercent({}, 'telephony'), 100, 'unset categories keep today’s level');
++console.log('Sound-level checks passed: base levels, percentage, caps and saved values');
+diff --git a/web/check-car.mjs b/web/check-car.mjs
+index 5b4ad78..5ceffbb 100644
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -221,10 +221,10 @@ assert.deepEqual(media.report(),{positionState:1,songPos:62,songDur:200,art:0},'
+ media.setActive(false);assert.equal(navigator.mediaSession.playbackState,'none');assert.equal(navigator.mediaSession.metadata,null);
+ // Music must take exactly one route; voice/navigation keep the existing Web Audio path.
+ const edges=[];let music;let packets=0;
+-class Node {gain={value:1};connect(to){edges.push(to);}disconnect(){}}
+-globalThis.AudioContext=class {state='running';destination={speaker:true};createGain(){return new Node();}resume(){return Promise.resolve();}};
++class Node {gain={value:1};threshold={value:0};knee={value:0};ratio={value:0};attack={value:0};release={value:0};connect(to){edges.push(to);}disconnect(){}}
++globalThis.AudioContext=class {state='running';destination={speaker:true};createGain(){return new Node();}createDynamicsCompressor(){return new Node();}resume(){return Promise.resolve();}};
+ globalThis.TestMusic=class {static supported(){return true;}static key(c){return JSON.stringify([c.sampleRate,c.channels,Array.from(c.description)]);}constructor(config){music=this;this.configKey=JSON.stringify([config.sampleRate,config.channels,Array.from(config.description)]);}unlocked=false;playing=false;configKey="";pause(){this.playing=false;this.paused=true;}volume(){}unlock(){this.unlocked=true;this.unlocks=(this.unlocks??0)+1;return Promise.resolve();}packet(){packets++;}close(){this.closed=true;}};
+-const {AudioEngine}=await load('audio',s=>s.replace(/^import .*?;$/gm,'')+'\nconst MusicOutput=globalThis.TestMusic;const AudioCodec={AacLc:1,Opus:2,Lpcm:3};\nfunction audioStartTime(){return 0;}');
++const {AudioEngine}=await load('audio',s=>s.replace(/^import .*?;$/gm,'')+'\nconst MusicOutput=globalThis.TestMusic;const AudioCodec={AacLc:1,Opus:2,Lpcm:3};\nfunction audioStartTime(){return 0;}\nconst baseGain=(n,b)=>n===\'default\'?Math.min(8,Math.max(1,b)):1;const clampPercent=(n,p)=>Math.min(n===\'media\'?100:300,Math.max(0,p));const effectiveGain=(b,p)=>Math.min(8,Math.max(0,b*p/100));');
+ const audio=new AudioEngine(()=>{});assert.equal(edges.length,1);assert.equal(edges[0].speaker,true);
+ audio.handleConfig({streamType:102,codec:1,name:'media',sampleRate:48000,channels:2,description:new Uint8Array([0x11,0x90])});
+ audio.handlePacket({streamType:102,timestampUs:0,data:new Uint8Array([1,2])});assert.equal(packets,1);
+@@ -234,6 +234,14 @@ audio.stopStream(102);assert.equal(music.closed,undefined,"Pause retains native
+ const pausedMusic=music;
+ audio.handleConfig({streamType:102,codec:1,name:'media',sampleRate:48000,channels:2,description:new Uint8Array([0x11,0x90])});
+ assert.equal(music,pausedMusic,'Resume reuses the native media element');assert.equal(audio.streams.get(102).music,pausedMusic,'as the stream\'s music');
++// The box settings' sound levels: above 100 % a category goes through its own limiter, at or below it the master.
++audio.setCategoryPercent('default',150);
++audio.handleConfig({streamType:7,codec:2,name:'default',sampleRate:24000,channels:1,description:new Uint8Array()});
++assert.notEqual(audio.streams.get(7).out,audio.gain,'boosted navigation uses a limiter');
++audio.setCategoryPercent('default',50);
++assert.equal(audio.streams.get(7).out,audio.gain,'at or below 100 % it feeds the master directly');
++audio.setCategoryPercent('media',50);
++assert.ok(audio.streams.get(102).music,'media stays on its element');
+ audio.stopAll();assert.equal(music.closed,true);assert.equal(audio.isPlaying,false);
+ const {aacInit,aacFragment}=await load('aac-mp4');
+ const init=aacInit(48000,2,new Uint8Array([0x11,0x90]));
+diff --git a/web/index.html b/web/index.html
+index 420fbe1..3898002 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -31,6 +31,15 @@
+   </div>
+   <p class="group-title" data-i18n="volume"></p>
+   <div class="group"><div class="cell volume"><svg class="ico dim" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><path d="M4 9h3l5-4v14l-5-4H4z"/></svg><input id="volume" type="range" min="0" max="100" value="100"/><svg class="ico dim" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 9h3l5-4v14l-5-4H4z" fill="currentColor" stroke="none"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></svg><output id="volume-value">100%</output></div></div>
++  <p class="group-title" data-i18n="audioMix"></p>
++  <div class="group" id="audio-mix">
++    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioNav"></b><span id="audio-default-base"></span></span><input id="audio-default" type="range" min="0" max="300" step="5" value="100"/><output id="audio-default-value">100%</output></div>
++    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioAlert"></b><span id="audio-alert-base"></span></span><input id="audio-alert" type="range" min="0" max="300" step="5" value="100"/><output id="audio-alert-value">100%</output></div>
++    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioMedia"></b><span id="audio-media-base"></span></span><input id="audio-media" type="range" min="0" max="100" step="5" value="100"/><output id="audio-media-value">100%</output></div>
++    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioSiri"></b><span id="audio-speechrecognition-base"></span></span><input id="audio-speechrecognition" type="range" min="0" max="300" step="5" value="100"/><output id="audio-speechrecognition-value">100%</output></div>
++    <div class="cell volume audio-row"><span class="main"><b data-i18n="audioCalls"></b><span id="audio-telephony-base"></span></span><input id="audio-telephony" type="range" min="0" max="300" step="5" value="100"/><output id="audio-telephony-value">100%</output></div>
++  </div>
++  <p class="foot" data-i18n="audioMixHint"></p>
+   <p id="audio-status" class="foot"></p>
+   <p class="group-title" data-i18n="display"></p>
+   <div class="group">
+diff --git a/web/package.json b/web/package.json
+index 6a47147..abd7ead 100644
+--- a/web/package.json
++++ b/web/package.json
+@@ -5,7 +5,7 @@
+   "type": "module",
+   "scripts": {
+     "dev": "vite",
+-    "test": "node check.mjs && node check-audio.mjs && node check-car.mjs && node check-browser.mjs && node check-flac.mjs",
++    "test": "node check.mjs && node check-audio.mjs && node check-audio-mix.mjs && node check-car.mjs && node check-browser.mjs && node check-flac.mjs",
+     "build": "tsc && vite build",
+     "preview": "vite preview"
+   },
+diff --git a/web/src/audio-mix.ts b/web/src/audio-mix.ts
+new file mode 100644
+index 0000000..e375718
+--- /dev/null
++++ b/web/src/audio-mix.ts
+@@ -0,0 +1,47 @@
++/** Volume relative to the level this page has always used, for each sound CarPlay sends.
++ *
++ *  Navigation prompts ("default") already carry a boost when music goes to the car over Bluetooth
++ *  (the ×3 in main.ts, or ?promptgain=): 100 % in this panel means that existing level, not an unboosted one.
++ *  Alerts ("alert"), Siri, calls and media start at ×1. Media is played through a media element whose
++ *  volume stops at 1, so it can only be turned down.
++ */
++export const AUDIO_CATEGORIES = ['default', 'media', 'speechrecognition', 'telephony', 'alert'] as const;
++export type AudioCategory = (typeof AUDIO_CATEGORIES)[number];
++
++/** Keeps this browser's choice across reloads; language and master volume live in their own keys. */
++export const STORAGE_KEY = 'f50-audio-mix';
++
++/** The level in use before this panel existed: ×3 for prompts when music goes over the car's Bluetooth. */
++export function baseGain(name: string, promptBoost: number): number {
++  return name === 'default' ? Math.min(8, Math.max(1, promptBoost)) : 1;
++}
++
++export function maxPercent(name: string): number {
++  return name === 'media' ? 100 : 300;
++}
++
++export function clampPercent(name: string, percent: number): number {
++  return Math.min(maxPercent(name), Math.max(0, Number.isFinite(percent) ? percent : 100));
++}
++
++/** What the audio engine applies: the base times the percentage, capped like the old ?promptgain= (×8). */
++export function effectiveGain(base: number, percent: number): number {
++  return Math.min(8, Math.max(0, base * percent / 100));
++}
++
++/** Read this browser's saved mix; unknown or broken entries fall back to 100 %. */
++export function parseMix(raw: string | null): Partial<Record<AudioCategory, number>> {
++  let data: unknown;
++  try { data = JSON.parse(raw ?? '{}'); } catch { return {}; }
++  if (!data || typeof data !== 'object') return {};
++  const mix: Partial<Record<AudioCategory, number>> = {};
++  for (const category of AUDIO_CATEGORIES) {
++    const value = (data as Record<string, unknown>)[category];
++    if (typeof value === 'number' && Number.isFinite(value)) mix[category] = clampPercent(category, value);
++  }
++  return mix;
++}
++
++export function mixPercent(mix: Partial<Record<AudioCategory, number>>, category: AudioCategory): number {
++  return clampPercent(category, mix[category] ?? 100);
++}
+diff --git a/web/src/audio.ts b/web/src/audio.ts
+index 87cc654..1e9861c 100644
+--- a/web/src/audio.ts
++++ b/web/src/audio.ts
+@@ -1,6 +1,7 @@
+ import { MusicOutput } from './music-output';
+ import { audioStartTime } from './audio-timing';
+ import { AudioCodec, type AudioConfigMessage, type AudioPacketMessage } from './protocol';
++import { baseGain, clampPercent, effectiveGain } from './audio-mix';
+ 
+ interface StreamState {
+   codec: number;
+@@ -11,6 +12,8 @@ interface StreamState {
+   decoder: AudioDecoder | null;
+   nextPlayTime: number;
+   gain: GainNode;
++  /** What [gain] feeds: the master node, or this category's limiter while it is above 100 %. */
++  out: AudioNode;
+ }
+ 
+ 
+@@ -20,6 +23,9 @@ export class AudioEngine {
+   private readonly gain: GainNode;
+   private readonly streams = new Map<number, StreamState>();
+   private readonly streamGains = new Map<string, number>();
++  /** Per-category percentage chosen in the box settings: 100 % is the level this page always used. */
++  private readonly percents = new Map<string, number>();
++  private readonly limiters = new Map<string, DynamicsCompressorNode>();
+   private retainedMusic: MusicOutput | null = null;
+   private retainedConfig = "";
+   private unlocked = false;
+@@ -31,11 +37,10 @@ export class AudioEngine {
+       (this.context.state === 'running' && performance.now() - this.lastAudioAt < 1800);
+   }
+ 
+-  /** Navigation prompts and alerts (audioType "default") boosted by this much through a limiter: in a Tesla the
++  /** Navigation prompts and alerts (audioType "default") carry this boost through a limiter: in a Tesla the
+    *  music goes to the car over Bluetooth at the car's volume while prompts come through the browser, and they were
+-   *  hard to hear at 1 (2026-10-14). 1 leaves them as sent. */
++   *  hard to hear at 1 (2026-10-14). 100 % in the sound-level panel means this same level. */
+   private readonly promptBoost: number;
+-  private promptLimiter: DynamicsCompressorNode | null = null;
+   /** Music over the car's Bluetooth: a Tesla took a browser that has an audio output open, even a silent one, for a
+    *  music source and switched its media card between it and the iPhone's Bluetooth over and over (2026-10-14). The output is closed
+    *  (context suspended) a few seconds after the last stream ends and opened again for the next prompt or call. */
+@@ -65,20 +70,26 @@ export class AudioEngine {
+     }, 3000);
+   }
+ 
++  private categoryPercent(name: string): number {
++    return clampPercent(name, this.percents.get(name) ?? 100);
++  }
++
+   private streamGainValue(name: string): number {
+-    return (this.streamGains.get(name) ?? 1) * (name === 'default' ? this.promptBoost : 1);
++    return (this.streamGains.get(name) ?? 1) * effectiveGain(baseGain(name, this.promptBoost), this.categoryPercent(name));
+   }
+ 
++  /** Above 100 % a category goes through its own limiter; at or below it feeds the master node directly. */
+   private streamOutput(name: string): AudioNode {
+-    if (name !== 'default' || this.promptBoost === 1) return this.gain;
+-    if (!this.promptLimiter) {
+-      const limiter = this.context.createDynamicsCompressor();
++    if (this.streamGainValue(name) <= 1) return this.gain;
++    let limiter = this.limiters.get(name);
++    if (!limiter) {
++      limiter = this.context.createDynamicsCompressor();
+       limiter.threshold.value = -6; limiter.knee.value = 0; limiter.ratio.value = 20;
+       limiter.attack.value = 0.003; limiter.release.value = 0.1;
+       limiter.connect(this.gain);
+-      this.promptLimiter = limiter;
++      this.limiters.set(name, limiter);
+     }
+-    return this.promptLimiter;
++    return limiter;
+   }
+ 
+   get isUnlocked(): boolean {
+@@ -96,14 +107,34 @@ export class AudioEngine {
+   setVolume(volume: number): void {
+     this.masterVolume = Math.min(1, Math.max(0, volume));
+     this.gain.gain.value = this.masterVolume;
+-    for (const state of this.streams.values()) state.music?.volume(this.masterVolume * (this.streamGains.get(state.name) ?? 1));
++    for (const state of this.streams.values()) state.music?.volume(this.masterVolume * this.streamGainValue(state.name));
+   }
+ 
+   setStreamGain(name: string, value: number): void {
+     const gain = Math.min(1, Math.max(0, value));
+     this.streamGains.set(name, gain);
++    this.applyStreamGain(name);
++  }
++
++  /** One category's percentage from the viewer's box settings; applies to streams already playing too. */
++  setCategoryPercent(name: string, percent: number): void {
++    this.percents.set(name, clampPercent(name, percent));
++    this.applyStreamGain(name);
++  }
++
++  private applyStreamGain(name: string): void {
++    const value = this.streamGainValue(name);
++    const out = this.streamOutput(name);
+     for (const state of this.streams.values()) {
+-      if (state.name === name) state.gain.gain.value = this.streamGainValue(name);
++      if (state.name !== name) continue;
++      state.gain.gain.value = value;
++      state.music?.volume(this.masterVolume * value);
++      // Crossing 1 rewires the stream through or around its limiter; the gain node keeps its own level.
++      if (state.out !== out) {
++        try { state.gain.disconnect(); } catch { /* already disconnected */ }
++        state.gain.connect(out);
++        state.out = out;
++      }
+     }
+   }
+ 
+@@ -116,7 +147,8 @@ export class AudioEngine {
+     this.wake();
+     const streamGain = this.context.createGain();
+     streamGain.gain.value = this.streamGainValue(message.name);
+-    streamGain.connect(this.streamOutput(message.name));
++    const out = this.streamOutput(message.name);
++    streamGain.connect(out);
+     const state: StreamState = {
+       codec: message.codec,
+       sampleRate: message.sampleRate,
+@@ -126,6 +158,7 @@ export class AudioEngine {
+       decoder: null,
+       nextPlayTime: 0,
+       gain: streamGain,
++      out,
+     };
+     // Music through a media element: AAC (stream 102, wireless) as sent; the wired iPhone's LPCM
+     // (stream 100) losslessly as FLAC, since 7 ms Web Audio buffers crackled and gave the head unit no
+@@ -137,7 +170,7 @@ export class AudioEngine {
+         state.music = (this.retainedMusic && this.retainedConfig === MusicOutput.key(message, kind) ? this.retainedMusic : new MusicOutput(message, this.onError, kind));
+         if (this.retainedMusic && this.retainedMusic !== state.music) this.retainedMusic.close();
+         this.retainedMusic = null;
+-        state.music.volume(this.masterVolume * (this.streamGains.get(state.name) ?? 1));
++        state.music.volume(this.masterVolume * this.streamGainValue(state.name));
+         this.streams.set(message.streamType, state);
+         void state.music.unlock().catch(() => {});
+         return;
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+index 12654eb..03ad84d 100644
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -15,6 +15,9 @@ const messages = {
+   starting: ['已连接，正在等待画面…', 'Connected. Waiting for video…'], live: ['已连接', 'Connected'],
+   access: ['需要首次登录链接', 'First-time access link required'], accessHint: ['请使用私有访问资料中的完整链接打开一次，此浏览器会记住登录。', 'Open the complete link from your private access file once. This browser will remember it.'],
+   sound: ['轻点启用声音', 'Tap to enable sound'], volume: ['音量', 'Volume'],
++  audioMix: ['各声音的音量', 'Sound levels'], audioNav: ['导航播报', 'Navigation'], audioAlert: ['提示音', 'Alerts'], audioMedia: ['媒体音乐', 'Media'], audioSiri: ['Siri', 'Siri'], audioCalls: ['通话', 'Calls'],
++  audioBase: ['基准 {base}，现在 {now}', 'Base {base}, now {now}'],
++  audioMixHint: ['100% 就是现在的设定。导航在媒体走车机蓝牙的用法里自带放大（默认 ×3），所以它的基准是那个倍数；调大后经过限幅，避免破音。媒体由本页播放时最高 100%，经车机蓝牙的音乐请用车机音量。设置保存在此浏览器。', '100% is today’s setting. Navigation carries its built-in boost when music goes over the car’s Bluetooth (×3 by default), so its base is that gain; higher levels pass a limiter to avoid clipping. Media played by this page tops out at 100%; use the car’s volume for music over Bluetooth. Saved in this browser.'],
+   display: ['画面', 'Display'], fullscreen: ['全屏', 'Fullscreen'], exitFullscreen: ['退出全屏', 'Exit fullscreen'], fullscreenHint: ['已全屏。退出全屏：点 CarPlay 主屏幕上的「盒子设置」图标，再点「退出全屏」。', 'Fullscreen on. To exit, tap the Box settings icon on the CarPlay home screen, then Exit fullscreen.'], fullscreenFail: ['此浏览器不允许全屏，画面仍会自动适配窗口。', 'Fullscreen unavailable. The picture still fits this window.'], tapFullscreen: ['轻点画面恢复全屏', 'Tap the picture to go back to fullscreen'],
+   teslaFullscreenOffline: ['全屏要经腾讯视频跳转，特斯拉现在上不了网。画面照常可用。', 'Fullscreen goes through a video site and the car is offline. The picture keeps working.'],
+   autoHint: ['关闭时跟随窗口：窗口多大就用多大，切到没见过的窗口会重连一次；打开后可自己填宽度、高度。只在一个显示端开启。', 'Off: follow the window; a new window size reconnects CarPlay once. On: set the width and height yourself. Turn it on for one display only.'],
+@@ -45,7 +48,7 @@ const messages = {
+   mediaNo: ['浏览器不提供系统媒体控制接口。', 'This browser does not expose system media controls.'],
+   noStream: ['尚无音视频流', 'No media stream yet'], playing: ['音频正在播放', 'Audio playing'], paused: ['等待音频', 'Waiting for audio'],
+   error: ['播放遇到问题', 'Playback problem'], technical: ['详细信息', 'Details'],
+-  savedHere: ['语言、音量与分辨率偏好保存在此浏览器。CarPlay 内部语言跟随 iPhone。', 'Language, volume and display preferences are saved in this browser. CarPlay itself follows the iPhone language.'],
++  savedHere: ['语言、音量（含各声音）、分辨率偏好保存在此浏览器。CarPlay 内部语言跟随 iPhone。', 'Language, volume (including each sound), and display preferences are saved in this browser. CarPlay itself follows the iPhone language.'],
+   privacy: ['首次登录后无需再次进入设置；自动播放被浏览器拦截时，只需轻点画面一次。', 'No need to reopen settings after setup. If autoplay is blocked, tap the screen once.'],
+   follow: ['关注作者 · 一只小黑狗', 'Follow the author'],
+   followDouyin: ['抖音扫一扫', 'Scan in Douyin'], followXiaohongshu: ['小红书扫一扫', 'Scan in Xiaohongshu'],
+diff --git a/web/src/main.ts b/web/src/main.ts
+index 228ec37..c7c94a5 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -1,5 +1,6 @@
+ import { startup, startupStats } from './startup';
+ import { AudioEngine } from './audio';
++import { AUDIO_CATEGORIES, STORAGE_KEY as AUDIO_MIX_KEY, baseGain, clampPercent, effectiveGain, maxPercent, mixPercent, parseMix, type AudioCategory } from './audio-mix';
+ import { InputController } from './input';
+ import { MicrophoneUplink } from './mic';
+ import { VideoPlayer } from './video';
+@@ -85,6 +86,7 @@ function render() {
+   const night = isNight(parseNightMode(nightSelect.value), new Date(), darkQuery.matches);
+   el('night-status').textContent = `${t('nightNow')}${t(night ? 'nightOn' : 'nightOff')}`;
+   el('night-status').title = t(darkQuery.matches ? 'browserDark' : 'browserLight');
++  renderAudioMix();
+   if (!devicesBlock.hidden) renderDevices();
+ }
+ 
+@@ -260,8 +262,38 @@ const promptGain = Number(new URLSearchParams(location.search).get('promptgain')
+ // Music the iPhone still sends here is played: it sends music to one place at a time, and after Siri from the
+ // CarPlay screen it sent it here for ~27 s before going back to the car's Bluetooth, silent while it was dropped.
+ const audio = new AudioEngine(error, { promptBoost: promptGain, idleClose: carMusic });
++// The sound-level panel: each category is a percentage of the level the page has always used. Navigation's
++// 100 % already includes the ×3 boost above when music goes to the car over Bluetooth; media stops at 100 %
++// because it is played through a media element (see audio-mix.ts). Kept in this browser, like the master volume.
++const AUDIO_LABELS: Record<AudioCategory, Key> = {
++  default: 'audioNav', alert: 'audioAlert', media: 'audioMedia', speechrecognition: 'audioSiri', telephony: 'audioCalls',
++};
++let audioMix = parseMix(localStorage.getItem(AUDIO_MIX_KEY));
++for (const category of AUDIO_CATEGORIES) audio.setCategoryPercent(category, mixPercent(audioMix, category));
++const gainText = (value: number) => `×${value.toFixed(2).replace(/\.?0+$/, '')}`;
++function renderAudioMix() {
++  for (const category of AUDIO_CATEGORIES) {
++    const percent = mixPercent(audioMix, category);
++    const input = el<HTMLInputElement>(`audio-${category}`);
++    input.max = String(maxPercent(category));
++    if (Number(input.value) !== percent) input.value = String(percent);
++    input.setAttribute('aria-label', t(AUDIO_LABELS[category]));
++    const base = baseGain(category, promptGain);
++    el(`audio-${category}-base`).textContent = t('audioBase')
++      .replace('{base}', gainText(base)).replace('{now}', gainText(effectiveGain(base, percent)));
++    el(`audio-${category}-value`).textContent = `${percent}%`;
++  }
++}
++for (const category of AUDIO_CATEGORIES) {
++  const input = el<HTMLInputElement>(`audio-${category}`);
++  input.oninput = () => {
++    audioMix = { ...audioMix, [category]: clampPercent(category, Number(input.value)) };
++    localStorage.setItem(AUDIO_MIX_KEY, JSON.stringify(audioMix));
++    audio.setCategoryPercent(category, mixPercent(audioMix, category));
++    renderAudioMix();
+   };
+ }
++renderAudioMix();
+ /** Music over the car's Bluetooth: the car's media card shows the page's title and address whenever the page sounds
+  *  (Siri, prompts, calls; a Tesla, 2026-10-14); name it instead. The last voice stream to start wins; the title goes back when none is left. */
+ const voiceLabels: Record<string, string> = { speechrecognition: 'Siri', telephony: '通话', default: '导航播报' };
+diff --git a/web/src/style.css b/web/src/style.css
+index 777d1f5..4bbcd2c 100644
+--- a/web/src/style.css
++++ b/web/src/style.css
+@@ -83,6 +83,9 @@ select option { color:#000; }
+ .volume { gap:14px; }
+ .volume input[type=range] { flex:1; min-width:0; height:32px; margin:0; accent-color:#fff; }
+ .volume output { min-width:3.2em; text-align:right; color:var(--secondary); font-variant-numeric:tabular-nums; }
++/* One row per sound: the label and its base need room, the slider takes what is left. */
++.audio-row .main { flex:1 1 9em; min-width:6em; }
++.audio-row input[type=range] { flex:2 1 7em; }
+ 
+ .btn { display:block; width:100%; min-height:50px; margin:14px 0 0; padding:13px 16px; border:0; border-radius:12px; background:var(--tint);
+   color:#fff; font-weight:600; text-align:center; transition:transform .1s ease-out; }

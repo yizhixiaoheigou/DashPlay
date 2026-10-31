@@ -11,6 +11,7 @@ Optional: a DuckDNS name with a Let's Encrypt certificate (uci duckdns_domain / 
 own_domain.py) for car browsers that refuse the local CA; it then replaces the name.
 """
 import argparse
+import audio_routes
 import ipaddress
 import json
 import os
@@ -57,7 +58,8 @@ DEFAULTS = {"enabled": "1", "wifi": "auto", "settings_port": "18080", "viewer_po
             # the music goes over the car's Bluetooth, the page leaves the steering wheel, media card and volume to
             # the car and plays prompts louder. car_voice 1: calls and Siri too (the receiver offers no microphone).
             "car_music": "0", "car_voice": "0",
-            # 1: Tesla mode: shared_lan, car_music, car_voice and the Tesla browser's fullscreen.
+            # 1: Tesla mode: shared_lan, the Tesla browser's fullscreen, and both switches above turned on when Tesla
+            # mode is enabled (LuCI); the two switches stay the owner's choice afterwards (2026-10-28).
             "tesla_mode": "0", "answer_tesla_checks": "auto",
             # A DuckDNS sub-domain and its token: the name becomes <sub-domain>.duckdns.org, with a Let's Encrypt
             # certificate the router obtains and renews itself (own_domain.py). Empty: off.
@@ -68,10 +70,17 @@ DEFAULTS = {"enabled": "1", "wifi": "auto", "settings_port": "18080", "viewer_po
 
 
 def car_audio_args(config):
-    """run-receiver.py options for what goes over the car's own Bluetooth; Tesla mode is all of them."""
-    if config["tesla_mode"] == "1":
+    """run-receiver.py options for what goes over the car's own Bluetooth; Tesla mode turns both switches on when it
+    is enabled (LuCI) but they remain the owner's choice, as on the box (2026-10-28)."""
+    # One sound switch since 2026-10-31 (audio_routes.resolve), the same as on the Linux boxes; a router whose owner
+    # never touched it keeps the older options unchanged.
+    tesla = config["tesla_mode"] == "1"
+    if config.get(audio_routes.OUTPUT_KEY):
+        return audio_routes.arguments(config, tesla)
+    if tesla and config["car_music"] == "1" and config["car_voice"] == "1":
         return ["--tesla"]
-    return [flag for key, flag in (("car_music", "--car-music"), ("car_voice", "--car-voice")) if config[key] == "1"]
+    return (["--tesla-browser"] if tesla else []) + [
+        flag for key, flag in (("car_music", "--car-music"), ("car_voice", "--car-voice")) if config[key] == "1"]
 
 
 RECHECK_EVERY = 10      # seconds between looks at the Wi-Fi handed to the iPhone
@@ -468,8 +477,15 @@ def main():
         reexec.append(reason)
         stopped.set()
 
+    receiver_refresh = []
+    def on_settings_change(reason):
+        if reason == 'receiver options changed':
+            receiver_refresh.append(reason)
+        else:
+            request_reexec(reason)
+
     trusted = []   # the network the settings page serves, once the Wi-Fi is known (it starts after that)
-    settings = SettingsPage(state, lambda: status, request_reexec, lambda: list(trusted), None, WIRED_STATUS,
+    settings = SettingsPage(state, lambda: status, on_settings_change, lambda: list(trusted), None, WIRED_STATUS,
                             managed={"by": "OpenWrt", "admin": "/cgi-bin/luci/admin/network/wireless"})
     offline_checks = OfflineChecks(state, platform=platform)
     maintainer = []   # own_domain.Maintainer, when a DuckDNS name is set
@@ -489,15 +505,16 @@ def main():
 
     handoff_file = RUN / "handoff.json"
 
-    def launch(network, wireless, wait=False):
+    def launch(network, wireless, wait=False, keep_epoch=False):
         setup_wizard.save_json(handoff_file, {"ssid": network["ssid"], "passphrase": network["key"]})
-        os.environ["CARPLAY_NETWORK_EPOCH"] = secrets.token_hex(4)
+        if not keep_epoch:
+            os.environ["CARPLAY_NETWORK_EPOCH"] = secrets.token_hex(4)
         platform.start("receiver", [
             sys.executable, str(root / "run-receiver.py"), "--root", str(root), "--bind", str(network["address"].ip),
             "--channel", str(network["channel"]), "--security", network["security"],
             "--hotspot", str(handoff_file), "--interface", network["device"], "--web-host", "0.0.0.0",
             "--java", config["java"], "--settings-port", str(port), "--viewer-port", str(viewer),
-            "--wired", "--wired-status", str(WIRED_STATUS),
+            "--wired", "--wired-status", str(WIRED_STATUS), "--cable-off-file", str(RUN / "cable-carplay-off"),
             "--idle-release", str(int(config["idle_release"]) if config["idle_release"].isdigit() else 300)]
             + ([] if wireless else ["--no-wireless"]) + (["--bind-wait", "120"] if wait else [])
             + car_audio_args(config))
@@ -672,6 +689,20 @@ def main():
         plan = plan_of(network)
         next_check = time.monotonic() + RECHECK_EVERY
         while not stopped.wait(2):
+            if receiver_refresh:
+                receiver_refresh.clear()
+                try:
+                    latest = audio_routes.read_uci()
+                except ValueError:
+                    say('Sound settings unavailable; keeping receiver running and retrying')
+                    receiver_refresh.append('receiver options changed')
+                else:
+                    for name in (*audio_routes.NAMES, 'main'):
+                        config.pop('audio_route_' + name, None)
+                    config.update({key: value for key, value in latest.items() if key.startswith('audio_route_')})
+                    platform.stop_child('receiver')
+                    if have_identity:
+                        launch(network, wireless, keep_epoch=True)
             if not have_identity and identity_ok():
                 request_reexec("MFi identity added")
                 continue
