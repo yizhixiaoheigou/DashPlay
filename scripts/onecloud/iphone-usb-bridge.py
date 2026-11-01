@@ -54,11 +54,15 @@ def apple_device():
     for device in sorted(glob.glob("/sys/bus/usb/devices/[0-9]-[0-9]*")):
         if ":" in Path(device).name:
             continue
+        path = Path(device)
         try:
-            if Path(device, "idVendor").read_text().strip() == "05ac":
-                return Path(device)
+            if path.joinpath("idVendor").read_text().strip() != "05ac":
+                continue
+            name = path.joinpath("product").read_text().strip().lower()
         except OSError:
             continue
+        if name.startswith("iphone"):
+            return path
     return None
 
 
