@@ -55,11 +55,11 @@ class PhoneUplinkTests(unittest.TestCase):
         self.assertEqual(self.u.phase, 'online')
 
     def test_boot_on_discovered_channel_starts_receiver_only_once(self):
-        self.boot(5180)
-        self.receiver.assert_called_once_with(36)
-        self.p.start_phone_station.assert_called_once_with(self.u.saved, 5180)
-        self.connected(5180)
-        self.receiver.assert_called_once_with(36)
+        self.boot(5805)
+        self.receiver.assert_called_once_with(161)
+        self.p.start_phone_station.assert_called_once_with(self.u.saved, 5805)
+        self.connected(5805)
+        self.receiver.assert_called_once_with(161)
         self.assertTrue(self.status['tesla_offline'], 'Tesla LAN stays available even online')
         self.p.cleanup_phone_uplink.assert_not_called()
 
@@ -98,20 +98,20 @@ class PhoneUplinkTests(unittest.TestCase):
 
     def test_late_different_channel_rebuilds_once_but_keeps_dns(self):
         self.boot(None)
-        self.p.phone_hotspot_frequency.return_value = 5180
+        self.p.phone_hotspot_frequency.return_value = 5805
         self.now = self.u.next_try
         self.u.tick()
-        self.connected(5180)
-        self.assertEqual([c.args[0] for c in self.receiver.call_args_list], [149, 36])
+        self.connected(5805)
+        self.assertEqual([c.args[0] for c in self.receiver.call_args_list], [149, 161])
         self.p.start_dhcp.assert_called_once()
         self.p.cleanup_phone_uplink.assert_not_called()
 
     def test_same_band_channel_change_still_rebuilds(self):
         self.boot(None)
-        self.p.phone_hotspot_frequency.return_value = 5180   # another 5 GHz channel
+        self.p.phone_hotspot_frequency.return_value = 5805   # another 5 GHz channel (161: a Tesla sees it)
         self.now = self.u.next_try
         self.u.tick()
-        self.p.start_phone_station.assert_called_once_with(self.u.saved, 5180)
+        self.p.start_phone_station.assert_called_once_with(self.u.saved, 5805)
 
     def test_boot_scan_timeout_still_starts_carplay_and_retries(self):
         self.p.phone_hotspot_frequency.side_effect = subprocess.TimeoutExpired('iw', 5)
@@ -228,7 +228,7 @@ class PhoneUplinkTests(unittest.TestCase):
 
     def test_failed_channel_switch_restores_previous_ap(self):
         self.boot(None)
-        self.p.phone_hotspot_frequency.return_value = 5180
+        self.p.phone_hotspot_frequency.return_value = 5805
         self.p.start_ap.side_effect = [False, False, True]
         self.now = self.u.next_try
         self.u.tick()
@@ -529,29 +529,29 @@ class FastSearchTests(unittest.TestCase):
         self.assertEqual(self.u.next_try - self.now, 10)
 
     def test_channel_is_remembered_without_the_password(self):
-        self.boot(5180)
-        self.connected(5180)
+        self.boot(5805)
+        self.connected(5805)
         cache = self.state / phone_uplink.LAST_HOTSPOT
         self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
         text = cache.read_text()
         self.assertNotIn('synthetic-pass', text)
         self.assertNotIn('Phone', text)
-        self.assertEqual(json.loads(text)['frequency'], 5180)
+        self.assertEqual(json.loads(text)['frequency'], 5805)
 
     def fresh(self):
         return PhoneUplink(self.p, self.state, self.u.address, self.u.box, 149, 40, Mock(), self.receiver,
                            self.status, say=lambda _: None, clock=lambda: self.now)
 
     def test_boot_opens_the_box_hotspot_on_the_remembered_5ghz_channel(self):
-        phone_uplink.HotspotSearch(self.state, {'ssid': 'Phone'}, lambda: 0).remember(5180)
+        phone_uplink.HotspotSearch(self.state, {'ssid': 'Phone'}, lambda: 0).remember(5805)
         self.u = self.fresh()
         self.boot(None)
-        self.receiver.assert_called_once_with(36)
+        self.receiver.assert_called_once_with(161)
         # The phone comes up on that channel later: joined without rebuilding anything.
-        self.p.phone_hotspot_frequency.return_value = 5180
+        self.p.phone_hotspot_frequency.return_value = 5805
         self.p.stop_child.reset_mock()
         self.attempts(11)
-        self.p.start_phone_station.assert_called_once_with(self.u.saved, 5180)
+        self.p.start_phone_station.assert_called_once_with(self.u.saved, 5805)
         self.p.stop_child.assert_not_called()
 
     def test_a_remembered_24ghz_channel_or_another_phone_does_not_move_the_box(self):
@@ -621,6 +621,91 @@ class FastSearchTests(unittest.TestCase):
         self.assertEqual(self.p.find_hotspot.call_args.kwargs.get('frequency'), 5745)
 
 
+class TeslaHiddenChannelTests(unittest.TestCase):
+    """A China-market Tesla sees 5 GHz only on 149-165 (36 measured 2026-10-14; 44 on a friend's N1, 2026-11-01:
+    the box followed the phone hotspot onto 44 and the car never came back). CarPlay comes first, so in Tesla mode
+    the box never moves its hotspot to another 5 GHz channel to follow a phone hotspot, and says why."""
+    setUp = PhoneUplinkTests.setUp
+    boot = PhoneUplinkTests.boot
+
+    def fresh(self, share=False):
+        return PhoneUplink(self.p, self.state, self.u.address, self.u.box, 149, 40, Mock(), self.receiver,
+                           self.status, say=lambda _: None, clock=lambda: self.now, share=share)
+
+    def test_phone_on_44_at_boot_keeps_the_box_on_149(self):
+        self.boot(5220)
+        self.receiver.assert_called_once_with(149)
+        self.p.start_phone_station.assert_not_called()
+
+    def test_phone_on_44_later_is_not_joined_and_the_reason_is_shown(self):
+        self.boot(None)
+        self.p.phone_hotspot_frequency.return_value = 5220
+        self.p.stop_child.reset_mock()
+        self.now = self.u.next_try
+        self.u.tick()
+        self.assertEqual(self.u.channel, 149)
+        self.p.start_phone_station.assert_not_called()
+        self.p.stop_child.assert_not_called()
+        reason = self.status['uplink']['reason']
+        self.assertIn('44', reason)
+        self.assertIn('最大兼容性', reason)
+
+    def test_only_149_to_165_and_2_4_ghz_are_joined(self):
+        for frequency, joins in ((5180, False), (5220, False), (5240, False), (5260, False), (5320, False),
+                                 (5500, False), (5700, False), (5745, True), (5765, True), (5805, True),
+                                 (5825, True), (2412, True), (2437, True), (2472, True)):
+            with self.subTest(frequency=frequency):
+                self.p.reset_mock()
+                self.u = self.fresh()
+                self.boot(None)
+                self.p.phone_hotspot_frequency.return_value = frequency
+                self.now = self.u.next_try
+                self.u.tick()
+                self.assertEqual(self.p.start_phone_station.called, joins)
+
+    def test_a_remembered_44_does_not_open_the_box_hotspot_there(self):
+        # The friend's box remembered 5220 and opened on 44 at every boot without the cable.
+        phone_uplink.HotspotSearch(self.state, {'ssid': 'Phone'}, lambda: 0).remember(5220)
+        self.u = self.fresh()
+        self.boot(None)
+        self.receiver.assert_called_once_with(149)
+
+    def test_usb_share_with_the_phone_on_44_stays_on_149(self):
+        self.u = self.fresh(share=True)
+        self.boot(None)
+        self.p.phone_hotspot_frequency.return_value = 5220
+        self.now = self.u.next_try
+        self.u.tick()
+        self.assertEqual(self.u.channel, 149)
+        self.p.start_phone_station.assert_not_called()
+
+    def test_the_reason_stays_while_the_phone_stays_on_44(self):
+        # Quick scans look at the remembered channel only. With 149 remembered and the phone on 44, two tries in
+        # three said "没找到手机热点" although the hotspot was on: the owner would think the box is broken.
+        phone_uplink.HotspotSearch(self.state, {'ssid': 'Phone'}, lambda: 0).remember(5745)
+        self.u = self.fresh()
+        self.boot(None)
+        self.p.phone_hotspot_frequency.side_effect = (
+            lambda ssid, frequency=None, timeout=None: None if frequency == 5745 else 5220)
+        reasons = []
+        for _ in range(6):
+            self.now = self.u.next_try
+            self.u.tick()
+            reasons.append(self.status['uplink']['reason'])
+        # Found on 44 by the first full scan (every third try); from then on it is never "not found" again.
+        first = next(i for i, reason in enumerate(reasons) if '信道 44' in reason)
+        self.assertLessEqual(first, phone_uplink.FULL_SCAN_EVERY - 1, reasons)
+        self.assertTrue(all('信道 44' in reason for reason in reasons[first:]), reasons)
+        self.assertEqual(self.u.channel, 149)
+        self.p.start_phone_station.assert_not_called()
+
+    def test_other_cars_still_follow_a_phone_on_44(self):
+        self.status['tesla'] = False
+        self.boot(5220)
+        self.receiver.assert_called_once_with(44)
+        self.p.start_phone_station.assert_called_once_with(self.u.saved, 5220)
+
+
 class UplinkAuditTests(unittest.TestCase):
     setUp = PhoneUplinkTests.setUp
     boot = PhoneUplinkTests.boot
@@ -653,7 +738,7 @@ class UplinkAuditTests(unittest.TestCase):
 
     def test_both_channels_fail_then_plain_ap_recovers(self):
         self.boot(None)
-        self.p.phone_hotspot_frequency.return_value = 5180
+        self.p.phone_hotspot_frequency.return_value = 5805
         self.p.start_ap.side_effect = [False, False, False, False, True]
         self.now = self.u.next_try
         self.u.tick()
@@ -675,7 +760,7 @@ class UplinkAuditTests(unittest.TestCase):
 
     def test_total_ap_failure_is_not_hidden_as_working_lan(self):
         self.boot(None)
-        self.p.phone_hotspot_frequency.return_value = 5180
+        self.p.phone_hotspot_frequency.return_value = 5805
         self.p.start_ap.return_value = False
         self.now = self.u.next_try
         with self.assertRaises(RuntimeError):

@@ -12,6 +12,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -31,10 +32,13 @@ def sha(data):
 
 
 class Server:
-    """GitHub stand-in: /gh/<path> serves files (or fails when listed in `down`); /mirror/<full url> serves the same."""
+    """GitHub stand-in: /gh/<path> serves files (or fails when listed in `down`); /<name>/<full url> is a mirror of
+    the same, behaving as `kinds` says: 'slow' trickles about 20 KB/s, 'lag' waits 0.5 s before answering, 'cut'
+    breaks off after half of what it announced, 'page' answers 200 with a block page. Range requests are answered
+    with 206 except by 'norange'."""
 
     def __init__(self, root):
-        self.root, self.down, self.seen = Path(root), set(), []
+        self.root, self.down, self.seen, self.ranges, self.kinds = Path(root), set(), [], [], {}
         server = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -42,25 +46,63 @@ class Server:
                 pass
 
             def do_GET(self):
+                try:
+                    self.answer()
+                except (BrokenPipeError, ConnectionResetError):   # the client stopped reading: a measurement, a stall
+                    pass
+
+            def answer(self):
                 server.seen.append(self.path)
-                path = self.path
-                if path.startswith('/mirror/'):
+                server.ranges.append((self.path, self.headers.get('Range')))
+                path, kind = self.path, 'gh'
+                if not path.startswith('/gh/') and '/gh/' in path:
+                    kind = path.split('/')[1]
                     path = '/gh/' + path.split('/gh/', 1)[1]
                 elif path.removeprefix('/gh/') in server.down:
                     return self.send_error(503)
+                kind = server.kinds.get(kind, kind)
                 target = server.root / path.removeprefix('/gh/')
                 if not path.startswith('/gh/') or not target.is_file():
                     return self.send_error(404)
-                data = target.read_bytes()
-                self.send_response(200)
+                if kind == 'page':
+                    page = b'<html>blocked</html>'
+                    self.send_response(200)
+                    self.send_header('Content-Length', str(len(page)))
+                    self.end_headers()
+                    return self.wfile.write(page)
+                if kind == 'lag':
+                    time.sleep(0.5)
+                data, start = target.read_bytes(), 0
+                wanted = self.headers.get('Range')
+                if wanted and kind != 'norange':
+                    first, _, last = wanted.removeprefix('bytes=').partition('-')
+                    start, end = int(first), min(int(last) if last else len(data) - 1, len(data) - 1)
+                    self.send_response(206)
+                    self.send_header('Content-Range', f'bytes {start}-{end}/{len(data)}')
+                    data = data[start:end + 1]
+                else:
+                    self.send_response(200)
                 self.send_header('Content-Length', str(len(data)))
                 self.end_headers()
-                self.wfile.write(data)
+                if kind == 'cut':
+                    self.wfile.write(data[:len(data) // 2])
+                    self.close_connection = True
+                    return
+                step = 512 if kind == 'slow' else 1 << 16
+                for i in range(0, len(data), step):
+                    self.wfile.write(data[i:i + step])
+                    if kind == 'slow':
+                        self.wfile.flush()
+                        time.sleep(0.025)
 
         self.httpd = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         self.base = f'http://127.0.0.1:{self.httpd.server_port}/gh/'
-        self.mirror = f'http://127.0.0.1:{self.httpd.server_port}/mirror/'
+        self.mirror = self.at('mirror')
+
+    def at(self, name):
+        """A mirror prefix on this server (its kind: the name, or kinds[name])."""
+        return f'http://127.0.0.1:{self.httpd.server_port}/{name}/'
 
     def put(self, path, data):
         target = self.root / path
@@ -171,6 +213,9 @@ class VersionTests(unittest.TestCase):
         self.assertEqual(update.forbidden_in_plan(plan), ['bluez-daemon', 'kernel', 'kmod-bluetooth'])
 
 
+BUILT_IN_MIRRORS = update.MIRRORS   # setUp patches update.MIRRORS for the tests below
+
+
 @unittest.skipUnless(OPENSSL, 'needs OpenSSL 3')
 class SignedReleaseTests(unittest.TestCase):
     def setUp(self):
@@ -191,7 +236,7 @@ class SignedReleaseTests(unittest.TestCase):
         (self.root / 'state/bluetooth').mkdir()
         (self.root / 'state/bluetooth/pairing').write_text('link key')
         for name, value in (('OPENSSL', OPENSSL), ('LATEST', self.server.base + 'latest/'), ('MIRRORS', ()),
-                            ('PREVIOUS_FEED', self.server.base + 'owrt/v{version}/')):
+                            ('PREVIOUS_FEED', self.server.base + 'owrt/v{version}/'), ('SAMPLE_SECONDS', 2)):
             p = patch.object(update, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -245,6 +290,120 @@ class SignedReleaseTests(unittest.TestCase):
         self.assertTrue(any(p.startswith('/mirror/') for p in self.server.seen))
         with self.assertRaisesRegex(update.UpdateError, '下载失败'):
             update.latest_manifest(self.root, False, self.pub)
+
+    def test_the_built_in_mirrors_are_https_prefixes(self):
+        # 2026-11-01: the released list was ghfast.top alone, which timed out at 15 s and 40 s.
+        self.assertGreaterEqual(len(BUILT_IN_MIRRORS), 6)
+        self.assertEqual(update.mirror_list(BUILT_IN_MIRRORS, https_only=True), BUILT_IN_MIRRORS)
+
+    def test_the_fastest_source_is_measured_and_used_first_even_before_github(self):
+        # Before 2026-11-01 GitHub came first: a GitHub that trickles never failed, so no mirror was ever tried.
+        self.publish({'format': 1, 'version': '2026.10.20', 'online': True})
+        # 'lag', not 'slow': the manifest fits in one 'slow' step, so GitHub was only ~25 ms behind and a busy machine
+        # (the release check runs beside other builds) sometimes ranked it first (2026-11-01).
+        self.server.kinds['gh'] = 'lag'
+        fast, dead = self.server.at('fast'), 'http://127.0.0.1:1/'
+        with patch.object(update, 'MIRRORS', (dead, fast)), patch.object(update, 'SAMPLE', 4096):
+            self.assertEqual(update.latest_manifest(self.root, False, self.pub)['version'], '2026.10.20')
+            state = update.sources_state(self.root)
+            self.assertEqual([r['source'] for r in state['ranking'] if 'speed' in r], [fast, ''])
+            self.assertIn('error', next(r for r in state['ranking'] if r['source'] == dead))
+            self.assertEqual(state['used'], fast)
+            self.assertEqual(update.sources(self.root, False), (fast, '', dead), 'failed sources stay, last')
+            seen = len(self.server.seen)
+            update.sources(self.root, False, update.LATEST + update.MANIFEST)
+            self.assertEqual(len(self.server.seen), seen, 'a day-old order is reused')
+            update.sources(self.root, False, update.LATEST + update.MANIFEST, fresh=True)
+            self.assertGreater(len(self.server.seen), seen, 'an install measures again')
+
+    def test_the_setting_picks_automatic_github_only_or_given_mirrors(self):
+        options = self.root / 'state/options.json'
+        with patch.object(update, 'MIRRORS', (self.server.mirror,)):
+            for value, expected in (('none', ('',)), ('https://a.example/ http://b.example', ('https://a.example/', 'http://b.example/', '')),
+                                    ('auto', ('', self.server.mirror)), ('', ('', self.server.mirror)),
+                                    ('ftp://x', ('', self.server.mirror))):
+                options.write_text(json.dumps({'update_mirror': value}))
+                self.assertEqual(update.sources(self.root, False), expected, value)
+        with self.assertRaises(ValueError):
+            update.mirror_list('https://a.example/ javascript:alert(1)')
+
+    def test_a_slow_source_hands_over_and_the_next_goes_on_where_it_stopped(self):
+        data = os.urandom(120_000)
+        self.server.put('big.tar', data)
+        self.server.kinds['gh'] = 'slow'
+        target, seen = self.dir / 'big.tar', []
+        with patch.object(update, 'STALL_SECONDS', 0.5), patch.object(update, 'STALL_BYTES', 30_000):
+            update.fetch(self.server.base + 'big.tar', ('', self.server.mirror), target=target, sha256=sha(data),
+                         size=len(data), report=lambda n, source: seen.append((n, source)))
+        self.assertEqual(target.read_bytes(), data)
+        resumed = [r for p, r in self.server.ranges if p.startswith('/mirror/')]
+        self.assertTrue(resumed[0] and resumed[0] != 'bytes=0-', f'the mirror went on from GitHub: {resumed}')
+        self.assertEqual(sum(n for n, _ in seen), len(data))
+        self.assertEqual({s for _, s in seen}, {'', self.server.mirror})
+
+    def test_when_every_source_is_slow_the_download_still_finishes(self):
+        data = os.urandom(40_000)
+        self.server.put('big.tar', data)
+        self.server.kinds.update(gh='slow', mirror='slow')
+        target = self.dir / 'big.tar'
+        with patch.object(update, 'STALL_SECONDS', 0.3), patch.object(update, 'STALL_BYTES', 30_000):
+            update.fetch(self.server.base + 'big.tar', ('', self.server.mirror), target=target, sha256=sha(data),
+                         size=len(data))
+        self.assertEqual(target.read_bytes(), data)
+
+    def test_a_broken_off_download_is_resumed_by_the_next_source(self):
+        data = os.urandom(100_000)
+        self.server.put('big.tar', data)
+        self.server.kinds['gh'] = 'cut'
+        target = self.dir / 'big.tar'
+        update.fetch(self.server.base + 'big.tar', ('', self.server.mirror), target=target, sha256=sha(data),
+                     size=len(data))
+        self.assertEqual(target.read_bytes(), data)
+        self.assertIn(('/mirror/' + self.server.base + 'big.tar', 'bytes=50000-'), self.server.ranges)
+        # Without a size from the manifest, too: the length the source announced decides.
+        self.assertEqual(update.fetch(self.server.base + 'big.tar', ('', self.server.mirror), limit=1 << 20), data)
+
+    def test_a_block_page_is_never_taken_for_the_file_or_the_manifest(self):
+        data = os.urandom(50_000)
+        self.server.put('big.tar', data)
+        self.server.kinds['block'] = 'page'
+        target = self.dir / 'big.tar'
+        update.fetch(self.server.base + 'big.tar', (self.server.at('block'), ''), target=target, sha256=sha(data),
+                     size=len(data))
+        self.assertEqual(target.read_bytes(), data)
+        self.assertFalse([r for p, r in self.server.ranges if p.startswith('/gh/') and r], 'GitHub started over')
+        self.publish({'format': 1, 'version': '2026.10.20', 'online': True})
+        (self.root / 'state/options.json').write_text(json.dumps({'update_mirror': self.server.at('block')}))
+        self.assertEqual(update.latest_manifest(self.root, False, self.pub)['version'], '2026.10.20')
+        self.assertEqual(update.sources_state(self.root)['used'], '')
+        self.assertEqual([r['source'] for r in update.measure(self.server.base + 'big.tar',
+                                                              ('', self.server.at('block')), len(data))
+                          if 'speed' in r], [''])
+
+    def test_a_signed_manifest_brings_the_mirrors_to_measure(self):
+        with patch.object(update, 'MIRRORS', ('https://127.0.0.1:1/old/',)):
+            self.assertEqual(update.candidates(self.root), ('https://127.0.0.1:1/old/',))
+            self.publish({'format': 1, 'version': '2026.10.20', 'online': True,
+                          'mirrors': ['https://127.0.0.1:1/new/', 'https://127.0.0.1:1/other']})
+            update.latest_manifest(self.root, False, self.pub)
+            self.assertEqual(update.candidates(self.root), ('https://127.0.0.1:1/new/', 'https://127.0.0.1:1/other/'))
+            self.publish({'format': 1, 'version': '2026.10.21', 'online': True, 'mirrors': ['http://127.0.0.1:1/plain/']})
+            update.latest_manifest(self.root, False, self.pub)
+            self.assertEqual(update.candidates(self.root), ('https://127.0.0.1:1/new/', 'https://127.0.0.1:1/other/'),
+                             'a list this version refuses keeps the one before')
+
+    def test_the_speed_test_measures_every_source_on_the_biggest_download(self):
+        data = self.debian_release()
+        dead = 'http://127.0.0.1:1/'
+        with patch.object(update, 'MIRRORS', (self.server.mirror, dead)), patch.object(update, 'SAMPLE', 4096):
+            state = update.speedtest(self.root, False, self.pub)
+        self.assertEqual({r['source'] for r in state['ranking']}, {'', self.server.mirror, dead})
+        self.assertEqual(state['measuring'], 0)
+        self.assertFalse(update.measuring(self.root))
+        sampled = [r for p, r in self.server.ranges if p.endswith('dashplay-bundle-2026.10.20.tar')]
+        self.assertEqual(set(sampled), {'bytes=0-4095'})
+        self.assertTrue(sampled)
+        self.assertIn(data[:4], (self.server.root / 'dp/v2026.10.20/dashplay-bundle-2026.10.20.tar').read_bytes())
 
     def test_a_download_must_match_the_manifest(self):
         self.server.put('f.apk', b'package')
@@ -381,10 +540,12 @@ class SignedReleaseTests(unittest.TestCase):
                          ['dashplay-2026.10.19.1-r1.apk', 'luci-app-dashplay-2026.10.19.1-r1.apk',
                           'luci-i18n-dashplay-zh-cn-2026.10.19.1-r1.apk'])
 
-    def test_a_box_runs_the_new_releases_upgrader_with_the_checked_bundle(self):
+    def debian_release(self, padding=0):
+        """Publish 2026.10.20 for OneCloud / N1: a bundle with a new upgrader (padded to be big); its bytes."""
         bundle = io.BytesIO()
         with tarfile.open(fileobj=bundle, mode='w') as tar:
-            for name, data in (('./firmware/upgrade.py', b'# new upgrader'), ('./supervisor.py', b'new')):
+            for name, data in (('./firmware/upgrade.py', b'# new upgrader'), ('./supervisor.py', b'new'),
+                               ('./padding', os.urandom(padding))):
                 info = tarfile.TarInfo(name)
                 info.size = len(data)
                 tar.addfile(info, io.BytesIO(data))
@@ -393,6 +554,10 @@ class SignedReleaseTests(unittest.TestCase):
         self.publish({'format': 1, 'version': '2026.10.20', 'online': True,
                       'debian': {'base': self.server.base + 'dp/v2026.10.20/', 'files': {'supervisor.py': sha(b'new')},
                                  'bundle': {'file': 'dashplay-bundle-2026.10.20.tar', 'sha256': sha(data), 'size': len(data)}}})
+        return data
+
+    def test_a_box_runs_the_new_releases_upgrader_with_the_checked_bundle(self):
+        self.debian_release()
         calls = []
 
         def run(*args, timeout=300):
@@ -408,6 +573,36 @@ class SignedReleaseTests(unittest.TestCase):
         self.assertEqual(Path(calls[0][2]).name, 'dashplay-bundle-2026.10.20.tar')
         self.assertEqual(json.loads((self.root / 'state/update.json').read_text())['version'], '2026.10.20')
         self.assertFalse(json.loads((self.root / 'state/update-check.json').read_text())['available'])
+
+    def test_the_page_sees_bytes_speed_and_source_while_downloading(self):
+        self.debian_release(padding=60_000)
+        self.server.kinds['mirror'] = 'slow'   # about 20 KB/s, some 3 s: progress is written once a second
+        self.server.down.add('dp/v2026.10.20/dashplay-bundle-2026.10.20.tar')
+        written, real_save = [], update.save
+
+        def save(path, value):
+            if path.name == 'update-status.json':
+                written.append(dict(value))
+            real_save(path, value)
+
+        def run(*args, timeout=300):
+            if args[0] == OPENSSL:
+                return subprocess.run(list(args), capture_output=True, text=True)
+            return subprocess.CompletedProcess(args, 0, '', '')
+
+        with patch.object(update, 'MIRRORS', (self.server.mirror,)), patch.object(update, 'save', save), \
+                patch.object(update, 'run', run), patch.object(update, 'BACKUP', 'backup.tar.gz'), \
+                patch.object(update, 'STALL_SECONDS', 60), patch.object(update, 'SAMPLE', 1024):
+            self.assertEqual(update.install(self.root, False, self.pub), 0, written[-1])
+        phases = [w['phase'] for w in written]
+        self.assertIn('measuring', phases)
+        moving = [w for w in written if w['phase'] == 'downloading' and 0 < w.get('done', 0) < w['total']]
+        self.assertGreaterEqual(len(moving), 2, phases)
+        self.assertTrue(all(w['source'] == update.name_of(self.server.mirror) for w in moving), moving)
+        self.assertTrue(any(w['speed'] > 0 for w in moving))
+        last = [w for w in written if w['phase'] == 'downloading'][-1]
+        self.assertEqual(last['done'], last['total'])
+        self.assertEqual(update.sources_state(self.root)['used'], self.server.mirror)
 
 
 class ServiceUpTests(unittest.TestCase):
@@ -483,6 +678,7 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(sorted(value['openwrt']['jre']['files']), ['aarch64_generic', 'x86_64'])
         self.assertEqual(value['openwrt']['base'], 'https://github.com/owner/openwrt-dashplay/releases/download/v2026.10.20/')
         self.assertEqual(value['debian']['files'], {'supervisor.py': sha(b'program')}, "the owner's data is no program file")
+        self.assertEqual(value['mirrors'], list(update.MIRRORS), 'boxes from then on measure the mirrors of the release')
 
 
 if __name__ == '__main__':

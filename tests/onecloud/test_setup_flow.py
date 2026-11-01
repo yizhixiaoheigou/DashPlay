@@ -209,8 +209,29 @@ class SetupFlowTests(unittest.TestCase):
         self.assertEqual(self.changes, ['setup confirmed'])
         self.assertEqual((self.state/'uplink-hotspot.json').stat().st_mode & 0o777, 0o600)
         self.assertTrue(setup_wizard.wireless(self.page.setup(), setup_wizard.options(self.state)))
-        self.assertEqual(supervisor.car_audio_args(self.state), ['--tesla-browser'])
+        # Tesla (2026-11-01): music, Siri and calls on the Tesla's Bluetooth, navigation on the page ("no").
+        self.assertEqual(supervisor.car_audio_args(self.state), ['--tesla-browser', '--car-music', '--audio-routes',
+                         'media=bluetooth,navigation=carplay,alert=carplay,siri=bluetooth,calls=bluetooth'])
         self.assertIn('添加 iPhone', self.page.render(''))
+
+    def test_tesla_sound_step_only_asks_about_navigation(self):
+        self.answer('vehicle', value='tesla')
+        self.answer('mode', value='no')
+        self.answer('mifi', value='box_hotspot')
+        self.answer('network', ssid='Box', password='synthetic-box')
+        self.answer('internet', value='none')
+        html = self.page.render('')
+        self.assertIn('导航播报从哪里出声', html)
+        self.assertIn('也走特斯拉蓝牙', html)
+        self.assertIn('一定走特斯拉蓝牙', html)
+        self.answer('sound', value='yes')
+        self.answer('iphone', value='any')
+        self.assertIn('全部走特斯拉蓝牙', self.page.render(''))
+        self.answer('summary', value='confirm')
+        options = json.loads((self.state/'options.json').read_text())
+        self.assertEqual(options['audio_route_navigation'], 'bluetooth')
+        self.assertNotIn('car_music', options, 'Tesla mode no longer reads the older switches')
+        self.assertIn('navigation=bluetooth', supervisor.car_audio_args(self.state)[-1])
 
     def test_back_retains_draft_but_invalidates_dependent_answers(self):
         self.until_iphone()

@@ -178,15 +178,14 @@ def car_audio_args(state):
     """run-receiver.py options for what goes over the car's own Bluetooth (settings page, state/options.json
     "car_music" / "car_voice"; found in a Tesla, 2026-10-14); Tesla mode is all of them."""
     # One sound switch since 2026-10-31 (audio_routes.resolve): CarPlay keeps its sound, or none goes through CarPlay.
-    # A box whose owner never touched it keeps the older options unchanged.
+    # Tesla mode always passes its split (2026-11-01): music, Siri and calls on the Tesla's Bluetooth, navigation
+    # on CarPlay unless the switch says otherwise; the older car_music / car_voice keys no longer decide it. Another
+    # car whose owner never touched the switch keeps the older options unchanged.
     chosen = options(state)
     tesla = tesla_mode(state)
-    if audio_routes.OUTPUT_KEY in chosen:
+    if tesla or audio_routes.OUTPUT_KEY in chosen:
         return audio_routes.arguments(chosen, tesla)
-    if tesla and all(chosen.get(key, True) is True for key in ("car_music", "car_voice")):
-        return ["--tesla"]
-    return (["--tesla-browser"] if tesla else []) + [flag for key, flag in (
-        ("car_music", "--car-music"), ("car_voice", "--car-voice")) if chosen.get(key, tesla) is True]
+    return [flag for key, flag in (("car_music", "--car-music"), ("car_voice", "--car-voice")) if chosen.get(key) is True]
 
 
 RECEIVER_OPTION_FLAGS = ("--tesla", "--tesla-browser", "--car-music", "--car-voice")

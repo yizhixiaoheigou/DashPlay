@@ -21,6 +21,8 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "onecloud/firmware"))
 from upgrade import extract_bundle, program_files   # noqa: E402  the files an in-place upgrade replaces
+sys.path.insert(0, str(Path(__file__).resolve().parent / "onecloud"))
+from update import MIRRORS   # noqa: E402  boxes measure these; the signed list replaces an older box's own
 
 
 def entry(path):
@@ -56,7 +58,7 @@ def manifest(version, notes, release, owner, online):
         files = {path: hashlib.sha256((Path(staging) / path).read_bytes()).hexdigest()
                  for path in sorted(program_files(staging)) if not (Path(staging) / path).is_symlink()}
     return {
-        "format": 1, "version": version, "notes": notes, "online": online,
+        "format": 1, "version": version, "notes": notes, "online": online, "mirrors": list(MIRRORS),
         "openwrt": {"base": f"https://github.com/{owner}/openwrt-dashplay/releases/download/v{version}/",
                     "packages": packages, "jre": jre},
         "debian": {"base": f"https://github.com/{owner}/DashPlay/releases/download/v{version}/",

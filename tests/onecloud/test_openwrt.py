@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts/onecloud'))
+REPO = Path(__file__).resolve().parents[2]
 import platform_openwrt as ow
 from settings_page import SettingsPage
 import setup_wizard
@@ -549,24 +550,17 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(car_audio_args(read_config("dashplay.main.car_music='1'\ndashplay.main.car_voice='1'\n")),
                          ["--car-music", "--car-voice"])
 
-    def test_tesla_mode_defaults_the_car_bluetooth_but_does_not_force_it(self):
-        # Tesla mode turns both on when it is enabled (LuCI); afterwards the switches are the owner's choice, as on
-        # the box (2026-10-28).
-        self.assertEqual(car_audio_args(read_config(
-            "dashplay.main.tesla_mode='1'\ndashplay.main.car_music='1'\ndashplay.main.car_voice='1'\n")),
-            ["--tesla"])
-        self.assertEqual(car_audio_args(read_config(
-            "dashplay.main.tesla_mode='1'\ndashplay.main.car_music='1'\ndashplay.main.car_voice='0'\n")),
-            ["--tesla-browser", "--car-music"])
-        self.assertEqual(car_audio_args(read_config(
-            "dashplay.main.tesla_mode='1'\ndashplay.main.car_music='0'\ndashplay.main.car_voice='1'\n")),
-            ["--tesla-browser", "--car-voice"])
-        self.assertEqual(car_audio_args(read_config(
-            "dashplay.main.tesla_mode='1'\ndashplay.main.car_music='0'\ndashplay.main.car_voice='0'\n")),
-            ["--tesla-browser"])
-        # A uci command that only turns Tesla mode on leaves the page as the audio source; the LuCI switch and the
-        # install docs turn both switches on with it.
-        self.assertEqual(car_audio_args(read_config("dashplay.main.tesla_mode='1'\n")), ["--tesla-browser"])
+    def test_tesla_mode_always_keeps_music_siri_and_calls_on_the_tesla(self):
+        # 2026-11-01: in Tesla mode only navigation is the owner's choice (audio_route_navigation); the older
+        # car_music / car_voice switches no longer change what CarPlay declares (AudioRoutes.voiceOnCarBluetooth).
+        tesla = "dashplay.main.tesla_mode='1'\n"
+        for extra in ("", "dashplay.main.car_music='1'\ndashplay.main.car_voice='1'\n",
+                      "dashplay.main.car_music='0'\ndashplay.main.car_voice='0'\n", "dashplay.main.car_music='1'\n"):
+            self.assertEqual(car_audio_args(read_config(tesla + extra)), [
+                "--tesla-browser", "--car-music", "--audio-routes",
+                "media=bluetooth,navigation=carplay,alert=carplay,siri=bluetooth,calls=bluetooth"], extra)
+        self.assertEqual(car_audio_args(read_config(tesla + "dashplay.main.audio_route_navigation='bluetooth'\n"))[-1],
+                         "media=bluetooth,navigation=bluetooth,alert=carplay,siri=bluetooth,calls=bluetooth")
 
     def test_uci_options_override_defaults(self):
         config = read_config("dashplay.main=dashplay\ndashplay.main.wifi='wwan'\ndashplay.main.settings_port='18090'\n")
@@ -661,6 +655,31 @@ class ManagedPageTests(unittest.TestCase):
         html = self.page.render("")
         self.assertIn("正在升级", html)
         self.assertNotIn("value=install", html)
+
+    def test_luci_offers_the_same_mirrors_and_translates_the_update_tab(self):
+        import re
+        import update
+        luci = REPO / "openwrt/luci-app-dashplay"
+        if not luci.is_dir():
+            # The public DashPlay export carries no openwrt/ (it ships as openwrt-dashplay): checked privately.
+            self.skipTest("openwrt/ is not in this tree (public DashPlay export)")
+        view = (luci / "htdocs/luci-static/resources/view/dashplay.js").read_text()
+        listed = re.search(r"var mirrors = \[([^\]]*)\]", view).group(1)
+        self.assertEqual(tuple(re.findall(r"'([^']+)'", listed)), update.MIRRORS)
+        po = (luci / "po/zh_Hans/dashplay.po").read_text()
+        for text in ("Download source", "Automatic (fastest, recommended)", "GitHub only", "Speed test",
+                     "Speed test failed:", "Last download source:", "unavailable"):
+            self.assertIn(f'msgid "{text}"', po)
+        acl = json.loads((luci / "root/usr/share/rpcd/acl.d/luci-app-dashplay.json").read_text())
+        self.assertIn("/opt/dashplay/state/update-sources.json", acl["luci-app-dashplay"]["read"]["file"])
+        self.assertIn("speedtest)", (REPO / "openwrt/dashplay/files/dashplay-update").read_text())
+
+    def test_the_managed_page_shows_the_speed_test_but_luci_picks_the_source(self):
+        html = self.page.render("")
+        self.assertIn(">测速</button>", html)
+        self.assertNotIn("保存下载源", html)
+        with self.assertRaisesRegex(ValueError, "OpenWrt"):
+            self.page.apply("/update", {"action": "source", "source": "none", "nonce": self.page.pairing.nonce})
 
     def test_firewall_warning_is_shown(self):
         self.status["warning"] = "防火墙区域拒绝入站连接"

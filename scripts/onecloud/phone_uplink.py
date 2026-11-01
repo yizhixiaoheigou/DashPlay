@@ -148,6 +148,27 @@ def start_shared_ap(platform, address, box, channel, width, wait_for, names=(), 
     platform.start_dhcp(address, False, names, upstream=upstream, query_log=query_log, router=router)
 
 
+# A China-market Tesla sees 2.4 GHz 1-13 but on 5 GHz only 149-165; 36-48, 52-64 and 100-140 are not shown
+# (measured: 36 on 2026-10-14, 44 on a friend's N1 2026-11-01, where the box followed the phone hotspot onto 44
+# and the car never found it again; 149 and 161 work. The owner's sources 2026-11-01 say the same for HW3 and
+# HW4: the domestic band rule, not the hardware). The radio has one channel, so in Tesla mode the box never moves
+# its hotspot onto any other 5 GHz channel: CarPlay first, internet second (owner's decision 2026-11-01).
+TESLA_5GHZ_MHZ = (5735, 5835)   # channels 149-165 with their 20 MHz edges
+
+
+def hidden_from_tesla(frequency):
+    return bool(frequency) and frequency > 5000 and not TESLA_5GHZ_MHZ[0] <= frequency <= TESLA_5GHZ_MHZ[1]
+
+
+def tesla_hidden_reason(frequency):
+    channel = (frequency - 5000) // 5
+    # Maximum Compatibility moves the iPhone hotspot to 2.4 GHz: the Tesla sees it, but the box hotspot follows
+    # and wireless CarPlay may stutter (settings page advice), so USB sharing comes first.
+    return (f'手机热点在 5 GHz 信道 {channel}，特斯拉在 5 GHz 只认 149–165 信道。盒子没有去连它，以免特斯拉找不到盒子、'
+            'CarPlay 断开；车机暂时没网。想让车机上网：改用「USB 共享网络」最稳；或 iPhone 打开「最大兼容性」'
+            '（热点改走 2.4 GHz，无线 CarPlay 可能变卡）；安卓把热点改到 2.4 GHz 或 5 GHz 149 信道。')
+
+
 class UnsuitableChannel(ValueError):
     """The upstream's channel does not suit a direct hotspot beside it; the text says which and what to change."""
 
@@ -309,8 +330,12 @@ class PhoneUplink:
             return self.channel_of(last)
         return self.channel
 
+    def hidden_from_car(self, frequency):
+        return bool(self.status.get('tesla')) and hidden_from_tesla(frequency)
+
     def usable(self, frequency):
-        return bool(frequency and not self.platform.ap_channel_problem(frequency))
+        return bool(frequency and not self.hidden_from_car(frequency)
+                    and not self.platform.ap_channel_problem(frequency))
 
     @staticmethod
     def channel_of(frequency):
@@ -356,6 +381,7 @@ class PhoneUplink:
                     frequency = self.scan()
                 except (OSError, ValueError, subprocess.SubprocessError) as error:
                     self.say('boot uplink scan unavailable: ' + type(error).__name__)
+            hidden = frequency if self.hidden_from_car(frequency) else None
             if not self.usable(frequency):
                 frequency = None
             if not p.add_phone_ap():
@@ -384,7 +410,8 @@ class PhoneUplink:
             return False
         self.started = True
         self.set_status('wired' if cable else 'offline',
-                        '已接有线网络；局域网保持可用' if cable else '盒子热点就绪；后台寻找手机热点')
+                        '已接有线网络；局域网保持可用' if cable else
+                        tesla_hidden_reason(hidden) if hidden else '盒子热点就绪；后台寻找手机热点')
         # usb_tether: give the cable's lease a few seconds before chasing the hotspot. A service restart with
         # the cable plugged used to decide "no cable" before the address arrived, join the hotspot, then
         # switch back — each move rebuilt the AP and restarted the receiver (4 receiver starts in 15 s,
@@ -492,7 +519,13 @@ class PhoneUplink:
 
     def connect(self, frequency):
         if not self.usable(frequency):
-            self.defer('上游信道不适合盒子热点；保持局域网')
+            if self.hidden_from_car(frequency):
+                # Quick scans look at the remembered channel: remember this one, or two tries in three said
+                # "没找到手机热点" while the hotspot was on. boot_channel never opens the AP there (usable).
+                self.search.remember(frequency)
+                self.defer(tesla_hidden_reason(frequency))
+            else:
+                self.defer('上游信道不适合盒子热点；保持局域网')
             return
         try:
             channel = self.channel_of(frequency)

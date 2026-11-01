@@ -4,6 +4,7 @@
     update.py check   [--root /opt/dashplay]   # a newer release? -> state/update-check.json
     update.py launch  [--root /opt/dashplay]   # start `install` apart from the service, which it restarts
     update.py install [--root /opt/dashplay]   # download, verify, back up, install, check; go back on failure
+    update.py speedtest [--root /opt/dashplay] # measure GitHub and every mirror -> state/update-sources.json
 
 Every release carries dashplay-update.json and its Ed25519 signature. Only a manifest signed by the key in
 update-key.pem (beside this file) counts, and every downloaded file must match it, so a mirror needs no trust.
@@ -12,7 +13,10 @@ refusing a plan with any kernel, kmod or BlueZ package (the ZTE F50 runs a vendo
 the installed version are fetched first to go back to. OneCloud / N1: firmware/upgrade.py with the release's
 program bundle (it keeps state/ and identity/ and restores the previous program by itself).
 Never while CarPlay is in use, and never by itself: the boxes only check (once a day) and say so.
-Progress goes to state/update-status.json, which the settings page and LuCI show.
+Progress goes to state/update-status.json, which the settings page and LuCI show (bytes, total, speed, source).
+Downloads come from the fastest source: GitHub and every mirror download the first 256 KB at once, an install
+always measures again, a check reuses a day-old order; a source that slows below 20 KB/s for 15 s or breaks off
+hands over to the next, which resumes where it stopped.
 """
 import argparse
 import email.utils
@@ -28,6 +32,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.request
 
@@ -42,9 +47,23 @@ MANIFEST = "dashplay-update.json"
 SIGNATURE = MANIFEST + ".sig"
 KEY = Path(__file__).resolve().with_name("update-key.pem")
 OPENSSL = os.environ.get("DASHPLAY_OPENSSL", "openssl")   # OpenSSL 3 on the boxes (a Mac's own is LibreSSL)
-# Tried after GitHub itself, as a URL prefix. The signature makes any mirror safe; uci dashplay.main.update_mirror
-# (OpenWrt) or state/options.json "update_mirror" (OneCloud / N1) replaces this list, "none" for GitHub only.
-MIRRORS = ("https://ghfast.top/",)
+# GitHub download mirrors, as URL prefixes. The signature makes any mirror safe. uci dashplay.main.update_mirror
+# (OpenWrt) or state/options.json "update_mirror" (OneCloud / N1): empty or "auto" measures GitHub and these and
+# takes the fastest, "none" is GitHub only, mirror prefixes are tried in that order and GitHub last. A signed
+# manifest may bring a newer list ("mirrors"), kept in SOURCES_FILE, so a dead mirror is replaced by a release.
+# Picked 2026-11-01 from 30 public ones by a 256 KB ranged download of a release bundle (all answered 206 in
+# 2.6-3.6 s from the US; ghproxy.net, which the version before tried second, sent nothing in 10 s). Not yet measured
+# from a network in China: the order matters little, since every box measures for itself.
+MIRRORS = ("https://gh-proxy.com/", "https://gh-proxy.org/", "https://edgeone.gh-proxy.com/", "https://ghfast.top/",
+           "https://gh.dpik.top/", "https://ghproxy.vip/", "https://tvv.tw/", "https://fastgit.cc/")
+DIRECT = ""                    # the source "GitHub itself": no prefix
+SOURCES_FILE = "state/update-sources.json"   # the measured order, the manifest's mirrors, the source used last
+MEASURE_EVERY = 24 * 3600      # a measured order counts this long; an install always measures again
+CONNECT_TIMEOUT = 15           # seconds for a connection or a read that gets nothing at all
+SAMPLE = 256 << 10             # bytes per source when measuring
+SAMPLE_SECONDS = 6             # all sources at once, so measuring takes at most this long
+STALL_SECONDS, STALL_BYTES = 15, 300 << 10   # under 20 KB/s for 15 s: go on from the next source where it stopped
+MIRROR_PATTERN = re.compile(r"https?://[A-Za-z0-9.-]+(:\d+)?(/[A-Za-z0-9._~%/-]*)?")
 OPENWRT_PACKAGES = ("dashplay", "luci-app-dashplay", "luci-i18n-dashplay-zh-cn")
 FORBIDDEN = re.compile(r"^(kernel|kmod-|bluez)")   # never through an online update (ZTE F50: 5.4 kernel)
 CHECK_EVERY = 24 * 3600
@@ -62,6 +81,10 @@ class UpdateError(Exception):
 
 class NotFound(UpdateError):
     """Every source answered 404: the file is not published, not a network problem."""
+
+
+class Slow(UpdateError):
+    """A source sends, but too slowly to finish: the next one goes on from there."""
 
 
 def is_openwrt():
@@ -84,8 +107,8 @@ def newer(latest, current):
     return latest is not None and (current is None or latest > current)
 
 
-def mirrors(root, openwrt):
-    """GitHub first, then the configured mirrors (prefixes)."""
+def setting(root, openwrt):
+    """The owner's update_mirror: "" (automatic), "none" or mirror prefixes separated by spaces."""
     if openwrt:
         try:
             value = run("uci", "-q", "get", "dashplay.main.update_mirror", timeout=5).stdout.strip()
@@ -96,46 +119,222 @@ def mirrors(root, openwrt):
             value = str(json.loads((Path(root) / "state/options.json").read_text()).get("update_mirror", ""))
         except (OSError, ValueError, AttributeError):
             value = ""
-    if value == "none":
-        return ()
-    return tuple(value.split()) if value else MIRRORS
+    return "" if value.strip().lower() == "auto" else value.strip()
 
 
-def fetch(url, prefixes=(), limit=1 << 20, target=None, sha256=None, size=None):
-    """Bytes of url (or, with target, the file written there), from GitHub or else each mirror prefix. With sha256
-    and size the download must match them exactly."""
-    errors, codes = [], []
-    for candidate in [url] + [prefix + url for prefix in prefixes]:
+def mirror_list(value, https_only=False):
+    """Mirror prefixes from a setting or a manifest, each ending in "/", or ValueError for anything else."""
+    words = value.split() if isinstance(value, str) else value
+    if not isinstance(words, (list, tuple)) or len(words) > 20:
+        raise ValueError("镜像地址太多")
+    out = []
+    for word in words:
+        if not isinstance(word, str) or len(word) > 200 or not MIRROR_PATTERN.fullmatch(word) \
+                or (https_only and not word.startswith("https://")):
+            raise ValueError(f"镜像地址不对：{str(word)[:60]}（要以 https:// 开头，例如 https://gh-proxy.com/）")
+        word = word if word.endswith("/") else word + "/"
+        if word not in out:
+            out.append(word)
+    return tuple(out)
+
+
+def name_of(prefix):
+    """How the page names a source: "GitHub" or the mirror's host."""
+    return prefix.split("/")[2] if prefix else "GitHub"
+
+
+def sources_state(root):
+    return read(Path(root) / SOURCES_FILE)
+
+
+def keep(root, **values):
+    save(Path(root) / SOURCES_FILE, dict(sources_state(root), **values))
+
+
+def candidates(root):
+    """The mirrors to measure: the latest signed manifest's list, else the built-in one."""
+    try:
+        return mirror_list(sources_state(root).get("mirrors") or (), https_only=True) or MIRRORS
+    except ValueError:
+        return MIRRORS
+
+
+def measure(url, pool, size=None):
+    """Download the first SAMPLE bytes of url from every source in pool at once; results fastest first, each
+    {"source", "speed" (bytes/s)} or {"source", "error"}. An answer that is not the file (a block page) is an error."""
+    results = {}
+
+    def one(prefix):
+        start = time.monotonic()
         try:
-            request = urllib.request.Request(candidate, headers={"User-Agent": "DashPlay-update"})
-            with urllib.request.urlopen(request, timeout=30) as response:
-                digest, total = hashlib.sha256(), 0
-                out = open(target, "wb") if target else None
-                chunks = []
-                try:
-                    while True:
-                        chunk = response.read(1 << 16)
-                        if not chunk:
-                            break
-                        total += len(chunk)
-                        if total > (size if size is not None else limit):
-                            raise UpdateError("下载的文件比预期大，已停止")
-                        digest.update(chunk)
-                        (out.write(chunk) if out else chunks.append(chunk))
-                finally:
-                    if out:
-                        out.close()
-            if sha256 and (digest.hexdigest() != sha256 or total != size):
-                raise UpdateError("下载的文件与签名清单不符")
-            return target if target else b"".join(chunks)
-        except (OSError, UpdateError, ValueError, http.client.HTTPException) as error:
-            if hasattr(error, "close"):   # an HTTPError holds its response open
+            request = urllib.request.Request(prefix + url, headers={"User-Agent": "DashPlay-update",
+                                                                    "Range": f"bytes=0-{SAMPLE - 1}"})
+            with urllib.request.urlopen(request, timeout=SAMPLE_SECONDS) as response:
+                total = response.headers.get("Content-Range", "").rpartition("/")[2] if response.status == 206 \
+                    else response.headers.get("Content-Length", "")
+                if response.status not in (200, 206) or size and total.isdigit() and int(total) != size:
+                    raise UpdateError(f"不是要下载的文件（HTTP {response.status}）")
+                got = 0
+                while got < SAMPLE and time.monotonic() - start < SAMPLE_SECONDS:
+                    chunk = response.read1(1 << 16)
+                    if not chunk:
+                        break
+                    got += len(chunk)
+            if not got:
+                raise UpdateError("没有数据")
+            results[prefix] = {"source": prefix, "speed": int(got / max(time.monotonic() - start, 0.001))}
+        except Exception as error:   # whatever a source does, it only drops out of the ranking
+            if hasattr(error, "close"):
                 error.close()
-            errors.append(f"{candidate.split('/')[2]}: {error}")
-            codes.append(getattr(error, "code", None))
+            results[prefix] = {"source": prefix, "error": str(error)[:80] or type(error).__name__}
+
+    threads = [threading.Thread(target=one, args=(prefix,), daemon=True) for prefix in pool]
+    for thread in threads:
+        thread.start()
+    until = time.monotonic() + SAMPLE_SECONDS + 1
+    for thread in threads:
+        thread.join(max(until - time.monotonic(), 0))
+    ranked = [results.get(prefix) or {"source": prefix, "error": "超时"} for prefix in pool]
+    return sorted(ranked, key=lambda r: -r.get("speed", -1))
+
+
+def sources(root, openwrt, url=None, fresh=False, size=None):
+    """Source prefixes in the order to try them ("" is GitHub itself). Automatic: the measured order (measured again
+    on url when it is older than a day, or always when fresh), sources that failed last; GitHub is one of them."""
+    value = setting(root, openwrt)
+    if value == "none":
+        return (DIRECT,)
+    if value:
+        try:
+            return mirror_list(value) + (DIRECT,)
+        except ValueError:   # a hand-edited setting that is not one: as if empty
+            pass
+    pool = (DIRECT,) + candidates(root)
+    if len(pool) == 1:
+        return pool
+    state = sources_state(root)
+    ranking = state.get("ranking") if isinstance(state.get("ranking"), list) else []
+    measured = state.get("measured_at") if isinstance(state.get("measured_at"), (int, float)) else 0
+    known = {r.get("source") for r in ranking if isinstance(r, dict)}
+    if url and (fresh or time.time() - measured > MEASURE_EVERY or not set(pool) <= known):
+        ranking = measure(url, pool, size)
+        keep(root, ranking=ranking, measured_at=int(time.time()), measuring=0)
+    order = [r["source"] for r in ranking if isinstance(r, dict) and "speed" in r and r.get("source") in pool]
+    return tuple(order + [prefix for prefix in pool if prefix not in order])
+
+
+def transfer(candidate, target, limit, size, stall, report):
+    """Append candidate to target, from where target ends (a Range request; a source that ignores it starts over).
+    An answer of another length than size (a block page with 200) is refused before anything is written."""
+    have = target.stat().st_size if target.exists() else 0
+    headers = {"User-Agent": "DashPlay-update", **({"Range": f"bytes={have}-"} if have else {})}
+    with urllib.request.urlopen(urllib.request.Request(candidate, headers=headers),
+                                timeout=CONNECT_TIMEOUT) as response:
+        if have and response.status != 206:
+            report(-have)
+            have = 0
+        elif have and not response.headers.get("Content-Range", "").startswith(f"bytes {have}-"):
+            raise UpdateError("续传位置不对")
+        announced = (response.headers.get("Content-Range", "").rpartition("/")[2] if response.status == 206
+                     else response.headers.get("Content-Length", ""))
+        expected = int(announced) if announced.isdigit() and response.status == 206 else \
+            have + int(announced) if announced.isdigit() else None
+        if size is not None and expected is not None and expected != size:
+            raise UpdateError(f"不是要下载的文件（{expected} 字节）")
+        window, window_bytes = time.monotonic(), 0
+        with open(target, "ab" if have else "wb") as out:
+            while True:
+                chunk = response.read1(1 << 16)
+                if not chunk:
+                    break
+                have += len(chunk)
+                if have > limit:
+                    out.truncate(0)
+                    raise UpdateError("下载的文件比预期大，已停止")
+                out.write(chunk)
+                report(len(chunk))
+                window_bytes += len(chunk)
+                if time.monotonic() - window >= STALL_SECONDS:
+                    if stall and window_bytes < STALL_BYTES:
+                        raise Slow(f"太慢（{int(window_bytes / STALL_SECONDS) // 1024} KB/s）")
+                    window, window_bytes = time.monotonic(), 0
+    if expected is not None and have < expected:
+        raise UpdateError("连接中断，没有下载完")   # the next source goes on from here
+    return have
+
+
+def fetch(url, prefixes=(DIRECT,), limit=1 << 20, target=None, sha256=None, size=None, report=None):
+    """Bytes of url (or, with target, the file written there) from the first source prefix that delivers it ("" is
+    GitHub itself). A source that sends too slowly or breaks off hands over to the next, which goes on from the byte
+    where it stopped; when every source was too slow, they are tried once more without a speed limit. With sha256
+    and size the download must match them exactly. report(bytes, source) follows the download (bytes < 0: started
+    over)."""
+    keep_bytes = target is None
+    if keep_bytes:
+        handle, name = tempfile.mkstemp(prefix="dashplay-fetch.")
+        os.close(handle)
+        work = Path(name)
+    else:
+        work = Path(target)
+        work.unlink(missing_ok=True)
+    errors, codes, slow = [], [], []
+    try:
+        for patient, pool in ((False, tuple(prefixes)), (True, None)):
+            for prefix in (pool if pool is not None else tuple(slow)):
+                try:
+                    total = transfer(prefix + url, work, size if size is not None else limit, size, not patient,
+                                     lambda n, prefix=prefix: report and report(n, prefix))
+                    if size is not None and total < size:
+                        raise UpdateError("没有下载完")   # the next source goes on from here
+                    if sha256 and (file_sha256(work) != sha256 or total != size):
+                        work.write_bytes(b"")
+                        raise UpdateError("下载的文件与签名清单不符")
+                    return work.read_bytes() if keep_bytes else work
+                except (OSError, UpdateError, ValueError, http.client.HTTPException) as error:
+                    if hasattr(error, "close"):   # an HTTPError holds its response open
+                        error.close()
+                    errors.append(f"{name_of(prefix)}: {error}")
+                    codes.append(getattr(error, "code", None))
+                    if isinstance(error, Slow) and not patient:
+                        slow.append(prefix)
+            if not slow:
+                break
+    finally:
+        if keep_bytes:
+            work.unlink(missing_ok=True)
+    detail = "；".join(errors)[-300:]
     if all(code == 404 for code in codes):
-        raise NotFound("下载失败（" + "；".join(errors)[-300:] + "）")
-    raise UpdateError("下载失败（" + "；".join(errors)[-300:] + "）。网络恢复后再试，或在设置里换一个镜像")
+        error = NotFound(f"下载失败（{detail}）")
+    else:
+        error = UpdateError(f"下载失败（{detail}）。网络恢复后再试，或在设置里点「测速」换一个下载源")
+    error.detail = detail
+    raise error
+
+
+class Progress:
+    """Bytes of one download step (several files) and the speed over the last 5 s, for state/update-status.json."""
+
+    def __init__(self, status, phase, message, total=0):
+        self.status, self.phase, self.message, self.total = status, phase, message, total
+        self.done, self.samples, self.shown, self.source = 0, [], 0.0, DIRECT
+
+    def __call__(self, n, source):
+        now = time.monotonic()
+        self.done, self.source = max(self.done + n, 0), source
+        self.samples = [s for s in self.samples if now - s[0] <= 5] + [(now, self.done)]
+        if now - self.shown >= 1:
+            self.shown = now
+            self.show()
+
+    def speed(self):
+        if len(self.samples) < 2 or self.samples[-1][0] - self.samples[0][0] < 0.5:
+            return 0
+        (t0, d0), (t1, d1) = self.samples[0], self.samples[-1]
+        return max(int((d1 - d0) / (t1 - t0)), 0)
+
+    def show(self):
+        self.status(self.phase, self.message, done=self.done, total=self.total, speed=self.speed(),
+                    source=name_of(self.source))
 
 
 def verify(data, signature, key=KEY):
@@ -152,14 +351,34 @@ def verify(data, signature, key=KEY):
 
 
 def latest_manifest(root, openwrt, key=KEY):
-    prefixes = mirrors(root, openwrt)
-    data = fetch(LATEST + MANIFEST, prefixes, limit=1 << 20)
-    signature = fetch(LATEST + SIGNATURE, prefixes, limit=4096)
-    if not verify(data, signature, key):
-        raise UpdateError("更新清单的签名不对，已忽略（可能是镜像或网络被篡改）")
+    """The latest signed manifest. Its "mirrors", when valid, become the mirrors measured from then on."""
+    # One source at a time: a mirror answering fast with a block page must not stop a check another source passes.
+    errors, forged = [], False
+    for prefix in sources(root, openwrt, LATEST + MANIFEST):
+        try:
+            data = fetch(LATEST + MANIFEST, (prefix,), limit=1 << 20)
+            signature = fetch(LATEST + SIGNATURE, (prefix,), limit=4096)
+        except UpdateError as error:
+            errors.append(error)
+            continue
+        if verify(data, signature, key):
+            break
+        forged = True
+    else:
+        if forged:
+            raise UpdateError("更新清单的签名不对，已忽略（可能是镜像或网络被篡改）")
+        why = "；".join(getattr(e, "detail", str(e)) for e in errors)[-300:]
+        raise (NotFound if all(isinstance(e, NotFound) for e in errors) else UpdateError)(
+            f"下载失败（{why}）。网络恢复后再试，或在设置里点「测速」换一个下载源")
     manifest = json.loads(data)
     if manifest.get("format") != 1 or not version_key(manifest.get("version")):
         raise UpdateError("更新清单格式不认识：请先手动升级到较新的版本")
+    try:
+        listed = mirror_list(manifest["mirrors"], https_only=True) if "mirrors" in manifest else None
+    except ValueError:
+        listed = None   # a list this version cannot read: keep the one before
+    keep(root, used=prefix, used_at=int(time.time()),
+         **({"mirrors": list(listed)} if listed else {}))
     return manifest
 
 
@@ -272,7 +491,7 @@ def forbidden_in_plan(simulation):
     return sorted({name for name in names if FORBIDDEN.match(name)})
 
 
-def previous_packages(version, prefixes, work):
+def previous_packages(version, prefixes, work, report=None):
     """The installed release's three packages (to go back to), checked against that release's SHA256SUMS."""
     base = PREVIOUS_FEED.format(version=version)
     try:
@@ -286,7 +505,7 @@ def previous_packages(version, prefixes, work):
         if any(re.fullmatch(rf"{re.escape(package)}-[0-9][^/]*\.apk", name) for package in OPENWRT_PACKAGES):
             target = Path(work) / "previous" / name
             target.parent.mkdir(parents=True, exist_ok=True)
-            fetch(base + name, prefixes, target=target, limit=256 << 20)   # no size here: the hash below decides
+            fetch(base + name, prefixes, target=target, limit=256 << 20, report=report)   # the hash below decides
             if file_sha256(target) != digest.strip():
                 raise UpdateError("当前版本的安装包校验不符，无法保证能退回，已停止")
             files.append(target)
@@ -341,7 +560,6 @@ def install_openwrt(root, manifest, status, work):
     current = current_version(root, True)
     if not current:
         raise UpdateError("没有找到已安装的 dashplay 软件包")
-    prefixes = mirrors(root, True)
     arch = Path("/etc/apk/arch").read_text().strip()
     feed = manifest["openwrt"]
     wanted = {name: feed["packages"][name] for name in OPENWRT_PACKAGES}
@@ -349,14 +567,21 @@ def install_openwrt(root, manifest, status, work):
         if arch not in feed["jre"]["files"]:
             raise UpdateError(f"这一版没有 {arch} 的 Java 运行环境")
         wanted["dashplay-jre"] = feed["jre"]["files"][arch]
+    biggest = max(wanted.values(), key=lambda entry: entry["size"])
+    status("measuring", "正在测速，选最快的下载源")
+    prefixes = sources(root, True, feed["base"] + biggest["file"], fresh=True, size=biggest["size"])
     # The way back first: without it nothing is installed, so the new release is not fetched for nothing.
-    status("downloading", f"正在下载当前版本 {current} 的安装包（升级失败时用来退回）")
-    previous = previous_packages(current, prefixes, work)
-    status("downloading", f"正在下载 {manifest['version']}（{sum(f['size'] for f in wanted.values()) // 1048576} MB）")
+    progress = Progress(status, "downloading", f"正在下载当前版本 {current} 的安装包（升级失败时用来退回）")
+    previous = previous_packages(current, prefixes, work, progress)
+    total = sum(entry["size"] for entry in wanted.values())
+    progress = Progress(status, "downloading", f"正在下载 {manifest['version']}（{total // 1048576} MB）", total)
+    progress.show()
     files = []
     for entry in wanted.values():
         files.append(fetch(feed["base"] + entry["file"], prefixes, target=Path(work) / entry["file"],
-                           sha256=entry["sha256"], size=entry["size"]))
+                           sha256=entry["sha256"], size=entry["size"], report=progress))
+    progress.show()
+    keep(root, used=progress.source, used_at=int(time.time()))
     status("checking", "正在核对升级计划")
     run("apk", "update", timeout=300)   # without the index the simulation misses dependencies (F50, 2026-10-19)
     simulation = run("apk", "add", "--upgrade", "--simulate", "--allow-untrusted", *map(str, files))
@@ -379,9 +604,16 @@ def install_openwrt(root, manifest, status, work):
 
 def install_debian(root, manifest, status, work):
     entry = manifest["debian"]["bundle"]
-    status("downloading", f"正在下载 {manifest['version']}（{entry['size'] // 1048576} MB）")
-    bundle = fetch(manifest["debian"]["base"] + entry["file"], mirrors(root, False), target=Path(work) / entry["file"],
-                   sha256=entry["sha256"], size=entry["size"])
+    url = manifest["debian"]["base"] + entry["file"]
+    status("measuring", "正在测速，选最快的下载源")
+    prefixes = sources(root, False, url, fresh=True, size=entry["size"])
+    progress = Progress(status, "downloading", f"正在下载 {manifest['version']}（{entry['size'] // 1048576} MB）",
+                        entry["size"])
+    progress.show()
+    bundle = fetch(url, prefixes, target=Path(work) / entry["file"], sha256=entry["sha256"], size=entry["size"],
+                   report=progress)
+    progress.show()
+    keep(root, used=progress.source, used_at=int(time.time()))
     status("installing", "正在安装，CarPlay 和盒子热点会断开约 1 分钟")
     upgrader = Path(root) / "firmware/upgrade.py"
     with tarfile.open(bundle) as archive:   # the new release's upgrader, as the manual procedure does
@@ -430,6 +662,40 @@ def install(root, openwrt=None, key=KEY):
     except Exception as error:   # whatever happened, the page must not keep saying "installing"
         status("failed", f"升级出错：{type(error).__name__}: {str(error)[-200:]}")
     return 1
+
+
+def speedtest(root, openwrt=None, key=KEY):
+    """The settings page's "测速": every source on the release's biggest download, whatever the setting; the result
+    (state/update-sources.json) is also the automatic order. Returns that state."""
+    root = Path(root)
+    openwrt = is_openwrt() if openwrt is None else openwrt
+    keep(root, measuring=int(time.time()), error="")
+    try:
+        manifest = latest_manifest(root, openwrt, key)
+        if openwrt:
+            packages = manifest["openwrt"]["packages"]
+            entry, base = packages["dashplay"], manifest["openwrt"]["base"]
+        else:
+            entry, base = manifest["debian"]["bundle"], manifest["debian"]["base"]
+        value = setting(root, openwrt)
+        try:
+            chosen = mirror_list(value) if value and value != "none" else ()
+        except ValueError:
+            chosen = ()
+        pool = tuple(dict.fromkeys((DIRECT,) + chosen + candidates(root)))
+        keep(root, ranking=measure(base + entry["file"], pool, entry["size"]), measured_at=int(time.time()),
+             measuring=0)
+    except UpdateError as error:
+        keep(root, measuring=0, error=str(error))
+    except Exception as error:   # the page must not keep saying "measuring"
+        keep(root, measuring=0, error=f"测速出错：{type(error).__name__}: {str(error)[-200:]}")
+    return sources_state(root)
+
+
+def measuring(root):
+    """A speed test started less than 2 minutes ago that has not finished."""
+    started = sources_state(root).get("measuring")
+    return isinstance(started, (int, float)) and 0 < time.time() - started < 120
 
 
 def running(root):
@@ -518,11 +784,14 @@ def checker(root, stopped, enabled=True, first=120):
 def main(argv=None):
     os.umask(0o077)   # status, check and backup files hold nothing for others; the backup holds keys
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["check", "launch", "install"])
+    parser.add_argument("command", choices=["check", "launch", "install", "speedtest"])
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
     args = parser.parse_args(argv)
     if args.command == "check":
         print(json.dumps(check(args.root), ensure_ascii=False))
+        return 0
+    if args.command == "speedtest":
+        print(json.dumps(speedtest(args.root), ensure_ascii=False))
         return 0
     if args.command == "launch":
         print(launch(args.root))

@@ -39,6 +39,25 @@ class AudioRoutesTest(unittest.TestCase):
             self.assertNotIn('--car-music', supervisor.car_audio_args(state))
             self.assertNotIn('--tesla-browser', supervisor.car_audio_args(state))
 
+    def test_tesla_mode_ignores_the_older_car_audio_keys(self):
+        # 2026-11-01: a Tesla box whose owner never touched the sound switch used to start with "--tesla" and whatever
+        # car_music / car_voice said; now the split is always explicit, so CarPlay declares the 7-format profile.
+        import json, tempfile
+        import supervisor
+        expected = ['--tesla-browser', '--car-music', '--audio-routes',
+                    'media=bluetooth,navigation=carplay,alert=carplay,siri=bluetooth,calls=bluetooth']
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d)
+            for old in ({}, {'car_music': True, 'car_voice': True}, {'car_music': False, 'car_voice': False},
+                        {'car_voice': True}, {'audio_route_navigation': 'carplay'}):
+                (state / 'options.json').write_text(json.dumps({'tesla': True, **old}))
+                self.assertEqual(supervisor.car_audio_args(state), expected, old)
+            (state / 'options.json').write_text(json.dumps({'tesla': True, 'audio_route_navigation': 'bluetooth'}))
+            self.assertIn('navigation=bluetooth', supervisor.car_audio_args(state)[-1])
+            # Other cars keep 31.3's behaviour, older switches included.
+            (state / 'options.json').write_text(json.dumps({'car_voice': True}))
+            self.assertEqual(supervisor.car_audio_args(state), ['--car-voice'])
+
     def test_switch_arguments_match_the_tested_declarations(self):
         # carplay -> --audio-routes navigation=carplay (nine formats); bluetooth -> navigation=bluetooth (six).
         on = audio_routes.arguments({'car_music': '1'}, tesla=True)
@@ -76,8 +95,10 @@ class SharedSettingsTest(unittest.TestCase):
         result = self.page.apply('/audio-routes', {'nonce': self.page.pairing.nonce,
                                  'category': 'navigation', 'destination': 'carplay'})
         self.assertEqual(result['navigation'], 'carplay')
-        self.assertIn('name="audio_route_navigation"><option value="carplay" selected>留在 CarPlay',
+        # Tesla mode (2026-11-01): the one choice is where navigation plays.
+        self.assertIn('name="audio_route_navigation"><option value="carplay" selected>CarPlay 网页',
                       self.page.car_audio_block(self.page.pairing.nonce, scope='sound'))
+        self.assertIn('也走特斯拉蓝牙', self.page.car_audio_block(self.page.pairing.nonce, scope='sound'))
         self.assertNotIn('audio_route_main', self.page.car_audio_block(self.page.pairing.nonce, scope='sound'))
         saved = json.loads(self.page.options_file.read_text())
         self.assertEqual(saved['idle_release'], 300)

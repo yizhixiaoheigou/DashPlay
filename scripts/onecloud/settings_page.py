@@ -122,6 +122,24 @@ CABLE_BLOCKS_ADDING = ("现在用数据线连着 CarPlay，无线连接是暂停
                        "要添加新手机，拔掉数据线再来。数据线照常充电，选了 USB 共享网络也照常上网。")
 
 
+def speed_text(value):
+    value = value if isinstance(value, (int, float)) else 0
+    return f"{value / 1048576:.1f} MB/s" if value >= 1048576 else f"{int(value) // 1024} KB/s"
+
+
+def download_progress(progress):
+    """The bar and "12.3 / 28.9 MB · 850 KB/s · gh-proxy.com" of update.py's state/update-status.json."""
+    number = lambda key: progress.get(key) if isinstance(progress.get(key), (int, float)) else 0
+    done, total, speed = number("done"), number("total"), number("speed")
+    if progress.get("phase") != "downloading" or not done and not total:
+        return ""
+    size = f"{done / 1048576:.1f} / {total / 1048576:.1f} MB" if total else f"{done / 1048576:.1f} MB"
+    words = " · ".join(w for w in (size, speed_text(speed) if speed else "", escape(str(progress.get("source") or "")))
+                       if w)
+    bar = f'<progress max={total} value={min(done, total)}></progress>' if total else ""
+    return f'<div class="cell download"><span class=main>{bar}<span>{words}</span></span></div>'
+
+
 class SettingsPage:
     def __init__(self, state: Path, status, on_change, allowed_networks, scanner=None, wired_status=None,
                  managed=None, run=None, retry_cert=None):
@@ -388,6 +406,16 @@ class SettingsPage:
                 return "正在检查更新，几秒后刷新页面就能看到结果。"
             if form.get("action") == "install":
                 return update.launch(self.state.parent)
+            if form.get("action") == "source":
+                return self.save_source(form)
+            if form.get("action") == "speedtest":
+                if update.running(self.state.parent):
+                    return "正在升级，升级时已经自动测过速。"
+                if not update.measuring(self.state.parent):
+                    update.keep(self.state.parent, measuring=int(time.time()))   # the page says so from now on
+                    threading.Thread(target=update.speedtest, args=(self.state.parent,), name="update-speedtest",
+                                     daemon=True).start()
+                return "正在测速，约 10 秒后页面自动显示结果。"
             raise ValueError("未知操作。")
         if path == "/setup-flow":
             self.check_nonce(form)
@@ -506,7 +534,8 @@ class SettingsPage:
         progress = update.read(self.state / "update-status.json")
         if update.running(self.state.parent):
             return (f'<div class=cell><span class=main><b>正在升级</b><span>{escape(progress.get("message", ""))}</span>'
-                    '</span></div><p class=note>约 2–5 分钟，期间 CarPlay 会断开，页面会自己刷新。</p>')
+                    f'</span></div>{download_progress(progress)}'
+                    '<p class=note>约 2–5 分钟，期间 CarPlay 会断开，页面会自己刷新。</p>')
         version = update.bundled_version(self.state.parent)
         cells = (f'<div class=cell><span class=main><b>本机程序</b></span><span class=value>{escape(version)}</span></div>'
                  if version else "")
@@ -532,6 +561,71 @@ class SettingsPage:
                    if found.get("checked_at") else "还没有检查过")
         return cells + (f'<form method=post action=/update>{ui.hidden(nonce)}<button class="cell action" name=action '
                         f'value=check>检查更新</button></form><p class=note>{checked}</p>')
+
+    def source_block(self, nonce):
+        """Where updates download from (update.sources): automatic (the fastest, measured), GitHub only or mirrors,
+        and the last speed test. On OpenWrt the choice is LuCI's (uci update_mirror); the speed test is here too."""
+        root = self.state.parent
+        openwrt = bool(self.managed)
+        value = update.setting(root, openwrt)
+        mirrors = update.candidates(root)
+        state = update.sources_state(root)
+        if value == "none":
+            mode = "只连 GitHub"
+        elif value:
+            mode = "先用 " + "、".join(update.name_of(m) for m in value.split()) + "，不行再连 GitHub"
+        else:
+            mode = "自动：升级前同时测 GitHub 和各个镜像，用最快的；下载中变慢会自动换下一个，接着下"
+        used = state.get("used")
+        last = (f'，上次用的 {escape(update.name_of(used))}' if isinstance(used, str) and state.get("used_at") else "")
+        cells = (f'<div class=cell><span class=main><b>下载源</b><span>{escape(mode)}{last}</span></span></div>')
+        if not openwrt:
+            chosen = "" if not value else "none" if value == "none" else value if value in mirrors else "custom"
+            options = [("", "自动（测速选最快，推荐）"), ("none", "只连 GitHub")] + \
+                [(m, update.name_of(m)) for m in mirrors] + [("custom", "自定义地址")]
+            choices = "".join(f'<option value="{escape(v)}"{" selected" if v == chosen else ""}>{escape(t)}</option>'
+                              for v, t in options)
+            custom = value if chosen == "custom" else ""
+            cells += (f'<form method=post action=/update>{ui.hidden(nonce, action="source")}'
+                      f'<label class=cell><span class=main><b>选择下载源</b></span><select name=source>{choices}</select></label>'
+                      f'<label class=cell><span class=main><b>自定义地址</b><span>选「自定义地址」时填，例如 https://gh-proxy.com/，'
+                      '可填多个，用空格隔开</span></span>'
+                      f'<input type=text name=custom value="{escape(custom)}" placeholder="https://" autocomplete=off></label>'
+                      '<button class="cell action">保存下载源</button></form>')
+        if update.measuring(root):
+            cells += ('<div class=cell><span class=main><b>正在测速</b><span>同时连 GitHub 和各个镜像，约 10 秒，'
+                      '页面会自己刷新</span></span></div>')
+        else:
+            ranking = [r for r in state.get("ranking") or () if isinstance(r, dict) and isinstance(r.get("source"), str)]
+            if ranking:
+                at = state.get("measured_at")
+                when = time.strftime("%m-%d %H:%M", time.localtime(at)) if isinstance(at, (int, float)) and at else ""
+                rows = "".join(
+                    f'<div class=cell><span class=main><b>{escape(update.name_of(r["source"]))}</b></span>'
+                    f'<span class=value>{speed_text(r["speed"]) if "speed" in r else "不可用"}</span></div>'
+                    for r in ranking)
+                cells += rows + (f'<p class=note>{when} 测速，从快到慢</p>' if when else "")
+            if state.get("error"):
+                cells += f'<div class=cell><span class=main><b>测速没有成功</b><span>{escape(state["error"])}</span></span></div>'
+            cells += (f'<form method=post action=/update>{ui.hidden(nonce, action="speedtest")}'
+                      '<button class="cell action">测速</button></form>')
+        return cells
+
+    def save_source(self, form):
+        if self.managed:
+            raise ValueError(f"下载源在 {self.managed['by']} 后台的 DashPlay → 程序更新里选。")
+        chosen = form.get("source", "").strip()
+        if chosen == "custom":
+            custom = form.get("custom", "").strip()
+            if not custom:
+                raise ValueError("选了「自定义地址」，请把镜像地址填上。")
+            value = " ".join(update.mirror_list(custom))
+        elif chosen in ("", "none") or chosen in update.candidates(self.state.parent):
+            value = chosen
+        else:
+            raise ValueError("请刷新页面后重新选择下载源。")
+        self._update_options(update_mirror=value)
+        return "已保存下载源，下次检查更新和升级时生效。"
 
     def debug_block(self, nonce):
         """Advanced: remote debugging over the owner's phone hotspot."""
@@ -684,8 +778,11 @@ class SettingsPage:
     def tesla_text(self, mode):
         """Tesla mode (supervisor.py tesla_mode): what it does in this way of use."""
         shared = setup_wizard.SHARED_LAN.ip
-        common = ("iPhone 用蓝牙连特斯拉并选为媒体来源，音乐、Siri 和通话在 iPhone 控制中心选特斯拉输出，导航播报留在网页"
-                  "（会放大）；想让所有声音都不走 CarPlay，在本页「声音」或 CarPlay 画面里的「盒子设置」改。"
+        # 2026-11-01: music, Siri and calls always go over the Tesla's Bluetooth (a moving Tesla does not let the page
+        # play music); navigation is the one choice (audio_routes.resolve, AudioRoutes.voiceOnCarBluetooth).
+        common = ("iPhone 要先用蓝牙连上特斯拉，并在特斯拉里选它为媒体来源：音乐、Siri 和通话一定走特斯拉蓝牙，"
+                  "导航播报默认在 CarPlay 网页（会放大）；听不到导航时，在本页「声音」或 CarPlay 画面里的「盒子设置」"
+                  "改为「也走特斯拉蓝牙」。"
                   "全屏按钮经腾讯视频、1905 的跳转页去掉地址栏（特斯拉要能上网）。特斯拉的 WiFi 设置里要打开「行驶中保持连接」，"
                   "否则一出 P 挡画面就停。")
         if mode in setup_wizard.JOINS:
@@ -734,10 +831,10 @@ class SettingsPage:
             chosen[key] = form.get(key) == "on"
         if chosen.get("tesla") and self.setup().get("mode") == "car_hotspot":
             raise ValueError("特斯拉没有车机热点，请先在网络里改用其他方式。")
-        if scope in (None, "car") and chosen.get("tesla") and not was_tesla:
-            # The page's car-music behaviour (prompt boost, no media session); where the sound plays is the iPhone's
-            # Control Center, or none through CarPlay with the sound switch (2026-10-31).
-            chosen.update(car_music=True, car_voice=True)
+        if chosen.get("tesla"):
+            # Not read in Tesla mode (supervisor.car_audio_args, 2026-11-01): music, Siri and calls are the Tesla's,
+            # navigation is the sound switch. Dropped so they cannot come back as a non-Tesla choice later.
+            chosen.pop("car_music", None); chosen.pop("car_voice", None)
         _save(self.options_file, chosen)
         if scope == "sound":
             # Receiver options only (supervisor.receiver_options): no network rebuild (2026-10-29).
@@ -753,15 +850,24 @@ class SettingsPage:
     def car_audio_block(self, nonce, scope=None):
         if scope == 'sound':
             output = self.sound_routes()['navigation']
+            tesla = self.sound_options()[1]
+            if tesla:
+                title, labels = '导航播报', (('carplay', 'CarPlay 网页'), ('bluetooth', '也走特斯拉蓝牙'))
+                foot = ('特斯拉模式：音乐、Siri 和通话一定走特斯拉蓝牙（行车中特斯拉不让网页放音乐），'
+                        'iPhone 要先用蓝牙连上特斯拉。导航播报默认在 CarPlay 网页；听不到导航，或切到特斯拉自带的地图、'
+                        '应用时播报会断，就改为「也走特斯拉蓝牙」。保存后 CarPlay 会短暂重连，WiFi 不断。')
+            else:
+                title, labels = '声音输出', (('carplay', '留在 CarPlay'), ('bluetooth', '不走 CarPlay'))
+                foot = ('留在 CarPlay：音乐、Siri 和通话从哪出，在 iPhone 控制中心（音乐卡片右上角的输出图标）选，'
+                        '导航播报一直在网页。不走 CarPlay：所有声音（含导航）都由 iPhone 自己或它连的蓝牙播放，'
+                        '控制中心里不会再有 CarPlay。保存后 CarPlay 会短暂重连，WiFi 不断。')
             choices = ''.join(f'<option value="{value}"{" selected" if output == value else ""}>{label}</option>'
-                              for value, label in (('carplay', '留在 CarPlay'), ('bluetooth', '不走 CarPlay')))
+                              for value, label in labels)
             return (f'<form method=post action=/audio>{ui.hidden(nonce, scope="sound")}'
-                    '<label class=cell><span class=main><b>声音输出</b><span>与 CarPlay 画面里的盒子设置同步</span></span>'
+                    f'<label class=cell><span class=main><b>{title}</b><span>与 CarPlay 画面里的盒子设置同步</span></span>'
                     f'<select name="{audio_routes.OUTPUT_KEY}">{choices}</select></label>'
-                    '<p class=foot>留在 CarPlay：音乐、Siri 和通话从哪出，在 iPhone 控制中心（音乐卡片右上角的输出图标）选，'
-                    '导航播报一直在网页。不走 CarPlay：所有声音（含导航）都由 iPhone 自己或它连的蓝牙播放，'
-                    '控制中心里不会再有 CarPlay。保存后 CarPlay 会短暂重连，WiFi 不断。</p>'
-                    '<button class="cell action">保存声音输出</button></form>')
+                    f'<p class=foot>{foot}</p>'
+                    f'<button class="cell action">保存{title}</button></form>')
         chosen = _load(self.options_file)
         chosen = chosen if isinstance(chosen, dict) else {}
         vehicle = (("tesla", "特斯拉模式", self.tesla_text(self.setup().get("mode"))),)
@@ -826,6 +932,8 @@ class SettingsPage:
         return ui.group('车机上网', rows, '密码只写不读，留空沿用同名热点密码。热点可以是手机（跑 CarPlay 的同一部 iPhone 或另一部手机），也可以是随身 WiFi，要一直开着。'
                        'iPhone 开热点时把「最大兼容性」关掉（热点走 5 GHz，画面才不卡）；'
                        '只有盒子网卡只支持 2.4 GHz 时才需要打开它。'
+                       '特斯拉在 5 GHz 只认 149–165 信道：手机热点在 5 GHz 别的信道上时盒子不去连它（否则特斯拉找不到盒子、'
+                       'CarPlay 断开），上面会写明原因；这时改用 USB 共享网络最稳。'
                        + setup_flow.DATA_USE + '找不到或掉线时退回不上网；特斯拉自带音乐、地图将不能联网，CarPlay 正常。'
                        '「USB 共享网络」：手机或随身 WiFi 用数据线插到盒子的 USB 口。iPhone 打开「个人热点」'
                        '（可以就是做有线 CarPlay 的那根线）；安卓手机打开「USB 网络共享」；随身 WiFi 一般插上即用。'
@@ -1265,6 +1373,9 @@ class SettingsPage:
                    else "")
                 + ui.group("程序更新", self.update_block(nonce),
                            "每天自动检查一次，只提示不自动安装。升级前会备份配对、证书和设置，新版本起不来会自动退回。")
+                + ui.group("下载源", self.source_block(nonce),
+                           "国内连 GitHub 常常很慢，镜像可以加速。发布包都有签名并逐个核对，镜像改不了装进来的内容。")
                 + ui.group("高级", advanced, "" if self.managed else "重新进行首次设置可以更换使用方式，会保留盒子证书、自己的域名和盒子热点密码。")
                 + '</div>')
-        return ui.page("盒子设置", body, refresh or update.running(self.state.parent), wide=True)
+        return ui.page("盒子设置", body, refresh or update.running(self.state.parent) or update.measuring(self.state.parent),
+                       wide=True)

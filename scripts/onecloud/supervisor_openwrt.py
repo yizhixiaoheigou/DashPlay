@@ -70,17 +70,15 @@ DEFAULTS = {"enabled": "1", "wifi": "auto", "settings_port": "18080", "viewer_po
 
 
 def car_audio_args(config):
-    """run-receiver.py options for what goes over the car's own Bluetooth; Tesla mode turns both switches on when it
-    is enabled (LuCI) but they remain the owner's choice, as on the box (2026-10-28)."""
-    # One sound switch since 2026-10-31 (audio_routes.resolve), the same as on the Linux boxes; a router whose owner
-    # never touched it keeps the older options unchanged.
+    """run-receiver.py options for what goes over the car's own Bluetooth, the same as on the Linux boxes
+    (supervisor.car_audio_args)."""
+    # One sound switch since 2026-10-31 (audio_routes.resolve). Tesla mode always passes its split (2026-11-01):
+    # music, Siri and calls on the Tesla's Bluetooth, navigation the owner's choice. Another car whose owner never
+    # touched the switch keeps the older options unchanged.
     tesla = config["tesla_mode"] == "1"
-    if config.get(audio_routes.OUTPUT_KEY):
+    if tesla or config.get(audio_routes.OUTPUT_KEY):
         return audio_routes.arguments(config, tesla)
-    if tesla and config["car_music"] == "1" and config["car_voice"] == "1":
-        return ["--tesla"]
-    return (["--tesla-browser"] if tesla else []) + [
-        flag for key, flag in (("car_music", "--car-music"), ("car_voice", "--car-voice")) if config[key] == "1"]
+    return [flag for key, flag in (("car_music", "--car-music"), ("car_voice", "--car-voice")) if config[key] == "1"]
 
 
 RECHECK_EVERY = 10      # seconds between looks at the Wi-Fi handed to the iPhone

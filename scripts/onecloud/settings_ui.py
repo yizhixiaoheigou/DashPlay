@@ -59,6 +59,8 @@ input::placeholder{color:var(--secondary)}
 color:#fff;font:inherit;font-weight:600;text-align:center;text-decoration:none;cursor:pointer;transition:transform .1s ease-out}
 .btn:active{transform:scale(.97)}
 .btn.plain{background:var(--fill);color:var(--tint)}
+.cell.download progress{display:block;width:100%;height:6px;margin:2px 0 6px;accent-color:var(--tint)}
+.cell select{max-width:55%;font:inherit;color:var(--secondary);background:none;border:0}
 .btn+form .btn,form+form .btn.plain{margin-top:10px}
 :focus-visible{outline:3px solid var(--tint);outline-offset:2px}
 .banner{border-radius:12px;padding:12px 16px;margin:12px 0 0;background:var(--cell);font-size:15px}

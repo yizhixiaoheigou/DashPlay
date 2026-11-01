@@ -9,6 +9,12 @@ TITLES = {'vehicle': '什么车？', 'mode': '车机能自己开热点吗？', '
           'internet': '连着盒子时，车机自己还要能上网吗？', 'uplink': '要连接的 WiFi 热点',
           'sound': '音乐、通话和 Siri 走车机蓝牙吗？', 'iphone': 'iPhone 用数据线还是无线？',
           'summary': '配置总结'}
+# Tesla mode (2026-11-01): music, Siri and calls always go over the Tesla's Bluetooth; only navigation is asked.
+TESLA_SOUND_TITLE = '导航播报从哪里出声？'
+
+
+def title(step, draft):
+    return TESLA_SOUND_TITLE if step == 'sound' and draft.get('tesla') else TITLES[step]
 # Asked by the owner (2026-10-29): CarPlay itself must not be read as eating the phone's data.
 DATA_USE = ('CarPlay 的画面和声音只在盒子与 iPhone 之间传，不经外网、不耗流量；在 CarPlay 里听音乐、导航时，'
             'iPhone 照常用自己的流量，和平时用手机一样。连 WiFi 热点后多出的流量，只来自车机自带的应用（如特斯拉的音乐、地图）上网。')
@@ -162,12 +168,14 @@ class FirstSetup:
         elif step == 'sound':
             if value not in ('yes', 'no'):
                 raise ValueError('请选择声音去向。')
-            draft.update(car_music=value == 'yes', car_voice=value == 'yes')
-            # Non-Tesla: the answer only matters through the single switch ("yes" = all sound on the
-            # phone or its Bluetooth). Tesla keeps its own default: media over the car's Bluetooth,
-            # navigation prompts on the page, so no key is written for it.
-            if not draft.get('tesla'):
-                draft['audio_route_navigation'] = 'bluetooth' if value == 'yes' else 'carplay'
+            # Both answer through the single switch ("yes" = off CarPlay). Other cars: every sound on the phone or
+            # its Bluetooth. Tesla (2026-11-01): music, Siri and calls are the Tesla's whatever the answer; "yes"
+            # also sends navigation there, "no" keeps navigation on the page.
+            if draft.get('tesla'):
+                draft.pop('car_music', None); draft.pop('car_voice', None)
+            else:
+                draft.update(car_music=value == 'yes', car_voice=value == 'yes')
+            draft['audio_route_navigation'] = 'bluetooth' if value == 'yes' else 'carplay'
         elif step == 'iphone':
             if value not in [key for key, *_ in iphone_choices(draft, self.page.direct_capable(), self.page.wired_capable())]:
                 raise ValueError('前面的需求只能使用数据线；请返回修改上网来源。')
@@ -181,6 +189,8 @@ class FirstSetup:
             for key in ('tesla', 'car_music', 'car_voice', 'car_internet', 'audio_route_navigation'):
                 if key in draft:
                     options[key] = draft[key]
+            if draft.get('tesla'):   # no longer read in Tesla mode (supervisor.car_audio_args, 2026-11-01)
+                options.pop('car_music', None); options.pop('car_voice', None)
             if draft['mode'] == 'car_hotspot' and draft.get('iphone') != 'wired' and self.page.direct_capable():
                 options['direct_phone'] = True   # wireless on the car hotspot is the direct hotspot
             _save(self.page.options_file, options)
@@ -209,7 +219,7 @@ class FirstSetup:
         steps = sequence(draft)
         nonce = self.page.pairing.nonce
         scanning = False
-        body = f'<h1>{TITLES[step]}</h1><p class=sub>第 {steps.index(step)+1} 步 / {len(steps)} · 确认总结后才生效</p>{notice}'
+        body = f'<h1>{title(step, draft)}</h1><p class=sub>第 {steps.index(step)+1} 步 / {len(steps)} · 确认总结后才生效</p>{notice}'
         form = f'<form method=post action=/setup-flow>{ui.hidden(nonce, action=step)}'
         def choices(items, selected=None):
             return ''.join(f'<label class=role><input class=pick type=radio name=value value="{key}" required'
@@ -262,8 +272,15 @@ class FirstSetup:
             form += self.credentials(draft.get('uplink', {}).get('ssid', ''), bool(draft.get('uplink')))
             form += '<p class=foot>可以是手机热点（跑 CarPlay 的同一部 iPhone 或另一部手机），也可以是随身 WiFi。</p>'
         elif step == 'sound':
-            form += choices([('yes', '是', '设置完成后，再让 iPhone 蓝牙连车机，媒体来源选这部手机。'),
-                             ('no', '否', '声音使用 CarPlay 网页。')], 'yes' if draft.get('car_music', draft.get('tesla')) else 'no')
+            if draft.get('tesla'):
+                form += choices([('no', 'CarPlay 网页（推荐）', '音乐、Siri、通话走特斯拉蓝牙，导航播报在 CarPlay 画面里放。'),
+                                 ('yes', '也走特斯拉蓝牙', '导航听不到时选这个：所有声音都由 iPhone 经蓝牙交给特斯拉。')],
+                                'yes' if draft.get('audio_route_navigation') == 'bluetooth' else 'no')
+                form += ('<p class=foot>特斯拉模式下音乐、Siri 和通话一定走特斯拉蓝牙（行车中特斯拉不让网页放音乐）。'
+                         '设置完成后，让 iPhone 用蓝牙连上特斯拉，并在特斯拉里选它为媒体来源。</p>')
+            else:
+                form += choices([('yes', '是', '设置完成后，再让 iPhone 蓝牙连车机，媒体来源选这部手机。'),
+                                 ('no', '否', '声音使用 CarPlay 网页。')], 'yes' if draft.get('car_music') else 'no')
         elif step == 'iphone':
             form += choices(iphone_choices(draft, self.page.direct_capable(), self.page.wired_capable()), draft.get('iphone', 'any'))
             form += ''.join(ui.banner(item, 'wait') for item in limitations(draft, self.page.direct_capable()))
@@ -272,7 +289,9 @@ class FirstSetup:
                     {'car_hotspot':'车机热点','mifi':'随身 WiFi','box_hotspot':'盒子热点'}[draft['mode']]),
                     ('热点', draft['hotspot']['ssid']), ('车机上网', {'phone_hotspot': '连接 WiFi 热点', 'usb_tether': 'USB 共享网络'}.get(draft.get('car_internet'), '不上网' if draft['mode']=='box_hotspot' else '使用上游')),
                     ('iPhone', dict((k,t) for k,t,_ in iphone_choices(draft, self.page.direct_capable(), self.page.wired_capable()))[draft['iphone']]),
-                    ('声音', '不走 CarPlay（车机蓝牙）' if draft.get('audio_route_navigation') == 'bluetooth' else '留在 CarPlay')]
+                    ('声音', ('全部走特斯拉蓝牙' if draft.get('audio_route_navigation') == 'bluetooth' else
+                             '音乐、Siri、通话走特斯拉蓝牙；导航在 CarPlay 网页') if draft['tesla'] else
+                     '不走 CarPlay（车机蓝牙）' if draft.get('audio_route_navigation') == 'bluetooth' else '留在 CarPlay')]
             if draft.get('uplink') and draft.get('car_internet') == 'phone_hotspot':
                 rows += [('手机热点', draft['uplink']['ssid'])]
             if draft['mode'] == 'box_hotspot':
@@ -288,7 +307,7 @@ class FirstSetup:
             body += f'<form method=post action=/setup-flow>{ui.hidden(nonce, action="back")}<button class="btn plain">返回修改</button></form>'
         if step == 'summary':
             body += ''.join(f'<form method=post action=/setup-flow>{ui.hidden(nonce, action="back", target=target)}'
-                            f'<button class="cell action">修改：{TITLES[target]}</button></form>' for target in steps[:-1])
+                            f'<button class="cell action">修改：{title(target, draft)}</button></form>' for target in steps[:-1])
         return ui.page('首次设置', body, ui.SCANNING_RELOAD if step == 'network' and draft.get('mode') != 'box_hotspot'
                        and self.page.scanner and scanning else False)
 

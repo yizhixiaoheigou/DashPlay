@@ -221,7 +221,7 @@ class WizardPageTests(unittest.TestCase):
         self.assertIn('name="audio_route_navigation"><option value="carplay" selected>', self.page.render(''),
                       'Tesla mode keeps the sound on CarPlay; the iPhone Control Center picks the Tesla')
         self.page.apply('/audio', {'car_voice': 'on', 'nonce': self.nonce})
-        self.assertEqual(car_audio_args(self.state), ['--car-voice'])
+        self.assertEqual(car_audio_args(self.state), ['--car-voice'], 'the form above turned Tesla mode off again')
         with self.assertRaises(ValueError):
             self.page.apply('/audio', {'car_music': 'on', 'nonce': 'bad'})
 
@@ -235,7 +235,8 @@ class WizardPageTests(unittest.TestCase):
         message = self.page.apply('/audio', {'tesla': 'on', 'nonce': self.nonce})
         self.assertIn('热点网段改为 100.96.0.1', message)
         self.assertEqual(json.loads((self.state / 'options.json').read_text())['tesla'], True)
-        self.assertEqual(car_audio_args(self.state), ['--tesla'])
+        # Tesla mode (2026-11-01): music, Siri and calls on the Tesla's Bluetooth, navigation on CarPlay by default.
+        self.assertEqual(car_audio_args(self.state), ['--tesla-browser', '--car-music', '--audio-routes', 'media=bluetooth,navigation=carplay,alert=carplay,siri=bluetooth,calls=bluetooth'])
         # Saved again unchanged: no talk of a new address.
         self.assertNotIn('网段', self.page.apply('/audio', {'tesla': 'on', 'car_music': 'on', 'nonce': self.nonce}))
 
@@ -247,7 +248,10 @@ class WizardPageTests(unittest.TestCase):
         self.page.apply('/audio', {'scope': 'car', 'tesla': 'on', 'nonce': self.nonce})
         self.assertEqual(self.page.sound_routes()['navigation'], 'carplay')
         self.assertEqual(self.page.sound_routes()['media'], 'bluetooth', 'car-music page behaviour')
-        self.assertIn('控制中心', self.page.render(''))
+        self.assertEqual(self.page.sound_routes()['siri'], 'bluetooth')
+        html = self.page.render('')
+        self.assertIn('一定走特斯拉蓝牙', html, 'Tesla mode says music, Siri and calls are the Tesla\'s (2026-11-01)')
+        self.assertIn('<b>导航播报</b>', html)
 
     def test_box_answers_its_own_domain_on_its_hotspot_by_default(self):
         # A car that gets no DNS of its own on the box hotspot (no internet; the Xpeng did not fall back to its
@@ -702,6 +706,46 @@ class WizardPageTests(unittest.TestCase):
         self.assertEqual(sorted(removed), ['A', 'B'])
         self.assertEqual(read_json(presence), {'boot': 'b1'})
         self.assertFalse((self.root / 'state/receiver/pairing-request.json').exists())
+
+
+    def test_download_source_choice_speed_test_and_progress(self):
+        # 2026-11-01: the mirror could only be typed into state/options.json, and an update showed no progress.
+        import update
+        self.set_up_done()
+        html = self.page.render('')
+        for text in ('下载源', '自动（测速选最快，推荐）', '只连 GitHub', 'gh-proxy.com', '自定义地址', '>测速</button>'):
+            self.assertIn(text, html)
+        options = lambda: json.loads((self.state / 'options.json').read_text()).get('update_mirror')
+        self.page.apply('/update', {'action': 'source', 'source': 'none', 'nonce': self.nonce})
+        self.assertEqual(options(), 'none')
+        self.page.apply('/update', {'action': 'source', 'source': 'https://gh-proxy.com/', 'nonce': self.nonce})
+        self.assertEqual(options(), 'https://gh-proxy.com/')
+        self.assertIn('<option value="https://gh-proxy.com/" selected>', self.page.render(''))
+        self.page.apply('/update', {'action': 'source', 'source': 'custom', 'custom': 'https://my.example', 'nonce': self.nonce})
+        self.assertEqual(options(), 'https://my.example/')
+        for bad in ({'source': 'custom', 'custom': ''}, {'source': 'custom', 'custom': 'ftp://x'}, {'source': 'https://evil/'}):
+            with self.assertRaises(ValueError):
+                self.page.apply('/update', dict(bad, action='source', nonce=self.nonce))
+        self.page.apply('/update', {'action': 'source', 'source': '', 'nonce': self.nonce})
+        self.assertEqual(options(), '')
+        with patch.object(update, 'speedtest') as test:
+            self.assertIn('正在测速', self.page.apply('/update', {'action': 'speedtest', 'nonce': self.nonce}))
+        html = self.page.render('')
+        self.assertIn('正在测速', html)
+        self.assertIn('http-equiv=refresh', html)
+        update.keep(self.state.parent, measuring=0, measured_at=1_800_000_000, used='https://gh-proxy.com/', used_at=1,
+                    ranking=[{'source': 'https://gh-proxy.com/', 'speed': 1_300_000}, {'source': '', 'speed': 90_000},
+                             {'source': 'https://ghfast.top/', 'error': 'timed out'}])
+        html = self.page.render('')
+        for text in ('1.2 MB/s', '87 KB/s', '不可用', '上次用的 gh-proxy.com', '从快到慢'):
+            self.assertIn(text, html)
+        import time
+        update.save(self.state / 'update-status.json', {'phase': 'downloading', 'message': '正在下载 2026.11.2（28 MB）',
+                                                        'at': time.time(), 'done': 12_897_485, 'total': 30_303_846,
+                                                        'speed': 870_400, 'source': 'gh-proxy.com'})
+        html = self.page.render('')
+        for text in ('正在升级', '<progress max=30303846 value=12897485>', '12.3 / 28.9 MB · 850 KB/s · gh-proxy.com'):
+            self.assertIn(text, html)
 
 
 class HostapdTests(unittest.TestCase):
