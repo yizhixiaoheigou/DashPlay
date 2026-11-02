@@ -36,8 +36,8 @@ RULES = [
     ("phone-number", re.compile(r"(?<![0-9A-Za-z])1[3-9]\d{9}(?![0-9A-Za-z])")),
     ("lan-ip", re.compile(r"\b(?:192\.168|10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b")),
     ("pairing-pin", re.compile(r"(?i)pairing pin\s*:?\s*\d{4}")),
-    # A PEM marker used as a string constant in code ("-----BEGIN PRIVATE KEY-----".toByteArray) is not a key.
-    ("secret-key", re.compile(r"BEGIN [A-Z ]*PRIVATE KEY(?!-----\")|token=[0-9a-f]{16,}|playport-token',\s*\"[0-9a-f]{32}")),
+    # A PEM marker; pem_marker_in_code() below exempts it when it is a string constant in code.
+    ("secret-key", re.compile(r"BEGIN [A-Z ]*PRIVATE KEY|token=[0-9a-f]{16,}|playport-token',\s*\"[0-9a-f]{32}")),
     ("identity-file-mention", re.compile(r"identity\.pk8|certificate\.p7b")),
     ("hex32-review", re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])")),
     ("third-party-identity", re.compile(r"DiPlay|Carlinkit|offline-mfi", re.I)),
@@ -66,6 +66,25 @@ def mask(text):
     return text if len(text) <= 4 else text[:2] + "…" + text[-2:]
 
 
+PEM_MARKER = re.compile(r"BEGIN [A-Z ]*PRIVATE KEY")
+
+
+def pem_marker_in_code(line):
+    """A PEM header used as a string constant is not key material.
+
+    "-----BEGIN PRIVATE KEY-----".toByteArray() and "-----BEGIN PRIVATE KEY-----\n" + base64 are code; a real key
+    has the base64 on the following line instead of a closing quote right after the header.
+    """
+    for match in PEM_MARKER.finditer(line):
+        rest = line[match.end():]
+        if rest.startswith("-----"):
+            rest = rest[5:]
+        if rest.startswith('"') or rest.startswith('\\n"') or rest.startswith("\\n\""):
+            continue
+        return False
+    return True
+
+
 def scan(path):
     try:
         data = path.read_bytes()
@@ -80,6 +99,8 @@ def scan(path):
                 value = match.group(0)
                 mac = value.upper().replace("-", ":")
                 if name == "mac-address" and (mac in ALLOWED_MACS or mac.startswith((EXAMPLE_MAC_PREFIX, *DOC_MAC_PREFIXES))):
+                    continue
+                if name == "secret-key" and value.startswith("BEGIN") and pem_marker_in_code(line):
                     continue
                 findings.append((name, number, value))
     return findings

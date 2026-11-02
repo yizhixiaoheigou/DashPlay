@@ -1,0 +1,222 @@
+--- a/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt
++++ b/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt
+@@ -75,6 +75,10 @@
+             val parts = state.split(" ")
+             when (parts[0]) {
+                 "waiting" -> { server.cableUnplugged(); status("cable") }
++                "prepare" -> {
++                    serial = parts.getOrNull(1); sawDevice = true
++                    status(if (server.prepareCablePhone()) "starting" else "")
++                }
+                 "iphone" -> { serial = parts.getOrNull(1); sawDevice = true; server.setCablePhone(true); status("starting") }
+                 "tether" -> { serial = parts.getOrNull(1); sawDevice = true; server.cableWithoutCarPlay(); status("") }
+             }
+@@ -385,7 +389,15 @@
+                 if (line.startsWith("usb ")) {
+                     log.info(line)
+                     if (line.startsWith("usb tether")) tether = true
+-                    runCatching { onState(line.removePrefix("usb ").trim()) }
++                    runCatching {
++                        onState(line.removePrefix("usb ").trim())
++                        // The new helper waits here BEFORE changing USB mode. Previously it changed
++                        // the phone's mode while this callback was still closing wireless CarPlay.
++                        if (line == "usb prepare" || line.startsWith("usb prepare ")) acknowledgePreparation()
++                    }.onFailure {
++                        log.warn("USB preparation failed: {}", it.message)
++                        process.destroy()
++                    }
+                 } else if (line.startsWith("ncm ")) {
+                     val parts = line.split(" ")
+                     ncm.offer(Triple(parts[1], parts.getOrNull(2)?.toIntOrNull() ?: 0, parts.getOrNull(3)))
+@@ -429,6 +441,13 @@
+     }
+ 
+     @Synchronized
++    private fun acknowledgePreparation() {
++        if (ended || !process.isAlive) throw EOFException("USB helper exited during preparation")
++        output.writeInt(0x52445921) // RDY!, consumed before the USBMUX framing begins
++        output.flush()
++    }
++
++    @Synchronized
+     override fun write(data: ByteArray, timeoutMillis: Int) {
+         if (ended || !process.isAlive) throw EOFException("USB helper exited")
+         output.writeInt(data.size)
+@@ -454,6 +473,8 @@
+ 
+     companion object {
+         fun start(helper: Path, onState: (String) -> Unit = {}): UsbBridgePipe =
+-            UsbBridgePipe(ProcessBuilder("python3", helper.toString()).start(), onState)
++            UsbBridgePipe(ProcessBuilder("python3", helper.toString()).apply {
++                environment()["CARPLAY_USB_STATE_ACK"] = "1"
++            }.start(), onState)
+     }
+ }
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -297,6 +297,7 @@
+         override fun onSessionActive(session: AirPlaySession) {
+             log.info("CarPlay session active peer={}", session.host)
+             activeSession = session
++            connectedSession = session
+             bootInvite = false
+             invitedPhone = null
+             switchingTo = null
+@@ -312,6 +313,7 @@
+             log.info("CarPlay session ended peer={}", session.host)
+             if (activeSession !== session) return
+             activeSession = null
++            if (connectedSession === session) connectedSession = null
+             if (presenceHelper != null) presence("idle")
+             // A session the receiver closed itself to apply a new display is already being re-invited;
+             // flagging it as ended made the supervisor start a second invitation that cut off the first
+@@ -419,11 +421,28 @@
+     /** An iPhone on the USB cable (WiredBootstrap): no wireless invitations until it is unplugged. */
+     @Volatile private var cablePhone = false
+     @Volatile private var wiredSession: AirPlaySession? = null
++    /** The session reached RECORD, rather than merely opening a control socket. */
++    @Volatile private var connectedSession: AirPlaySession? = null
+     /** The wired iPhone's name from its CarPlay device info (for the settings' phone list). */
+     @Volatile private var wiredName: String? = null
+ 
+     /** The iPhone on the cable has opened CarPlay (AirPlay over its NCM link) and is the active session. */
+     fun wiredSessionActive(): Boolean = wiredSession.let { it != null && it === activeSession }
++
++    /** Called before the helper changes USB mode; false keeps the cable for power/internet only. */
++    fun prepareCablePhone(): Boolean {
++        synchronized(this) {
++            val current = activeSession
++            val wirelessActive = current != null && current === connectedSession && current !== wiredSession
++            if (cableRole.keepWirelessOnPlug(wirelessActive, cableRequested = cablePhone)) {
++                cablePresent = true
++                log.info("keeping active wireless CarPlay; USB cable is for charging/internet until wired is selected")
++                return false
++            }
++        }
++        setCablePhone(true)
++        return true
++    }
+ 
+     fun setCablePhone(present: Boolean) {
+         if (present) cablePresent = true
+--- a/server/src/main/kotlin/com/playport/server/CableRole.kt
++++ b/server/src/main/kotlin/com/playport/server/CableRole.kt
+@@ -35,6 +35,10 @@
+         if (file == null) return false
+         return runCatching { if (!Files.exists(file)) write(ONCE); true }.getOrDefault(false)
+     }
++
++    /** A plug must not interrupt a live wireless session. An explicit wired choice still wins. */
++    fun keepWirelessOnPlug(wirelessActive: Boolean, cableRequested: Boolean): Boolean =
++        wirelessActive && !cableRequested && turnOff()
+ 
+     /** The viewer picked the wired row. A static choice is not overridden from the viewer. */
+     fun turnOn(): Boolean {
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/UsbPrepareTest.kt
+@@ -0,0 +1,68 @@
++package com.playport.server
++
++import java.nio.file.Files
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++import org.junit.Assert.*
++import org.junit.Test
++
++class UsbPrepareTest {
++    @Test fun usbModeChangeWaitsForWirelessTeardownToFinish() {
++        val dir = Files.createTempDirectory("usb-prepare")
++        val changed = dir.resolve("configured")
++        val helper = dir.resolve("helper.py")
++        Files.writeString(helper, """
++            import os, sys
++            from pathlib import Path
++            if os.environ.get('CARPLAY_USB_STATE_ACK') == '1':
++                print('usb prepare test-phone', file=sys.stderr, flush=True)
++                assert sys.stdin.buffer.read(4) == b'RDY!'
++            else:
++                print('usb iphone test-phone', file=sys.stderr, flush=True)
++            Path('${changed}').write_text('configured')
++            print('ncm testtap 3 02:00:00:00:00:01', file=sys.stderr, flush=True)
++            sys.stdin.buffer.read()
++        """.trimIndent())
++        val entered = CountDownLatch(1)
++        val release = CountDownLatch(1)
++        val pipe = UsbBridgePipe.start(helper) {
++            entered.countDown()
++            check(release.await(3, TimeUnit.SECONDS))
++        }
++        try {
++            assertTrue(entered.await(2, TimeUnit.SECONDS))
++            assertNull(pipe.awaitNcm(150))
++            assertFalse("USB mode changed before wireless teardown finished", Files.exists(changed))
++            release.countDown()
++            assertEquals("testtap", pipe.awaitNcm(2000))
++            assertTrue(Files.exists(changed))
++        } finally {
++            release.countDown()
++            pipe.close()
++            dir.toFile().deleteRecursively()
++        }
++    }
++
++    @Test fun oldHelperReceivesNoExtraAcknowledgementBytes() {
++        val helper = Files.createTempFile("usb-legacy", ".py")
++        Files.writeString(helper, """
++            import sys, struct
++            print('usb iphone test-phone', file=sys.stderr, flush=True)
++            print('ncm testtap 3 02:00:00:00:00:01', file=sys.stderr, flush=True)
++            size = struct.unpack('>I', sys.stdin.buffer.read(4))[0]
++            data = sys.stdin.buffer.read(size)
++            sys.stdout.buffer.write(struct.pack('>I', len(data)) + data)
++            sys.stdout.buffer.flush()
++            sys.stdin.buffer.read()
++        """.trimIndent())
++        val pipe = UsbBridgePipe.start(helper)
++        try {
++            assertEquals("testtap", pipe.awaitNcm(2000))
++            pipe.write(byteArrayOf(1, 2, 3), 1000)
++            assertArrayEquals(byteArrayOf(1, 2, 3), pipe.read(2000))
++        } finally {
++            pipe.close()
++            Files.deleteIfExists(helper)
++        }
++    }
++}
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/KeepWirelessTest.kt
+@@ -0,0 +1,34 @@
++package com.playport.server
++
++import java.nio.file.Files
++import org.junit.Assert.*
++import org.junit.Test
++
++class KeepWirelessTest {
++    @Test fun pluggingInPreservesWirelessButExplicitCableSelectionOverridesIt() {
++        val dir = Files.createTempDirectory("keep-wireless")
++        val role = CableRole(dir.resolve("cable-off"), false)
++        try {
++            role.init()
++            assertTrue(role.keepWirelessOnPlug(wirelessActive=true, cableRequested=false))
++            assertFalse(role.carPlayOnCable())
++            assertEquals("available", CableRole.wiredRow(true, role.carPlayOnCable(), false, false))
++            assertTrue(role.turnOn())
++            assertFalse(role.keepWirelessOnPlug(wirelessActive=true, cableRequested=true))
++            assertTrue(role.carPlayOnCable())
++            assertEquals("starting", CableRole.wiredRow(true, role.carPlayOnCable(), false, false))
++        } finally { dir.toFile().deleteRecursively() }
++    }
++
++    @Test fun unplugClearsTheTemporaryChoiceAndNoWirelessMeansDirectWiredStartup() {
++        val dir = Files.createTempDirectory("keep-wireless-unplug")
++        val role = CableRole(dir.resolve("cable-off"), false)
++        try {
++            assertTrue(role.keepWirelessOnPlug(wirelessActive=true, cableRequested=false))
++            role.unplugged()
++            assertTrue(role.carPlayOnCable())
++            assertFalse(role.keepWirelessOnPlug(wirelessActive=false, cableRequested=false))
++            assertTrue(role.carPlayOnCable())
++        } finally { dir.toFile().deleteRecursively() }
++    }
++}

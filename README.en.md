@@ -45,7 +45,7 @@ The OneCloud (玩客云) runs the same program as the N1 and connects the same w
 
 - ① is cable only for now, and only in this setup: a wireless iPhone would also have to join the car hotspot, which relays the picture between them at about 0.1 Mbit/s (measured in an Xpeng), so the program offers no wireless in ①. Letting the box raise its own hotspot for the iPhone would allow wireless later.
 - With a phone's hotspot, the phone keeps its hotspot on and pays the data; when the hotspot is not found the box falls back to ③. The hotspot can come from the same iPhone that runs CarPlay.
-- When both work: wired while a cable is plugged in; after unplugging, the last iPhone is invited to go wireless, and plugging back in returns to wired. Wireless needs one Bluetooth pairing first ("Add iPhone" on the settings page); after that it connects by itself.
+- When both work: plugging in starts wired CarPlay if no wireless session is active. If wireless CarPlay is already connected, plugging in keeps it connected; the cable charges the phone and shares internet when configured. Select the wired entry in the phone list to switch to wired CarPlay. After unplugging, the last iPhone is invited to go wireless. Wireless needs one Bluetooth pairing first ("Add iPhone" on the settings page); after that it connects by itself.
 - If the portable Wi-Fi in ② isolates its clients, wireless stalls or fails; use a cable.
 
 **When the head unit cannot show the page or will not connect**, go by what you see, whatever the car (settings page group "When the head unit cannot open the picture"; steps in [AI install notes (Chinese)](docs/DashPlay-AI安装说明.md), section 4):
@@ -105,6 +105,21 @@ sh scripts/onecloud/firmware/build-bundle.sh dashplay-bundle.tar   # the program
 ```
 
 `scripts/build-playport.sh` runs the same Gradle build and tests in an isolated Docker container. On the box DashPlay needs Java 21 and Python 3 with asyncio: OneCloud and N1 get them from Debian through `install.sh`; OpenWrt from the plugin's `dashplay-jre` (Temurin 21, musl build) and the system package feeds.
+
+## Android app (source published, still beta)
+
+The same receiver also runs on an Android device: a spare phone or an Android TV box acts as the
+receiver, the iPhone plugs in over USB or joins over Bluetooth + Wi-Fi, and the car's browser shows
+the screen. Source is in [`android/`](android/), on the same PlayPort baseline and the same patch
+series as the boxes; only the platform layer differs (system hotspot, USB host, Root, certificates).
+
+- **Status: beta, no APK published yet.** This repository carries the source only; the release page
+  has no APK. Building it needs JDK 25 and Android SDK 35.
+- Android 5.0 (API 21) and up. Wired CarPlay needs USB host (OTG); wireless needs a system hotspot
+  or Wi-Fi Direct.
+- First run asks whether the device is an Android phone or an Android TV box. That only changes
+  layout and wording; hotspot, Root and USB capabilities follow what the device actually supports.
+- No CarPlay identity is bundled; you import your own, as with the boxes.
 
 ## Running (OneCloud / Phicomm N1)
 

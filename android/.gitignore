@@ -1,0 +1,10 @@
+.gradle/
+build/
+local.properties
+*.apk
+*.jks
+# Release signing credentials (storeFile/passwords): never committed. See scripts/android-release.sh.
+release-keystore.properties
+# The root .gitignore drops Gradle wrappers; this one pins the Gradle version for the app build.
+!gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties

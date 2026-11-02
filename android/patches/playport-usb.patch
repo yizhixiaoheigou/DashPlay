@@ -1,0 +1,206 @@
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -188,7 +188,7 @@
+         // CarPlay on the cable: picking a wireless row turns the cable's CarPlay off first (the cable keeps
+         // charging and, if chosen, feeding the box internet), then invites the phone like any other switch.
+         val fromCable = cablePhone
+-        if (fromCable && (!config.wireless || wired == null)) return "cable"
++        if (fromCable && (!config.wireless || (wired == null && platformWiredReselect == null))) return "cable"
+         if (switchingTo == phone) return "busy"
+         // Checked and written before the old session ends: the grant names the phone to invite next.
+         if (!presence("switch", phone)) return "not-paired"
+@@ -202,6 +202,7 @@
+                 wiredSession = null
+                 wiredName = null
+                 wired?.reselect()
++                platformWiredReselect?.invoke()
+             }
+             selectedPhone = phone
+             switchingTo = phone
+@@ -437,6 +438,9 @@
+     }
+ 
+     @Volatile private var wired: WiredBootstrap? = null
++    /** Android owns USB directly instead of the Linux bridge process. */
++    @Volatile var platformWiredRestart: (() -> Unit)? = null
++    @Volatile var platformWiredReselect: (() -> Unit)? = null
+ 
+     /** An iPhone on the USB cable (WiredBootstrap): no wireless invitations until it is unplugged. */
+     @Volatile private var cablePhone = false
+@@ -477,7 +481,7 @@
+     }
+ 
+     /** Whether CarPlay runs on the cable is the viewer's choice, separate from the box's internet. */
+-    private val cableRole = CableRole.fromEnvironment()
++    val cableRole: CableRole = platformCableRole ?: CableRole.fromEnvironment()
+     /** An iPhone is plugged into the cable, with or without CarPlay on it; its name once known. */
+     @Volatile private var cablePresent = false
+     @Volatile private var cableName: String? = null
+@@ -502,7 +506,8 @@
+      */
+     fun switchToCable(): String? {
+         if (closed.get()) return "closed"
+-        val bootstrap = wired ?: return "unsupported"
++        val bootstrap = wired
++        if (bootstrap == null && platformWiredReselect == null) return "unsupported"
+         if (!cablePresent && !cablePhone) return "no-cable"
+         if (cablePhone) return null   // already there
+         if (cableRole.staticOff || !cableRole.turnOn()) return "cable-off"
+@@ -519,14 +524,15 @@
+             activeSession?.takeIf { it !== wiredSession }?.let { runCatching { it.close() } }
+         }
+         log.info("CarPlay moving onto the USB cable, chosen in the viewer")
+-        bootstrap.reselect()
++        bootstrap?.reselect()
++        platformWiredReselect?.invoke()
+         return null
+     }
+ 
+     /** The paired phones plus the wired row (see [CableRole.wiredRow]); a live cable session is the one in use. */
+     private fun withWiredRow(body: String): String {
+         // Only the Linux USB helper reports the cable's states; other platforms keep the plain "cable" name.
+-        if (wired == null) return body
++        if (wired == null && platformWiredReselect == null) return body
+         val live = wiredSessionActive()
+         val row = CableRole.wiredRow(cablePresent || cablePhone, cableRole.carPlayOnCable(), live, cableRole.staticOff)
+         return PhoneList.withWired(body, row, cableName ?: wiredName)
+@@ -549,12 +556,23 @@
+ 
+     @Volatile private var wiredSocket: ServerSocket? = null
+ 
++    @Synchronized
++    fun stopWired() {
++        runCatching { wiredSocket?.close() }
++        wiredSocket = null
++        val previous = wiredSession
++        wiredSession = null
++        wiredName = null
++        runCatching { previous?.close() }
++    }
++
+     /**
+      * Wired CarPlay: listen on the iPhone's NCM link (see WiredBootstrap). Whoever connects there is
+      * the phone on the cable, so there is no network admission; a wired phone replaces a session.
+      */
+     @Synchronized
+     fun listenWired(address: java.net.InetAddress) {
++        check(!closed.get()) { "Receiver is closed" }
+         val current = wiredSocket
+         // Each helper run creates the TAP again with a new interface index: InetAddress.equals ignores
+         // the scope, and a listener left on the old index never saw the iPhone (2026-10-12).
+@@ -642,9 +660,19 @@
+                     listener = listener,
+                     media = media,
+                 )
+-                activeSession = session
+-                if (wired) wiredSession = session
+-                session.start()
++                if (wired) {
++                    // A detach/display restart can close the listener after accept() returned.
++                    // Do not publish a session from that old USB interface into the new generation.
++                    synchronized(this) {
++                        if (wiredSocket !== server || closed.get()) { socket.close(); return }
++                        activeSession = session
++                        wiredSession = session
++                        session.start()
++                    }
++                } else {
++                    activeSession = session
++                    session.start()
++                }
+             } catch (error: Exception) {
+                 log.warn("AirPlay session bring-up failed: {}", error.message)
+                 runCatching { socket.close() }
+@@ -956,6 +984,7 @@
+         activeSession?.close()
+         // Wired: start the USB side over (identification, then CarPlayStartSession with the new display).
+         wired?.restart()
++        platformWiredRestart?.invoke()
+         // The phone was just using CarPlay, so skip the ~2.4 s presence re-check before re-inviting it.
+         if (wasActive) armQuickRetry()
+         restartWireless(confirmedPresent = wasActive)
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/PlatformWiredTest.kt
+@@ -0,0 +1,33 @@
++package com.playport.server
++
++import java.net.BindException
++import java.net.InetAddress
++import java.net.InetSocketAddress
++import java.net.ServerSocket
++import org.junit.Assert.assertThrows
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++
++class PlatformWiredTest {
++    @get:Rule val temp = TemporaryFolder()
++
++    @Test fun stoppingTheUsbListenerReleasesItsPortAndAllowsReconnection() {
++        val address = InetAddress.getByName("127.0.0.1")
++        val port = ServerSocket(0, 1, address).use { it.localPort }
++        val server = CarPlayServer(ServerConfig(bindAddress = "127.0.0.1", airPlayPort = port,
++            identityDir = temp.newFolder("identity").toPath(), stateDir = temp.newFolder("state").toPath(), wireless = false))
++        try {
++            repeat(2) {
++                server.listenWired(address)
++                assertThrows(BindException::class.java) {
++                    ServerSocket().use { it.bind(InetSocketAddress(address, port)) }
++                }
++                server.stopWired()
++                server.stopWired()
++                ServerSocket().use { it.bind(InetSocketAddress(address, port)) }
++            }
++        } finally { server.close() }
++        assertThrows(IllegalStateException::class.java) { server.listenWired(address) }
++    }
++}
+--- a/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2UsbMuxHost.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2UsbMuxHost.kt
+@@ -1,6 +1,7 @@
+ package com.shilapi.xcertplay.transport
+ 
+ import java.io.Closeable
++import java.io.IOException
+ import java.util.ArrayDeque
+ 
+ /**
+@@ -203,9 +204,11 @@
+         payload.copyInto(frame, MUX_HEADER_BYTES)
+         try {
+             pipe.write(frame, WRITE_TIMEOUT_MILLIS)
+-        } catch (error: IphoneUsbException) {
+-            fail(error)
+-            throw error
++        } catch (error: IOException) {
++            val failure = error as? IphoneUsbException
++                ?: IphoneUsbException.DeviceUnavailable("USBMUX write failed", error)
++            fail(failure)
++            throw failure
+         }
+         synchronized(stateLock) {
+             nextMuxSequence = (nextMuxSequence + 1) and 0xffff
+@@ -221,8 +224,11 @@
+                 val frame = takeFrame(readTimeoutMillis) ?: continue
+                 if (frame.protocol == PROTOCOL_TCP) dispatchTcp(frame.payload)
+             }
+-        } catch (error: IphoneUsbException) {
+-            fail(error)
++        } catch (error: IOException) {
++            // Android bulk reads report an ordinary IOException when the cable disappears.
++            // Route it to every pending stream instead of Android's process-fatal handler.
++            fail(error as? IphoneUsbException
++                ?: IphoneUsbException.DeviceUnavailable("USBMUX reader failed", error))
+         } catch (error: RuntimeException) {
+             fail(IphoneUsbException.DeviceUnavailable("USBMUX reader failed", error))
+         }
+@@ -256,7 +262,8 @@
+             connections.values.toList().also { connections.clear() }
+         }
+         activeConnections.forEach { it.closeFromHost(error) }
+-        pipe.close()
++        // The original failure is already delivered. Cleanup of a detached device may also fail.
++        try { pipe.close() } catch (_: Exception) { }
+     }
+ 
+     private fun allocateSourcePortLocked(): Int {

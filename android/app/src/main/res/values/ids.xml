@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Stable ids for the main controls: UI tests find them by id, whatever the language. -->
+<resources>
+    <item name="row_update" type="id" />
+    <item name="update_check_now" type="id" />
+    <item name="update_download" type="id" />
+    <item name="update_daily" type="id" />
+    <item name="update_mirror" type="id" />
+    <item name="update_mirror_save" type="id" />
+    <item name="update_choose" type="id" />
+    <item name="update_install" type="id" />
+    <item name="update_status" type="id" />
+    <item name="tesla_offline_checks" type="id" />
+    <item name="tls_automatic" type="id" />
+    <item name="auto_tls_enabled" type="id" />
+    <item name="auto_tls_provider" type="id" />
+    <item name="auto_tls_domain" type="id" />
+    <item name="auto_tls_zone" type="id" />
+    <item name="auto_tls_token" type="id" />
+    <item name="auto_tls_terms" type="id" />
+    <item name="auto_tls_save" type="id" />
+    <item name="auto_tls_retry" type="id" />
+    <item name="row_tls" type="id" />
+    <item name="tls_domain" type="id" />
+    <item name="tls_chain" type="id" />
+    <item name="tls_key" type="id" />
+    <item name="tls_import" type="id" />
+    <item name="tls_enable" type="id" />
+    <item name="tls_disable" type="id" />
+    <item name="row_tesla_access" type="id" />
+    <item name="tesla_root_enable" type="id" />
+    <item name="tesla_root_disable" type="id" />
+    <item name="row_phones" type="id" />
+    <item name="row_usb" type="id" />
+    <item name="usb_enable" type="id" />
+    <item name="usb_disable" type="id" />
+    <item name="usb_internet" type="id" />
+    <item name="usb_hotspot_share" type="id" />
+    <item name="usb_share_retry" type="id" />
+    <item name="row_hotspot" type="id" />
+    <item name="row_background" type="id" />
+    <item name="settings_button" type="id" />
+    <item name="primary" type="id" />
+    <item name="secondary" type="id" />
+    <item name="back" type="id" />
+    <item name="choice_1" type="id" />
+    <item name="choice_2" type="id" />
+    <item name="choice_3" type="id" />
+    <item name="field_ssid" type="id" />
+    <item name="field_password" type="id" />
+    <item name="row_redo" type="id" />
+    <item name="row_manage" type="id" />
+    <item name="row_capabilities" type="id" />
+    <item name="row_device" type="id" />
+    <item name="row_licenses" type="id" />
+    <item name="add_iphone" type="id" />
+</resources>

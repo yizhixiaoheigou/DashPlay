@@ -287,6 +287,19 @@ class SetupFlowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.page.apply('/internet', {'car_internet':'usb_tether','nonce':self.page.pairing.nonce})
 
+    def test_usb_width_is_saved_and_invalid_values_do_not_change_settings(self):
+        setup_wizard.save(self.state, {'done':True,'mode':'box_hotspot','iphone':'wired'})
+        form = {'car_internet':'usb_tether', 'nonce':self.page.pairing.nonce}
+        for width in ('auto', '20', '40'):
+            self.page.apply('/internet', dict(form, usb_hotspot_width=width))
+            self.assertEqual(setup_wizard.options(self.state)['usb_hotspot_width'], width)
+        saved = (self.state / 'options.json').read_bytes()
+        with self.assertRaises(ValueError):
+            self.page.apply('/internet', dict(form, usb_hotspot_width='160'))
+        self.assertEqual((self.state / 'options.json').read_bytes(), saved)
+        self.page.apply('/internet', form)
+        self.assertEqual(setup_wizard.options(self.state)['usb_hotspot_width'], '40', 'old forms preserve the choice')
+
     def test_internet_settings_say_nothing_about_where_carplay_runs(self):
         # 2026-10-31: "the cable only feeds the box, CarPlay goes wireless" was a checkbox under car internet, so
         # moving CarPlay off the cable meant changing a network setting. The cable's CarPlay is the viewer's

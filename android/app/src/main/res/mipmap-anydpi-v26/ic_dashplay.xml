@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- The generated overscan composition keeps the full mark inside launcher masks. -->
+    <background android:drawable="@drawable/dashplay_icon_adaptive_v2" />
+    <foreground android:drawable="@android:color/transparent" />
+</adaptive-icon>

@@ -660,9 +660,6 @@ class ManagedPageTests(unittest.TestCase):
         import re
         import update
         luci = REPO / "openwrt/luci-app-dashplay"
-        if not luci.is_dir():
-            # The public DashPlay export carries no openwrt/ (it ships as openwrt-dashplay): checked privately.
-            self.skipTest("openwrt/ is not in this tree (public DashPlay export)")
         view = (luci / "htdocs/luci-static/resources/view/dashplay.js").read_text()
         listed = re.search(r"var mirrors = \[([^\]]*)\]", view).group(1)
         self.assertEqual(tuple(re.findall(r"'([^']+)'", listed)), update.MIRRORS)

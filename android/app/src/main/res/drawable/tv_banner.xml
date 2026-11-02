@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 320x180 banner for the Android TV launcher: the app icon on the brand blue. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="320dp" android:height="180dp" android:viewportWidth="320" android:viewportHeight="180">
+    <path android:pathData="M0,0L320,0L320,180L0,180Z" android:fillColor="#FF0062CC" />
+    <path android:pathData="M110,50L210,50A10,10 0 0,1 220,60L220,110A10,10 0 0,1 210,120L110,120A10,10 0 0,1 100,110L100,60A10,10 0 0,1 110,50Z" android:strokeColor="#FFFFFFFF" android:strokeWidth="7" />
+    <path android:pathData="M148,68L182,85L148,102Z" android:fillColor="#FFFFFFFF" />
+    <path android:pathData="M135,140L185,140" android:strokeColor="#FFFFFFFF" android:strokeWidth="7" android:strokeLineCap="round" />
+</vector>

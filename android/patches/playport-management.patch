@@ -1,0 +1,57 @@
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -65,6 +65,7 @@
+     /** Android RFCOMM; null retains the Linux helper. */
+     val bluetoothLink: BluetoothLink? = null,
+     val platformAudioRoutes: ((String?, String?) -> String?)? = null,
++    val idleReleaseMs: Long? = null,
+ ) : Closeable {
+     private val log = LoggerFactory.getLogger("playport")
+ 
+@@ -703,7 +704,7 @@
+         if (!config.wireless) return
+         Thread({
+             var absentChecks = 0
+-            val releaseMs = System.getenv("CARPLAY_IDLE_RELEASE_SECONDS")?.toLongOrNull()?.coerceAtLeast(0)?.times(1000)
++            val releaseMs = idleReleaseMs ?: System.getenv("CARPLAY_IDLE_RELEASE_SECONDS")?.toLongOrNull()?.coerceAtLeast(0)?.times(1000)
+                 ?: IDLE_RELEASE_MS
+             if (releaseMs == 0L) log.info("idle release off: CarPlay stays connected without a viewer")
+             val idleTimer = IdleReleaseTimer(System.nanoTime() / 1_000_000, releaseMs)
+diff --git a/web/src/boot.ts b/web/src/boot.ts
+--- a/web/src/boot.ts
++++ b/web/src/boot.ts
+@@ -13,9 +13,10 @@
+   try {
+     const response = await fetch('./receiver-access.json', { cache: 'no-store', credentials: 'same-origin' });
+     if (!response.ok) return;
+-    const value = await response.json() as { token?: string; settingsPort?: number; carMusic?: boolean; carVoice?: boolean; tesla?: boolean; audioRoutes?: unknown };
++    const value = await response.json() as { token?: string; settingsPort?: number; settingsPath?: string; carMusic?: boolean; carVoice?: boolean; tesla?: boolean; audioRoutes?: unknown };
+     if (typeof value.token === 'string' && /^[0-9a-f]{32}$/.test(value.token)) localStorage.setItem('playport-token', value.token);
+     if (Number.isInteger(value.settingsPort)) (window as unknown as { playportBoxSettingsPort?: number }).playportBoxSettingsPort = value.settingsPort;
++    if (value.settingsPath === "/manage") (window as unknown as { playportSettingsPath?: string }).playportSettingsPath = value.settingsPath;
+     // Set on the box: carMusic, the music goes over the car's own Bluetooth (OpenWrt dashplay.main.car_music, settings
+     // page); tesla, the Tesla browser's ways (fullscreen through a listed video site, a quieter microphone). Tesla
+     // mode (dashplay.main.tesla_mode) sets both.
+diff --git a/web/src/main.ts b/web/src/main.ts
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -63,14 +63,16 @@
+ /** Box settings page (pairing, hotspot): same host, plain HTTP. The port comes from the startup flag, else from
+  *  the access file the receiver writes (the Linux boxes announce no flag, and the link stayed hidden). */
+ function showBoxLinks(port: number) {
+-  const base = `http://${location.hostname}${port === 80 ? '' : `:${port}`}/`;
++  const settingsPath = (window as unknown as { playportSettingsPath?: string }).playportSettingsPath;
++  const base = settingsPath === '/manage' ? '/manage' : `http://${location.hostname}${port === 80 ? '' : `:${port}`}/`;
+   const links: [string, string][] = [['box-link', base], ['add-phone-panel', `${base}#phones`], ['box-settings-panel', base]];
+   for (const [id, href] of links) {
+     const link = el<HTMLAnchorElement>(id);
+     link.href = href;
+     link.hidden = false;
+   }
+ }
+ const boxPort = Number((window as unknown as { playportBoxSettingsPort?: number }).playportBoxSettingsPort) || 0;
+-if (boxPort) showBoxLinks(boxPort);
++const settingsPath = (window as unknown as { playportSettingsPath?: string }).playportSettingsPath;
++if (boxPort || settingsPath) showBoxLinks(boxPort);
+ else void fetch('./receiver-access.json', { cache: 'no-store' }).then(r => r.ok ? r.json() : null)

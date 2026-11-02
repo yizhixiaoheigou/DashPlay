@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:colorPrimary">@color/bg</item>
+        <item name="android:colorPrimaryDark">@color/bg</item>
+        <item name="android:colorAccent">@color/blue</item>
+        <item name="android:statusBarColor">#FF000000</item>
+        <item name="android:navigationBarColor">#FF000000</item>
+        <item name="android:textColor">@color/text</item>
+        <item name="android:textColorPrimary">@color/text</item>
+        <item name="android:textColorSecondary">@color/text2</item>
+    </style>
+
+    <style name="Text"><item name="android:textColor">@color/text</item><item name="android:textSize">@dimen/text_body</item><item name="android:lineSpacingMultiplier">1.15</item></style>
+    <style name="Text.Title"><item name="android:textSize">@dimen/text_title</item><item name="android:textStyle">bold</item></style>
+    <style name="Text.Head"><item name="android:textSize">@dimen/text_head</item><item name="android:textStyle">bold</item></style>
+    <style name="Text.Name"><item name="android:textSize">@dimen/text_body</item></style>
+    <style name="Text.Small"><item name="android:textSize">@dimen/text_small</item><item name="android:textColor">@color/text2</item></style>
+    <style name="Text.Tiny"><item name="android:textSize">@dimen/text_tiny</item><item name="android:textColor">@color/text2</item></style>
+    <style name="Text.Group"><item name="android:textSize">@dimen/text_tiny</item><item name="android:textColor">@color/text2</item><item name="android:paddingStart">4dp</item><item name="android:paddingTop">12dp</item><item name="android:paddingBottom">6dp</item></style>
+
+    <style name="Card"><item name="android:background">@drawable/bg_card</item></style>
+
+    <style name="Button">
+        <item name="android:minHeight">@dimen/button_height</item>
+        <item name="android:paddingStart">20dp</item>
+        <item name="android:paddingEnd">20dp</item>
+        <item name="android:textSize">@dimen/text_body</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:stateListAnimator">@null</item>
+        <item name="android:gravity">center</item>
+        <item name="android:paddingTop">8dp</item>
+        <item name="android:paddingBottom">8dp</item>
+        <item name="android:focusable">true</item>
+    </style>
+    <style name="Button.Primary"><item name="android:background">@drawable/btn_primary</item><item name="android:textColor">#FFFFFF</item></style>
+    <style name="Button.Secondary"><item name="android:background">@drawable/btn_secondary</item><item name="android:textColor">@color/text</item></style>
+    <style name="Button.Text"><item name="android:background">@drawable/btn_text</item><item name="android:textColor">@color/blue_text</item></style>
+</resources>

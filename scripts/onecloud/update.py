@@ -20,6 +20,7 @@ hands over to the next, which resumes where it stopped.
 """
 import argparse
 import email.utils
+import fcntl
 import hashlib
 import http.client
 import json
@@ -40,6 +41,10 @@ OWNER = "yizhixiaoheigou"
 # Where the latest manifest and the installed version's OpenWrt packages (to go back to) come from. The environment
 # may point both at a test server (scripts/openwrt/lab-test.sh); the signature check is the same.
 LATEST = os.environ.get("DASHPLAY_UPDATE_LATEST", f"https://github.com/{OWNER}/DashPlay/releases/latest/download/")
+RELEASE_FEED = os.environ.get("DASHPLAY_RELEASE_FEED", f"https://github.com/{OWNER}/DashPlay/releases/download/v{{version}}/")
+RELEASE_LIST = f"https://api.github.com/repos/{OWNER}/DashPlay/releases?per_page=100"
+SETTINGS_FORMAT = 1
+HISTORY_MIN = (2026, 10, 29)
 PREVIOUS_FEED = os.environ.get("DASHPLAY_UPDATE_FEED",
                                f"https://github.com/{OWNER}/openwrt-dashplay/releases/download/v{{version}}/")
 VERSION_FILE = "version.txt"
@@ -73,6 +78,7 @@ CHECK_EVERY = 24 * 3600
 SYSTEM_FILES = ("firmware/install.sh", "firmware/prepare-image.sh", "firmware/dashplay-firstboot.service",
                 "dashplay.service")
 BACKUP = "dashplay-update-backup.tar.gz"   # beside the program directory: the owner's data before the last update
+WIRED_STATUS = Path('/var/run/dashplay/wired-status.json')
 
 
 class UpdateError(Exception):
@@ -350,14 +356,17 @@ def verify(data, signature, key=KEY):
     return out.returncode == 0 and "Signature Verified Successfully" in out.stdout
 
 
-def latest_manifest(root, openwrt, key=KEY):
+def latest_manifest(root, openwrt, key=KEY, version=None):
     """The latest signed manifest. Its "mirrors", when valid, become the mirrors measured from then on."""
     # One source at a time: a mirror answering fast with a block page must not stop a check another source passes.
+    if version is not None and not re.fullmatch(r'20\d{2}\.\d{2}\.\d{2}(?:\.\d+)?', version):
+        raise UpdateError('版本号格式不正确')
+    base = RELEASE_FEED.format(version=version) if version else LATEST
     errors, forged = [], False
-    for prefix in sources(root, openwrt, LATEST + MANIFEST):
+    for prefix in sources(root, openwrt, base + MANIFEST):
         try:
-            data = fetch(LATEST + MANIFEST, (prefix,), limit=1 << 20)
-            signature = fetch(LATEST + SIGNATURE, (prefix,), limit=4096)
+            data = fetch(base + MANIFEST, (prefix,), limit=1 << 20)
+            signature = fetch(base + SIGNATURE, (prefix,), limit=4096)
         except UpdateError as error:
             errors.append(error)
             continue
@@ -373,6 +382,8 @@ def latest_manifest(root, openwrt, key=KEY):
     manifest = json.loads(data)
     if manifest.get("format") != 1 or not version_key(manifest.get("version")):
         raise UpdateError("更新清单格式不认识：请先手动升级到较新的版本")
+    if version and manifest['version'] != version:
+        raise UpdateError('下载的清单不是所选版本，已停止')
     try:
         listed = mirror_list(manifest["mirrors"], https_only=True) if "mirrors" in manifest else None
     except ValueError:
@@ -380,6 +391,38 @@ def latest_manifest(root, openwrt, key=KEY):
     keep(root, used=prefix, used_at=int(time.time()),
          **({"mirrors": list(listed)} if listed else {}))
     return manifest
+
+
+def history(root, openwrt=None):
+    """The list is discovery only; every chosen release is authenticated again before installation."""
+    rows = json.loads(fetch(RELEASE_LIST, sources(root, bool(openwrt)), limit=2 << 20))
+    if not isinstance(rows, list):
+        raise UpdateError('暂时无法读取历史版本列表')
+    versions = []
+    for row in rows:
+        version = str(row.get('tag_name', '')).removeprefix('v')
+        if row.get('draft') or row.get('prerelease') or not version_key(version):
+            continue
+        assets = {a.get('name') for a in row.get('assets', [])}
+        if version_key(version) >= HISTORY_MIN and {MANIFEST, SIGNATURE} <= assets:
+            versions.append(version)
+    return sorted(set(versions), key=version_key, reverse=True)
+
+
+def check_target(root, openwrt, manifest):
+    """Older releases used the same JSON settings. Future schema changes must opt into a new contract."""
+    if version_key(manifest['version']) < HISTORY_MIN:
+        raise UpdateError('这个历史版本尚未核对设置兼容性，不能保留设置切换')
+    if manifest.get('compatibility', {}).get('settings', 1) != SETTINGS_FORMAT:
+        raise UpdateError('所选版本的设置格式不兼容，已保留当前程序和设置')
+    if not manifest.get('online'):
+        raise UpdateError('所选版本需要更换系统，不能只切换程序')
+    if not openwrt:
+        files = manifest.get('debian', {}).get('files', {})
+        if not all(name in files for name in SYSTEM_FILES) or not system_matches(root, files):
+            raise UpdateError('所选版本与这台盒子的系统不兼容，已停止')
+    elif apk_version('dashplay-jre') != manifest.get('openwrt', {}).get('jre', {}).get('version'):
+        raise UpdateError('所选版本需要不同的 Java 运行环境，暂不支持保留系统回退')
 
 
 def file_sha256(path):
@@ -482,7 +525,9 @@ def check(root, openwrt=None, key=KEY, manifest=None):
 
 
 def carplay_in_use(root):
-    return bool(read(Path(root) / "state/receiver/phone-presence.json").get("active"))
+    # The presence helper's active field tracks wireless sessions only. USB has its own runtime status.
+    return (bool(read(Path(root) / "state/receiver/phone-presence.json").get("active")) or
+            read(WIRED_STATUS).get('phase') in ('starting', 'live'))
 
 
 def forbidden_in_plan(simulation):
@@ -584,7 +629,8 @@ def install_openwrt(root, manifest, status, work):
     keep(root, used=progress.source, used_at=int(time.time()))
     status("checking", "正在核对升级计划")
     run("apk", "update", timeout=300)   # without the index the simulation misses dependencies (F50, 2026-10-19)
-    simulation = run("apk", "add", "--upgrade", "--simulate", "--allow-untrusted", *map(str, files))
+    direction = () if newer(current, manifest['version']) else ('--upgrade',)
+    simulation = run("apk", "add", *direction, "--simulate", "--allow-untrusted", *map(str, files))
     if simulation.returncode != 0:
         raise UpdateError("升级计划不成立：" + (simulation.stderr or simulation.stdout).strip()[-300:])
     blocked = forbidden_in_plan(simulation.stdout)
@@ -592,7 +638,7 @@ def install_openwrt(root, manifest, status, work):
         raise UpdateError("升级会改动内核、内核模块或系统蓝牙（" + "、".join(blocked) + "），已停止，请按说明手动升级")
     status("installing", "正在安装，CarPlay 会断开约 1 分钟")
     port = settings_port()
-    result = run("apk", "add", "--upgrade", "--allow-untrusted", *map(str, files), timeout=600)
+    result = run("apk", "add", *direction, "--allow-untrusted", *map(str, files), timeout=600)
     if result.returncode == 0 and service_up(port):
         return
     status("restoring", "新版本没有正常启动，正在退回原来的版本")
@@ -615,20 +661,27 @@ def install_debian(root, manifest, status, work):
     progress.show()
     keep(root, used=progress.source, used_at=int(time.time()))
     status("installing", "正在安装，CarPlay 和盒子热点会断开约 1 分钟")
-    upgrader = Path(root) / "firmware/upgrade.py"
-    with tarfile.open(bundle) as archive:   # the new release's upgrader, as the manual procedure does
-        member = next((m for m in archive.getmembers()
-                       if m.name.removeprefix("./") == "firmware/upgrade.py" and m.isfile()), None)
-        if member:
-            upgrader = Path(work) / "upgrade.py"
-            upgrader.write_bytes(archive.extractfile(member).read())
+    # Downgrading must not hand control to an old installer that lacks today's preservation checks.
+    retained = Path(root) / 'state/version-manager/upgrade.py'
+    upgrader = retained if retained.is_file() else Path(root) / 'firmware/upgrade.py'
     result = run(sys.executable, str(upgrader), str(bundle), timeout=900)
     if result.returncode != 0:
         raise UpdateError("新版本没有正常启动，已自动退回原来的程序（详见 state/upgrade.log）")
     save(Path(root) / "state/update.json", {"version": manifest["version"], "at": int(time.time())})
 
 
-def install(root, openwrt=None, key=KEY):
+def install(root, openwrt=None, key=KEY, version=None):
+    root = Path(root)
+    (root / 'state').mkdir(parents=True, exist_ok=True)
+    with open(root / 'state/update.lock', 'a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 1
+        return _install(root, openwrt, key, version)
+
+
+def _install(root, openwrt=None, key=KEY, version=None):
     root = Path(root)
     openwrt = is_openwrt() if openwrt is None else openwrt
     status_file = root / "state/update-status.json"
@@ -636,11 +689,14 @@ def install(root, openwrt=None, key=KEY):
     def status(phase, message, **extra):
         save(status_file, {"phase": phase, "message": message, "at": int(time.time()), **extra})
 
-    status("checking", "正在检查最新版本")
+    status("checking", "正在核对所选版本" if version is not None else "正在检查最新版本")
     try:
-        manifest = latest_manifest(root, openwrt, key)
-        found = check(root, openwrt, key, manifest)
-        if not found.get("available"):
+        before = current_version(root, openwrt)
+        manifest = latest_manifest(root, openwrt, key, version=version) if version is not None else latest_manifest(root, openwrt, key)
+        if version is not None:
+            check_target(root, openwrt, manifest)
+        found = compare(root, openwrt, manifest)
+        if version is None and not found.get("available"):
             status("done", f"已是最新版本 {manifest['version']}")
             return 0
         if not found.get("online"):
@@ -654,8 +710,12 @@ def install(root, openwrt=None, key=KEY):
         saved = backup(root, openwrt)
         with tempfile.TemporaryDirectory(prefix="dashplay-update.") as work:
             (install_openwrt if openwrt else install_debian)(root, manifest, status, work)
-        status("done", f"已升级到 {manifest['version']}", version=manifest["version"], backup=str(saved))
-        check(root, openwrt, key, manifest)
+        if before and before != manifest['version']:
+            save(root / 'state/version-manager/previous.json', {'version': before, 'installed': manifest['version']})
+        status("done", f"已安装 {manifest['version']}", version=manifest["version"], backup=str(saved))
+        # A selected old release must not overwrite the latest-release indicator.
+        if version is None:
+            check(root, openwrt, key, manifest)
         return 0
     except UpdateError as error:
         status("failed", str(error))
@@ -704,7 +764,7 @@ def running(root):
     return state.get("phase") not in (None, "done", "failed") and time.time() - state.get("at", 0) < 1200
 
 
-def launch(root, openwrt=None):
+def launch(root, openwrt=None, version=None):
     """Start an install apart from the dashplay service (it restarts that service, and procd or systemd would end
     a child with it). Returns a message for the page. OpenWrt: a procd service made for this one run over ubus, not
     an init script, since installing a package starts every init script in it (default_postinst; the F50 began an
@@ -716,6 +776,10 @@ def launch(root, openwrt=None):
     if carplay_in_use(root):
         return "正在使用 CarPlay：停车、断开后再升级"
     install = [sys.executable, str(Path(__file__).resolve()), "install", "--root", str(root)]
+    if version is not None:
+        if not re.fullmatch(r'20\d{2}\.\d{2}\.\d{2}(?:\.\d+)?', version):
+            return '版本号格式不正确'
+        install.extend(['--version', version])
     if openwrt:
         service = {"name": "dashplay-update", "instances": {"update": {"command": install, "stdout": True, "stderr": True}}}
         command = ["ubus", "call", "service", "set", json.dumps(service)]
@@ -786,6 +850,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=["check", "launch", "install", "speedtest"])
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
+    parser.add_argument('--version', help='explicitly selected release, including a compatible older version')
     args = parser.parse_args(argv)
     if args.command == "check":
         print(json.dumps(check(args.root), ensure_ascii=False))
@@ -794,9 +859,9 @@ def main(argv=None):
         print(json.dumps(speedtest(args.root), ensure_ascii=False))
         return 0
     if args.command == "launch":
-        print(launch(args.root))
+        print(launch(args.root, version=args.version))
         return 0
-    return install(args.root)
+    return install(args.root, version=args.version)
 
 
 if __name__ == "__main__":

@@ -33,9 +33,8 @@ def sha(data):
 
 class Server:
     """GitHub stand-in: /gh/<path> serves files (or fails when listed in `down`); /<name>/<full url> is a mirror of
-    the same, behaving as `kinds` says: 'slow' trickles about 20 KB/s, 'lag' waits 0.5 s before answering, 'cut'
-    breaks off after half of what it announced, 'page' answers 200 with a block page. Range requests are answered
-    with 206 except by 'norange'."""
+    the same, behaving as `kinds` says: 'slow' trickles about 20 KB/s, 'cut' breaks off after half of what it
+    announced, 'page' answers 200 with a block page. Range requests are answered with 206 except by 'norange'."""
 
     def __init__(self, root):
         self.root, self.down, self.seen, self.ranges, self.kinds = Path(root), set(), [], [], {}
@@ -70,8 +69,6 @@ class Server:
                     self.send_header('Content-Length', str(len(page)))
                     self.end_headers()
                     return self.wfile.write(page)
-                if kind == 'lag':
-                    time.sleep(0.5)
                 data, start = target.read_bytes(), 0
                 wanted = self.headers.get('Range')
                 if wanted and kind != 'norange':
@@ -299,9 +296,7 @@ class SignedReleaseTests(unittest.TestCase):
     def test_the_fastest_source_is_measured_and_used_first_even_before_github(self):
         # Before 2026-11-01 GitHub came first: a GitHub that trickles never failed, so no mirror was ever tried.
         self.publish({'format': 1, 'version': '2026.10.20', 'online': True})
-        # 'lag', not 'slow': the manifest fits in one 'slow' step, so GitHub was only ~25 ms behind and a busy machine
-        # (the release check runs beside other builds) sometimes ranked it first (2026-11-01).
-        self.server.kinds['gh'] = 'lag'
+        self.server.kinds['gh'] = 'slow'
         fast, dead = self.server.at('fast'), 'http://127.0.0.1:1/'
         with patch.object(update, 'MIRRORS', (dead, fast)), patch.object(update, 'SAMPLE', 4096):
             self.assertEqual(update.latest_manifest(self.root, False, self.pub)['version'], '2026.10.20')

@@ -1,0 +1,33 @@
+diff --git a/web/src/audio-timing.ts b/web/src/audio-timing.ts
+--- a/web/src/audio-timing.ts
++++ b/web/src/audio-timing.ts
+@@ -3,5 +3,6 @@
+   const target = media ? 0.6 : 0.12;
+   // Bound backlog without overlapping buffers already submitted to Web Audio.
+   if (next > now + 2) return null;
+-  return next <= now + 0.005 ? now + target : next;
++  // Even a few queued milliseconds are continuous audio, not an underrun.
++  return next <= now ? now + target : next;
+ }
+diff --git a/web/check-audio.mjs b/web/check-audio.mjs
+--- a/web/check-audio.mjs
++++ b/web/check-audio.mjs
+@@ -21,4 +21,17 @@
+ assert.equal(audioStartTime(10, 10.04, true), 10.04, 'small remaining reserve is not an underrun');
+ assert.equal(audioStartTime(10, 0, false), 10.12, 'voice keeps lower initial latency');
+ assert.equal(audioStartTime(10, 13, true), null, 'excess backlog is bounded without rewinding');
+-console.log('Audio burst scheduling checks passed');
++// A small packet arriving while 4 ms is still queued must not insert a 116 ms hole.
++assert.equal(audioStartTime(10, 10.004, false), 10.004, 'keep already scheduled voice contiguous');
++assert.equal(audioStartTime(10, 10.004, true), 10.004, 'keep already scheduled music contiguous');
++// 20 ms navigation packets can arrive with only 1–4 ms of queued audio left.
++next = 0;
++for (let packet = 0; packet < 200; packet++) {
++  const now = packet === 0 ? 0 : next - (1 + packet % 4) / 1000;
++  const start = audioStartTime(now, next, false);
++  assert.notEqual(start, null);
++  if (packet) assert.equal(start, next, 'small positive voice reserve stays contiguous');
++  next = start + .02;
++}
++assert.equal(audioStartTime(10, 10, false), 10.12, 'a true empty queue rebuilds reserve');
++console.log('Audio burst and navigation scheduling checks passed');

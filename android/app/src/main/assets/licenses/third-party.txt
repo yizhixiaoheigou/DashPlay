@@ -1,0 +1,50 @@
+DashPlay 安卓版随包第三方组件
+
+本文件由 scripts/android-collect-licenses.py 依据构建的运行时依赖生成，不要手改。
+许可证名称和链接取自各依赖的 POM <licenses>、jar 内的 LICENSE/NOTICE，
+或（仅四个依赖）项目公布的许可证；全文在同目录。
+
+com.android.tools:desugar_jdk_libs_configuration_nio:2.1.5   BSD-3-Clause  <https://opensource.org/licenses/BSD-3-Clause>
+com.android.tools:desugar_jdk_libs_nio:2.1.5                 GNU General Public License, version 2, with the Classpath Exception  <https://github.com/google/desugar_jdk_libs/blob/master/LICENSE>
+com.google.zxing:core:3.5.3                                  Apache License, Version 2.0  <https://github.com/zxing/zxing/blob/master/LICENSE>
+com.typesafe:config:1.4.9                                    Apache-2.0  <https://www.apache.org/licenses/LICENSE-2.0>
+io.ktor:ktor-events-jvm:3.6.0                                The Apache Software License, Version 2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+io.ktor:ktor-http-cio-jvm:3.6.0                              The Apache Software License, Version 2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+io.ktor:ktor-http-jvm:3.6.0                                  The Apache Software License, Version 2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+io.ktor:ktor-io-jvm:3.6.0                                    The Apache Software License, Version 2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+io.ktor:ktor-network-jvm:3.6.0                               The Apache Software License, Version 2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+io.ktor:ktor-serialization-jvm:3.6.0                         The Apache Software License, Version 2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+io.ktor:ktor-server-cio-jvm:3.6.0                            The Apache Software License, Version 2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+io.ktor:ktor-server-core-jvm:3.6.0                           The Apache Software License, Version 2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+io.ktor:ktor-server-websockets-jvm:3.6.0                     The Apache Software License, Version 2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+io.ktor:ktor-utils-jvm:3.6.0                                 The Apache Software License, Version 2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+io.ktor:ktor-websocket-serialization-jvm:3.6.0               The Apache Software License, Version 2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+io.ktor:ktor-websockets-jvm:3.6.0                            The Apache Software License, Version 2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+net.sf.kxml:kxml2:2.3.0                                      BSD-style (kXML 2 licence)  <https://github.com/kxml2/kxml2/blob/master/LICENSE>
+org.bouncycastle:bcpkix-jdk18on:1.79                         Bouncy Castle Licence (MIT-style)  <https://www.bouncycastle.org/licence.html>
+org.bouncycastle:bcprov-jdk18on:1.79                         Bouncy Castle Licence (MIT-style)  <https://www.bouncycastle.org/licence.html>
+org.bouncycastle:bcutil-jdk18on:1.79                         Bouncy Castle Licence (MIT-style)  <https://www.bouncycastle.org/licence.html>
+org.jetbrains:annotations:23.0.0                             The Apache Software License, Version 2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+org.jetbrains.kotlin:kotlin-reflect:2.3.21                   Apache-2.0  <http://www.apache.org/licenses/LICENSE-2.0.txt>
+org.jetbrains.kotlin:kotlin-stdlib:2.4.20                    Apache-2.0  <http://www.apache.org/licenses/LICENSE-2.0.txt>
+org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.11.0     Apache-2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+org.jetbrains.kotlinx:kotlinx-io-bytestring-jvm:0.9.1        Apache-2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+org.jetbrains.kotlinx:kotlinx-io-core-jvm:0.9.1              Apache-2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+org.jetbrains.kotlinx:kotlinx-serialization-core-jvm:1.11.0  Apache-2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+org.jetbrains.kotlinx:kotlinx-serialization-json-jvm:1.11.0  Apache-2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+org.jmdns:jmdns:3.6.3                                        Apache License, Version 2.0  <https://www.apache.org/licenses/LICENSE-2.0.txt>
+org.slf4j:slf4j-api:2.0.20                                   MIT License  <https://github.com/qos-ch/slf4j/blob/master/LICENSE>
+org.slf4j:slf4j-simple:2.0.20                                MIT License  <https://github.com/qos-ch/slf4j/blob/master/LICENSE>
+
+移植进本仓库的源码（不是依赖，没有 POM）：
+
+com/shilapi/xcertplay/transport/                             GNU General Public License, version 3  <https://github.com/shihabal3amri/DiPlay>
+  移植自 DiPlay（shihabal3amri/DiPlay）的 USB/蓝牙传输代码，随本程序按 GPL-3.0 提供；同一许可证下的完整对应源码见 https://github.com/yizhixiaoheigou/DashPlay （android/ 目录）
+
+完整许可证全文：
+
+  Apache-2.0.txt
+  BSD-3-Clause.txt
+  GPL-2.0-with-Classpath-exception.txt
+  GPL-3.0.txt
+  MIT.txt

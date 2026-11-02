@@ -1,0 +1,45 @@
+{
+  "project": "WheelPlay",
+  "commit": "c1bd07717c8e87a3130ef03477d2ca318fb66caa",
+  "license": "GPL-3.0",
+  "source_sha256": {
+    "Ntb16Codec.kt": "91932f559953e914e6103c43de0358598a757afb6d544c01aef23dcf1b4d4388",
+    "EthernetIpv6Codec.kt": "31591c2fc6665c0e37aab9fadad87aecf40d9e62cd44b81c1983ac82e72103c9",
+    "NcmFunctionDiscovery.kt": "85dcc1a6b7c9a01926e5689c596083ff83c20f99ca23791f63e43b88de0b264c",
+    "IphoneCarPlayConfiguration.kt": "466d93731b8e862a953f6ef9efe04a0f2b6145df6e86d6ffe551953ee0747cf4",
+    "NcmUsbBridge.kt": "cd63fcb6d2dac14c6ef51fa054322abac157256bd61b40999e313334d0720151"
+  },
+  "personal_hotspot": {
+    "implementation": "Independent DashPlay userspace ipheth transport, DHCPv4 and Ethernet/IPv4 adapter; separate from WheelPlay CarPlay NCM code.",
+    "references": [
+      "https://github.com/torvalds/linux/blob/master/drivers/net/usb/ipheth.c",
+      "https://www.rfc-editor.org/rfc/rfc2131.html",
+      "https://www.rfc-editor.org/rfc/rfc2132.html",
+      "https://www.rfc-editor.org/rfc/rfc3396.html",
+      "https://www.rfc-editor.org/rfc/rfc5227.html",
+      "https://www.rfc-editor.org/rfc/rfc1624.html",
+      "https://www.rfc-editor.org/rfc/rfc3022.html",
+      "https://developer.android.com/reference/android/hardware/usb/UsbDeviceConnection",
+      "https://developer.android.com/reference/android/net/VpnService.Builder"
+    ],
+    "transport": "Legacy ipheth RX (two-byte prefix), raw Ethernet TX; no aggregated RX enable command.",
+    "integration_status": "Connected to production wired CarPlay controller and stable VPN, with IPv4/DNS translation and native/web local opt-in. Real managers have been exercised on a disposable Android emulator using a test-only adb-root executor: both Tesla/shared DNS rule orders, rule repair, durable journal recovery in a new manager, bounded denied-cleanup retries, and actual VPN-close guard/cleanup. Whole-package force-stop and fresh-process recovery of both production managers also pass: persisted journals survive, a destroyed VPN does not fall through to another uplink, rules are restored and sharing waits for USB. Real su authorization, delayed requests, automatic service restart and physical USB/iPhone Internet acceptance remain pending.",
+    "hotspot_forwarding": {
+      "implementation": "UsbShareAccess maintains a journaled UsbShareSessionPlan with scoped IPv4 policy routes, SNAT, local DNS proxy and periodic rule verification. UsbShareRuntime revokes installation tokens on cancellation and retains unfinished cleanup records. Captured boot/ifindex restrict forwarding restoration; unrelated/global IPv4 settings are not changed. Scoped IPv6 FORWARD rejection and unreachable fallback routes protect the installed sharing path. Production TeslaCheckDns uses the USB VPN virtual resolver while borrowing is active.",
+      "constraints": "Manager integration and real Android TUN/independent namespace client tests pass against a synthetic Ethernet peer. Test hotspot interface is registered with Android local network 99, as IpServer does; it is not physical Wi-Fi/DHCP. Root scripts run through a test-APK-only adb-root bridge, absent from the application APK. System hotspots on API 27+ require hardware offload already disabled and API 30+ require BPF disabled; global offload settings are never changed. Whole-package force-stop recovery is tested by explicitly invoking production managers in a fresh instrumentation process; it does not prove automatic service restart by Android. Real Root grant/revocation and delayed requests, hotspot DHCP and OTG iPhone Internet remain pending. Tesla rule installation additionally checks caller PID/start ticks before each mutation; replay after actual process death is rejected in the emulator. Legacy Root commands now handle unsupported numeric xtables waits, toolbox UID output and absent printf; 132 unit tests, Android 5 real rule installation/verification/revocation/cleanup, and Android 14 independent client DNS/HTTP pass. Android 5 rules-only validation does not prove client traffic. The final Android 14 full manager test passes both sharing-only cleanup with a live VPN and normal VPN-close cleanup against the complete pre-VPN NAT/filter/policy/AP baseline. Latest whole-process crash replay rejects the old command and restores NAT/policy/AP forwarding, but full IPv4/IPv6 filter equality fails: a VPN-only control without Root managers reproduces the identical system quota residual. That gate remains failed; the app does not delete system-owned bandwidth rules.",
+      "references": [
+        "https://android.googlesource.com/platform/system/netd/+/lollipop-dev/server/RouteController.cpp",
+        "https://android.googlesource.com/platform/system/netd/+/refs/heads/android14-mainline-healthfitness-release/server/RouteController.h",
+        "https://raw.githubusercontent.com/torvalds/linux/v5.10/net/ipv4/route.c",
+        "https://raw.githubusercontent.com/torvalds/linux/v5.10/net/ipv4/ip_forward.c",
+        "https://docs.kernel.org/networking/ip-sysctl.html",
+        "https://developer.android.com/reference/android/system/Os#if_indextoname(int)",
+        "https://developer.android.com/reference/android/net/Network#getSocketFactory()",
+        "https://source.android.com/docs/core/data/tethering-offload",
+        "https://android.googlesource.com/platform/packages/modules/Connectivity/+/refs/heads/main/Tethering/src/com/android/networkstack/tethering/BpfCoordinator.java",
+        "https://kernel.org/doc/html/v6.1/networking/ip-sysctl.html",
+        "https://android.googlesource.com/platform/packages/modules/Connectivity/+/6150ec80cc314e851428eaf6a65d329862ee4080/Tethering/src/android/net/ip/IpServer.java"
+      ]
+    }
+  }
+}

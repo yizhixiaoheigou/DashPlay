@@ -1,0 +1,179 @@
+diff --git a/web/index.html b/web/index.html
+--- a/web/index.html
++++ b/web/index.html
+@@ -21,6 +21,7 @@
+ </main>
+ <dialog id="settings" aria-labelledby="settings-title"><header><h2 id="settings-title" data-i18n="settings" tabindex="-1" autofocus></h2><button id="btn-close" class="text" data-i18n="done"></button></header><div class="settings-body">
+   <div class="group">
++    <button id="simple-settings" class="cell" type="button" aria-pressed="false"><span class="main"><b data-i18n="simpleTry">选项点不开？试试简易设置</b><span data-i18n="simpleHint">把下拉选项改成直接点选，可随时切回。</span></span></button>
+     <button id="fullscreen" class="cell" type="button"><span class="tile blue"><svg class="ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path class="expand" d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><path class="collapse" d="M3 8h5V3m8 0v5h5M8 21v-5H3m13 5v-5h5"/></svg></span><span class="main"><b id="fullscreen-text">全屏</b></span></button>
+     <a id="add-phone-panel" class="cell" href="/" hidden><span class="tile green"><svg class="ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2.8" width="10" height="18.4" rx="2.6"/><path d="M10.8 5.2h2.4"/></svg></span><span class="main"><b data-i18n="addPhoneLink"></b><span data-i18n="addPhoneLinkHint"></span></span><span class="chev"></span></a>
+     <a id="box-settings-panel" class="cell" href="/" hidden><span class="tile gray"><svg class="ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.6v3M12 18.4v3M2.6 12h3M18.4 12h3M5.4 5.4l2.1 2.1M16.5 16.5l2.1 2.1M18.6 5.4l-2.1 2.1M7.5 16.5l-2.1 2.1"/></svg></span><span class="main"><b data-i18n="boxSettingsLink"></b><span data-i18n="boxSettingsLinkHint"></span></span><span class="chev"></span></a>
+diff --git a/web/src/main.ts b/web/src/main.ts
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -1,3 +1,4 @@
++import { simpleSettings } from './simple-settings';
+ import { categoryDestination, initialRoutes, validRoutes, sameRoutes, displayedVolume, type AudioRoutes, type Destination, type RouteName } from './audio-routes';
+ import { startup, startupStats } from './startup';
+ import { AudioEngine } from './audio';
+@@ -77,6 +78,7 @@
+ else void fetch('./receiver-access.json', { cache: 'no-store' }).then(r => r.ok ? r.json() : null)
+   .then(access => { const port = Number(access?.settingsPort) || 0; if (port) showBoxLinks(port); })
+   .catch(() => { /* no settings page on this box: the links stay hidden */ });
++let simpleMenu: ReturnType<typeof simpleSettings> | undefined;
+ function render() {
+   setLanguage(language);
+   updateFullscreen();
+@@ -98,6 +100,7 @@
+   el('night-status').title = t(darkQuery.matches ? 'browserDark' : 'browserLight');
+   renderAudioMix();
+   if (!devicesBlock.hidden) renderDevices();
++  if (simpleMenu) syncSimpleButton();
+ }
+ 
+ // The box's ways in, one row each: "wired · phone" while an iPhone is plugged in, and "wireless · phone" for
+@@ -639,6 +642,7 @@
+   if (!display) return;
+   el<HTMLInputElement>('width').value = String(display.width); el<HTMLInputElement>('height').value = String(display.height);
+   el<HTMLSelectElement>('fps').value = String(display.fps); el<HTMLSelectElement>('ui-scale').value = String(display.uiScale);
++  simpleMenu?.sync();
+   el('display-status').dataset.codec = display.hevc ? 'H.265' : 'H.264';
+   el('display-status').textContent = `${display.width} × ${display.height} / ${display.fps} fps / ${display.hevc ? 'H.265' : 'H.264'}${display.pending ? ` · ${t('nextSession')}` : ''}`;
+ }
+@@ -816,7 +820,7 @@
+   send({type:'stats',stats:{fps:reportFrames/seconds,decodeMs:video.decodeLatencyMs,queue:video.decodeQueueSize,
+     kbps:reportBytes*8/1000/seconds,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,
+     width:canvas.width,height:canvas.height,...(touchCount?{touchMs:touchSum/touchCount,touches:touchCount}:{}),...(musicBytes?{musicKbps:musicBytes*8/1000/seconds}:{}),
+-    ...startupStats(),chrome:chromeMajor,compat:compatDisplay?1:0,build:BUILD,webView,carMusic:carMusic?1:0,teslaMode:teslaMode?1:0,promptGain,...(revived?{revived}:{}),fastDecoder:fastDecoder()?1:0,hevcDecodes:hevcDecodes?1:0,hevc:display?.hevc?1:0,...microphone.report(),...audio.farReport(),...media.report(),...musicTimeline(),...audio.musicReport(),...stalls,...lag.take(performance.now())}});
++    ...startupStats(),simpleSettings:simpleMenu?.enabled?1:0,chrome:chromeMajor,compat:compatDisplay?1:0,build:BUILD,webView,carMusic:carMusic?1:0,teslaMode:teslaMode?1:0,promptGain,...(revived?{revived}:{}),fastDecoder:fastDecoder()?1:0,hevcDecodes:hevcDecodes?1:0,hevc:display?.hevc?1:0,...microphone.report(),...audio.farReport(),...media.report(),...musicTimeline(),...audio.musicReport(),...stalls,...lag.take(performance.now())}});
+   judgeDecoder(video.decodeLatencyMs, reportFrames/seconds);
+   if (active) judgeFrameRate(stalls.caughtUp);
+   reportFrames=0;reportBytes=0;reportStart=now;touchSum=0;touchCount=0;musicBytes=0;
+@@ -845,3 +849,21 @@
+ window.setInterval(() => { syncNight(); if (panel.open) render(); }, 30000);
+ 
+ el('browser-check-show').onclick = () => (window as unknown as { F50BrowserCheck: { show(): void } }).F50BrowserCheck.show();
++
++// This switch changes only the local controls, never the CarPlay session or decoder.
++const simpleQuery = new URLSearchParams(location.search).get('simple');
++if (simpleQuery === '1' || simpleQuery === '0') saveFlag('dashplay-simple-settings', simpleQuery);
++simpleMenu = simpleSettings(panel, readFlag('dashplay-simple-settings') === '1');
++const simpleButton = el<HTMLButtonElement>('simple-settings');
++function syncSimpleButton() {
++  simpleButton.querySelector('b')!.removeAttribute('data-i18n');
++  simpleButton.setAttribute('aria-pressed', String(simpleMenu!.enabled));
++  simpleButton.querySelector('b')!.textContent = simpleMenu!.enabled ? t('simpleOn') : t('simpleTry');
++  simpleMenu!.sync();
++}
++simpleButton.onclick = () => {
++  simpleMenu!.set(!simpleMenu!.enabled);
++  saveFlag('dashplay-simple-settings', simpleMenu!.enabled ? '1' : '0');
++  syncSimpleButton();
++};
++syncSimpleButton();
+diff --git a/web/src/style.css b/web/src/style.css
+--- a/web/src/style.css
++++ b/web/src/style.css
+@@ -106,7 +106,7 @@
+ button.text:active { opacity:.5; }
+ fieldset { border:0; padding:0; margin:0; min-width:0; }
+ .pair { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:0 0 12px; }
+-.pair label { display:flex; flex-direction:column; gap:6px; color:var(--secondary); font-size:13px; }
++.pair label, .pair .simple-row { display:flex; flex-direction:column; gap:6px; color:var(--secondary); font-size:13px; }
+ .pair input, .pair select { width:100%; min-width:0; max-width:none; min-height:44px; padding:8px 12px; border:0; border-radius:10px;
+   background:var(--cell-hi); color:var(--label); font-size:17px; text-align:left; }
+ #fallback-controls { display:flex; flex-wrap:wrap; gap:10px; }
+@@ -171,3 +171,12 @@
+ .group.more { margin-top:26px; }
+ .more-body { padding:0 12px 16px; background:var(--bg, transparent); }
+ .more-body > .group-title:first-child { margin-top:16px; }
++
++/* No native picker, popup positioning or nested modal is needed. */
++.simple-row { flex-wrap:wrap; }
++.simple-options { display:flex; flex-wrap:wrap; gap:8px; flex-basis:100%; padding:8px 0; }
++.simple-options[hidden], select[hidden] { display:none !important; }
++.simple-options button { min-height:44px; padding:8px 16px; border:1px solid #666; border-radius:8px; background:#222; color:#fff; }
++.simple-options button[aria-pressed=true] { background:#0a477b; border-color:#82baff; }
++.simple-options button:focus-visible { outline:3px solid #82baff; outline-offset:2px; }
++.simple-options button:disabled { opacity:.45; }
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -1,5 +1,5 @@
+ const messages = {
+-  settings: ['盒子设置', 'Box settings'], close: ['关闭', 'Close'], done: ['完成', 'Done'],
++  simpleTry: ['选项点不开？试试简易设置', 'Options won’t open? Try simple settings'], simpleOn: ['简易设置已开启 · 点此切回', 'Simple settings on · Switch back'], simpleHint: ['把下拉选项改成直接点选，可随时切回。', 'Choose options with buttons. Switch back any time.'], settings: ['盒子设置', 'Box settings'], close: ['关闭', 'Close'], done: ['完成', 'Done'],
+   boxLink: ['添加 iPhone · 网络设置', 'Add iPhone · Network'], boxLinkHint: ['配对新手机、选择热点', 'Pair a phone, choose the hotspot'],
+   boxLinkHintLive: ['离开画面，配对手机、更换热点', 'Leaves the picture to pair phones or change the hotspot'],
+   addPhoneLink: ['添加 iPhone', 'Add iPhone'], addPhoneLinkHint: ['离开画面，配对一部新手机', 'Leaves the picture to pair a new phone'],
+diff --git a/web/src/simple-settings.ts b/web/src/simple-settings.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/simple-settings.ts
+@@ -0,0 +1,65 @@
++/** The same select values and change handlers, presented as ordinary in-page buttons. */
++export function simpleSettings(panel: HTMLElement, enabled: boolean) {
++  const controls = Array.from(panel.querySelectorAll<HTMLSelectElement>('select')).map(select => {
++    // A button inside a label would also activate the hidden native picker.
++    const label = select.closest('label');
++    if (label) {
++      const row = document.createElement('div');
++      row.className = label.className;
++      row.classList.add('simple-row');
++      row.append(...Array.from(label.childNodes));
++      label.replaceWith(row);
++      const title = row.querySelector<HTMLElement>('b, span');
++      if (title) {
++        title.id ||= `${select.id}-label`;
++        select.setAttribute('aria-labelledby', title.id);
++      }
++    }
++    const group = document.createElement('div');
++    group.className = 'simple-options';
++    group.setAttribute('role', 'group');
++    const title = select.getAttribute('aria-labelledby');
++    if (title) group.setAttribute('aria-labelledby', title);
++    else group.setAttribute('aria-label', select.getAttribute('aria-label') || select.id);
++    select.after(group);
++    let signature = '';
++    const sync = () => {
++      if (select.hidden !== enabled) select.hidden = enabled;
++      group.hidden = !enabled;
++      const disabled = select.matches(':disabled');
++      const next = JSON.stringify([select.value, disabled, Array.from(select.options, o => [o.value, o.text, o.disabled])]);
++      if (next === signature) return;
++      signature = next;
++      // Keep focus on the chosen button when a change handler refreshes the values.
++      const focused = document.activeElement instanceof HTMLButtonElement && group.contains(document.activeElement)
++        ? document.activeElement.dataset.value : undefined;
++      group.replaceChildren(...Array.from(select.options, option => {
++        const button = document.createElement('button');
++        button.type = 'button';
++        button.textContent = option.text;
++        button.dataset.value = option.value;
++        button.disabled = disabled || option.disabled;
++        button.setAttribute('aria-pressed', String(select.value === option.value));
++        button.onclick = () => {
++          if (select.matches(':disabled')) return;
++          select.value = option.value;
++          select.dispatchEvent(new Event('change', { bubbles: true }));
++          sync();
++        };
++        return button;
++      }));
++      if (focused !== undefined) Array.from(group.querySelectorAll('button')).find(b => b.dataset.value === focused)?.focus();
++    };
++    select.addEventListener('change', sync);
++    const observer = new MutationObserver(sync);
++    observer.observe(select, { attributes: true, childList: true, characterData: true, subtree: true });
++    const fieldset = select.closest('fieldset');
++    if (fieldset) observer.observe(fieldset, { attributes: true, attributeFilter: ['disabled'] });
++    return sync;
++  });
++  return {
++    get enabled() { return enabled; },
++    set(value: boolean) { enabled = value; this.sync(); },
++    sync() { for (const sync of controls) sync(); },
++  };
++}

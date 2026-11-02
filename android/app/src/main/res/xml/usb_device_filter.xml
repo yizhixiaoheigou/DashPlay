@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Apple Inc. (0x05ac = 1452). Allows the system to remember "Always open DashPlay" across plug-ins and
+         USB CarPlay mode switches (0x52 re-enumeration), so a screenless box never gets stuck on a USB dialog. -->
+    <usb-device vendor-id="1452" />
+</resources>

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Same palette as the box's settings page (settings_ui.py); blue and status colors darkened so white or body text keeps 4.5:1. -->
+<resources>
+    <color name="bg">#F2F2F7</color>
+    <color name="card">#FFFFFF</color>
+    <color name="text">#1C1C1E</color>
+    <color name="text2">#5B5B60</color>
+    <color name="line">#E5E5EA</color>
+    <color name="fill">#E5E5EA</color>
+    <color name="blue">#0062CC</color>
+    <color name="blue_pressed">#004A9E</color>
+    <color name="blue_text">#0062CC</color>
+    <color name="focus">#409CFF</color>
+    <color name="green">#248A3D</color>
+    <color name="orange">#C93400</color>
+    <color name="red">#D70015</color>
+    <color name="on_dot">#FFFFFF</color>
+    <color name="disabled">#AEAEB2</color>
+</resources>

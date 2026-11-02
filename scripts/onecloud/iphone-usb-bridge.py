@@ -5,7 +5,8 @@ Waits for an iPhone on a USB port (the OTG port away from the network jack is pu
 switches it to its CarPlay configuration as the Android WheelPlay/LIVI code does (vendor request
 IN 0xc0/0x52/0/4, then configuration 6: USBMUX ff/fe/02 + NCM 02/0d), brings the NCM interface up
 (relayed here to a TAP interface, see below; CarPlay uses fe80::2 on it), reports "usb waiting" (no
-iPhone yet), "usb iphone <serial>" (one plugged in; the receiver then pauses wireless invitations) and
+iPhone yet), "usb prepare <serial>" (wait for the receiver to choose wired or preserve wireless;
+legacy receivers use "usb iphone <serial>") and
 "ncm <ifname> <number> <mac>" on stderr, claims the USBMUX interface and relays its bulk transfers over stdio as frames of
 u32 big-endian length + bytes. Exits when the iPhone goes away; the receiver starts it again.
 Verified step by step on the box with wired-host-probe.py (2026-10-12).
@@ -297,6 +298,26 @@ def open_tap(mac):
     return fd
 
 
+def prepare_carplay(serial, off, stream=None, environ=None):
+    """Choose the cable role and finish any wireless teardown before changing USB mode.
+
+    Only newer receivers opt in and understand ``usb prepare``. The reply uses the
+    helper's otherwise-idle stdin before any USBMUX packets can be sent.
+    """
+    environ = os.environ if environ is None else environ
+    needs_ack = not off and environ.get('CARPLAY_USB_STATE_ACK') == '1'
+    state = 'tether' if off else ('prepare' if needs_ack else 'iphone')
+    log(f'usb {state} {serial}'.strip())
+    if needs_ack:
+        reply = (sys.stdin.buffer if stream is None else stream).read(4)
+        if reply != b'RDY!':
+            raise RuntimeError('receiver did not confirm USB CarPlay preparation')
+        off = cable_carplay_off(environ)
+        if off:
+            log(f'usb tether {serial}'.strip())
+    return off
+
+
 def main():
     if ROLE.exists() and ROLE.read_text().strip() != "host":
         ROLE.write_text("none\n")
@@ -310,11 +331,10 @@ def main():
         serial = Path(device, "serial").read_text().strip()
     except OSError:
         serial = ""
-    # "usb iphone <serial>" makes the receiver pause wireless and end a running wireless session
-    # (WiredBootstrap -> setCablePhone). With no CarPlay on the cable the bridge says "usb tether <serial>":
-    # wireless CarPlay (this phone or another) keeps running while the cable is in.
+    # New receivers may preserve a live wireless session by writing the cable marker before
+    # acknowledging preparation. Then the bridge reports "usb tether" and stays out of CarPlay.
     off = cable_carplay_off()
-    log(f"usb {'tether' if off else 'iphone'} {serial}".strip())   # the serial keys the per-iPhone Lockdown record
+    off = prepare_carplay(serial, off)   # the receiver may preserve an active wireless session
     device = carplay_configuration(device)
     release_tethering(device)
     if off:
@@ -421,7 +441,9 @@ def main():
     def from_phone():
         while True:
             try:
-                data = bulk(fd, in_ep, timeout=1000)
+                # A timed-out synchronous USBDEVFS_BULK can discard actual_length bytes.
+                # Keep this IN request pending; device errors/process termination still end it.
+                data = bulk(fd, in_ep, timeout=0)
             except OSError as error:
                 if error.errno == errno.ETIMEDOUT:
                     continue

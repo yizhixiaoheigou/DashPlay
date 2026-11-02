@@ -64,6 +64,8 @@ def options(state):
     # The identity is for explanatory text; both phones may use wireless CarPlay.
     if value.get("uplink_phone") not in ("same", "other"):
         value["uplink_phone"] = "same"
+    if value.get("usb_hotspot_width") not in ("auto", "20", "40"):
+        value["usb_hotspot_width"] = "auto"
     return value
 
 

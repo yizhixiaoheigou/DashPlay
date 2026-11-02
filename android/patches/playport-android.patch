@@ -1,0 +1,237 @@
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/network/TcpLiveness.kt b/protocol/src/main/java/com/shilapi/xcertplay/network/TcpLiveness.kt
+--- a/protocol/src/main/java/com/shilapi/xcertplay/network/TcpLiveness.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/network/TcpLiveness.kt
+@@ -17,6 +17,9 @@
+             )
+         } catch (failure: Exception) {
+             diagnostic("TCP peer health tuning unavailable: ${failure.javaClass.simpleName}")
++        } catch (failure: LinkageError) {
++            // Android before 13 has no jdk.net socket options.
++            diagnostic("TCP peer health tuning unavailable: ${failure.javaClass.simpleName}")
+         }
+     }
+ 
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/transport/LockdownTlsEngineFactory.kt b/protocol/src/main/java/com/shilapi/xcertplay/transport/LockdownTlsEngineFactory.kt
+--- a/protocol/src/main/java/com/shilapi/xcertplay/transport/LockdownTlsEngineFactory.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/transport/LockdownTlsEngineFactory.kt
+@@ -47,7 +47,11 @@
+             }
+             return context.createSSLEngine(PEER_HOST, PEER_PORT).apply {
+                 useClientMode = true
+-                sslParameters = sslParameters.apply { endpointIdentificationAlgorithm = null }
++                // Android before 7.0 has no endpoint identification, so nothing to switch off there.
++                try {
++                    sslParameters = sslParameters.apply { endpointIdentificationAlgorithm = null }
++                } catch (_: NoSuchMethodError) {
++                }
+             }
+         } finally {
+             password.fill('\u0000')
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -59,7 +59,13 @@
+     }
+ }
+ 
+-class CarPlayServer(val config: ServerConfig, private val configStore: ConfigStore? = null) : Closeable {
++class CarPlayServer(
++    val config: ServerConfig,
++    private val configStore: ConfigStore? = null,
++    /** Android RFCOMM; null retains the Linux helper. */
++    val bluetoothLink: BluetoothLink? = null,
++    val platformAudioRoutes: ((String?, String?) -> String?)? = null,
++) : Closeable {
+     private val log = LoggerFactory.getLogger("playport")
+ 
+     val identity = AirPlayIdentityStore.loadOrCreate(config.stateDir)
+@@ -67,7 +73,8 @@
+     // Use one adapter identity for Bluetooth bootstrap and AirPlay /info.
+     val hostBluetoothMac: String by lazy {
+         if (config.wireless) {
+-            BluetoothBridge.resolvePath(config.bluetoothBridge)?.let(BluetoothBridge::localAddress) ?: deviceId
++            bluetoothLink?.localAddress()
++                ?: BluetoothBridge.resolvePath(config.bluetoothBridge)?.let(BluetoothBridge::localAddress) ?: deviceId
+         } else deviceId
+     }
+     val bindAddress: InetAddress = Networks.resolve(config.bindAddress)
+@@ -230,7 +237,7 @@
+         val helper = presenceHelper ?: return null
+         return runCatching {
+             val process = ProcessBuilder(listOf("/usr/bin/python3", helper, command) + args)
+-                .redirectError(ProcessBuilder.Redirect.DISCARD).start()
++                .redirectError(ProcessBuilder.Redirect.to(java.io.File("/dev/null"))).start()
+             // BlueZ lookups slow down while a phone is being bootstrapped; give the helper room.
+             if (!process.waitFor(6, java.util.concurrent.TimeUnit.SECONDS)) {
+                 process.destroyForcibly()
+@@ -342,11 +349,12 @@
+     }
+ 
+     private fun audioRoutesJson(category: String?, destination: String?): String? {
++        platformAudioRoutes?.let { return it(category, destination) }
+         val helper = System.getenv("CARPLAY_AUDIO_ROUTES_HELPER") ?: return null
+         return runCatching {
+             val args = if (category == null) listOf("get") else listOf("set", category, destination.orEmpty())
+             val process = ProcessBuilder(listOf("/usr/bin/python3", helper) + args)
+-                .redirectError(ProcessBuilder.Redirect.DISCARD).start()
++                .redirectError(ProcessBuilder.Redirect.to(java.io.File("/dev/null"))).start()
+             if (!process.waitFor(12, java.util.concurrent.TimeUnit.SECONDS)) {
+                 process.destroyForcibly()
+                 return@runCatching null
+diff --git a/server/src/main/kotlin/com/playport/server/PersistentConfig.kt b/server/src/main/kotlin/com/playport/server/PersistentConfig.kt
+--- a/server/src/main/kotlin/com/playport/server/PersistentConfig.kt
++++ b/server/src/main/kotlin/com/playport/server/PersistentConfig.kt
+@@ -106,7 +106,7 @@
+     fun load(): PersistentConfig? {
+         if (!Files.isRegularFile(file)) return null
+         return runCatching {
+-            json.decodeFromString(PersistentConfig.serializer(), Files.readString(file))
++            json.decodeFromString(PersistentConfig.serializer(), String(Files.readAllBytes(file), Charsets.UTF_8))
+         }.getOrNull()
+     }
+ 
+diff --git a/server/src/main/kotlin/com/playport/server/WebHub.kt b/server/src/main/kotlin/com/playport/server/WebHub.kt
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -191,7 +191,7 @@
+     private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default),
+ ) {
+     private val json = Json { ignoreUnknownKeys = true }
+-    private val clients = ConcurrentHashMap.newKeySet<WsClient>()
++    private val clients: MutableSet<WsClient> = ConcurrentHashMap.newKeySet()
+     private val codecsByStream = ConcurrentHashMap<Int, VideoCodec>()
+     private val configByStream = ConcurrentHashMap<Int, Pair<VideoCodec, ByteArray>>()
+     private val audioFormatByStream = ConcurrentHashMap<Int, AudioFormat>()
+@@ -202,6 +202,8 @@
+     @Volatile var onViewerJoined: ((Int) -> Unit)? = null
+     /** Pages connected to watch (the supervisor releases CarPlay when there are none for a while). */
+     val viewerCount: Int get() = clients.size
++    val sessionIsActive: Boolean get() = sessionActive
++    val sessionPhoneName: String? get() = phoneName
+ 
+     /** Applies a display change; returns null on success or an error message. */
+     @Volatile var onApplyDisplay: ((DisplayRequest) -> DisplayOutcome)? = null
+@@ -349,7 +351,7 @@
+         }
+     }
+ 
+-    private val recoveringStreams = ConcurrentHashMap.newKeySet<Int>()
++    private val recoveringStreams: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+ 
+     /** The phone command can wait on its event socket. Never hold the viewer's Netty reader/writer behind it.
+      * Coalesce recovery per stream so a stalled phone cannot accumulate an unbounded number of workers. */
+@@ -663,7 +665,7 @@
+                     }
+                     call.response.headers.append("Cross-Origin-Resource-Policy", "same-origin")
+                     call.response.headers.append("Cache-Control", "no-store")
+-                    call.respondText(Files.readString(file), io.ktor.http.ContentType.Application.Json)
++                    call.respondText(String(Files.readAllBytes(file), Charsets.UTF_8), io.ktor.http.ContentType.Application.Json)
+                     return@get
+                 }
+                 val resolved = webRoot.resolve(relative).normalize()
+@@ -674,7 +676,7 @@
+                     )
+                     return@get
+                 }
+-                call.respondText(Files.readString(file), contentTypeFor(file.fileName.toString()))
++                call.respondText(String(Files.readAllBytes(file), Charsets.UTF_8), contentTypeFor(file.fileName.toString()))
+             }
+         }
+     }
+diff --git a/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt b/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt
+--- a/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt
++++ b/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt
+@@ -229,7 +229,7 @@
+         val file = statusFile ?: return
+         runCatching {
+             val temporary = file.resolveSibling(file.fileName.toString() + ".tmp")
+-            Files.writeString(temporary, "{\"phase\": \"$phase\"}\n")
++            Files.write(temporary, "{\"phase\": \"$phase\"}\n".toByteArray())
+             Files.move(temporary, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
+         }.onFailure { log.debug("wired status not written: {}", it.message) }
+     }
+@@ -379,7 +379,7 @@
+     }
+ 
+     fun onExit(action: () -> Unit) {
+-        process.onExit().thenRun { runCatching(action) }
++        Thread({ runCatching { process.waitFor() }; runCatching(action) }, "usb-helper-exit").apply { isDaemon = true }.start()
+     }
+ 
+     override fun close() {
+diff --git a/server/src/main/kotlin/com/playport/server/WirelessBootstrap.kt b/server/src/main/kotlin/com/playport/server/WirelessBootstrap.kt
+--- a/server/src/main/kotlin/com/playport/server/WirelessBootstrap.kt
++++ b/server/src/main/kotlin/com/playport/server/WirelessBootstrap.kt
+@@ -2,6 +2,7 @@
+ 
+ import com.shilapi.xcertplay.iap2.session.Iap2Session
+ import com.shilapi.xcertplay.mfi.Iap2MfiAuthenticationClient
++import com.shilapi.xcertplay.transport.BlockingDuplexByteStream
+ import com.shilapi.xcertplay.transport.Iap2IdentificationConfig
+ import com.shilapi.xcertplay.transport.Iap2WirelessCarPlayEndpoint
+ import com.shilapi.xcertplay.transport.Iap2WirelessControlClient
+@@ -21,7 +22,7 @@
+  */
+ class WirelessBootstrap(private val server: CarPlayServer) : Closeable {
+     private val log = LoggerFactory.getLogger("wireless")
+-    @Volatile private var bridgeProcess: ProcessByteStream? = null
++    @Volatile private var bridgeProcess: BlockingDuplexByteStream? = null
+     @Volatile private var stopped = false
+     @Volatile var running = false
+         private set
+@@ -53,8 +54,9 @@
+             if (!wifi.ssid.isNullOrBlank() && config.wifiPassphrase.isNullOrBlank()) {
+                 log.warn("no --wifi-passphrase configured; the phone must already know network {}", wifi.ssid)
+             }
++            val link = server.bluetoothLink
+             val bridgePath = BluetoothBridge.resolvePath(config.bluetoothBridge)
+-            if (bridgePath == null) {
++            if (link == null && bridgePath == null) {
+                 log.warn(
+                     "wireless bootstrap skipped: bt-bridge helper not found; " +
+                         "build it with macos/bt-bridge/build.sh or pass --bt-bridge",
+@@ -62,7 +64,8 @@
+                 return
+             }
+             val deviceAddress = server.wirelessPhone()?.takeIf { it.isNotBlank() }
+-                ?: if (System.getenv("CARPLAY_PRESENCE_HELPER") == null) BluetoothBridge.findPairedIphone(bridgePath) else null
++                ?: link?.pairedIphone()
++                ?: if (link == null && System.getenv("CARPLAY_PRESENCE_HELPER") == null) BluetoothBridge.findPairedIphone(bridgePath!!) else null
+             if (deviceAddress == null) {
+                 log.warn("wireless bootstrap skipped: no paired iPhone found; pass --bt-address AA:BB:CC:DD:EE:FF")
+                 return
+@@ -75,7 +78,7 @@
+ 
+             val stream = synchronized(this) {
+                 if (stopped) return
+-                BluetoothBridge.open(bridgePath, deviceAddress).also { bridgeProcess = it }
++                (link?.open(deviceAddress) ?: BluetoothBridge.open(bridgePath!!, deviceAddress)).also { bridgeProcess = it }
+             }
+             val channel = Iap2Session.openWireless(stream, traceContext = "wireless-rfcomm", onTrace = { log.debug(it) })
+             log.info("wireless iAP2 CSM channel opened over RFCOMM")
+@@ -114,6 +117,6 @@
+                     server.handoffAccepted()
+                 },
+-                onProgress = { log.debug("wireless $it") },
++                onProgress = { log.info("wireless $it") },
+             )
+             if (!stopped) {
+                 when (result.terminal) {
+@@ -146,6 +149,17 @@
+     }
+ }
+ 
++/** How the wireless bootstrap reaches the iPhone's iAP2 service over Bluetooth RFCOMM (the Android app's sockets). */
++interface BluetoothLink {
++    /** This adapter's address, or null when the platform hides it. */
++    fun localAddress(): String?
++
++    /** A paired iPhone to invite, or null. */
++    fun pairedIphone(): String?
++
++    fun open(deviceAddress: String): BlockingDuplexByteStream
++}
++
+ /** Helpers around the macOS bt-bridge executable. */
+ object BluetoothBridge {
+     fun resolvePath(configured: Path?): Path? {

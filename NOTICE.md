@@ -15,6 +15,13 @@ patches and tools for PlayPort and must stay under the same license.
   classes in `patches/playport-wired.patch` (USBMUX host, Lockdown pairing and CarKit service, the
   TLS duplex channel and the wired iAP2 control client; Android logging and XML replaced).
 
+- **Android app** (`android/`): the Bluetooth RFCOMM link, the USB (NCM/iAP2) transport and the
+  Ethernet/IPv6 + iAP2 codecs under `android/app/src/main/java/com/shilapi/xcertplay/transport/`
+  are ported from **DiPlay** by shihabal3amri (GPL-3.0) <https://github.com/shihabal3amri/DiPlay>.
+  The rest of the app (receiver, USB host, hotspot, Root, certificate handling, UI) is DashPlay's
+  own code on the same PlayPort baseline that the boxes use. The app ships without any CarPlay
+  identity and imports one the user already has.
+
 No accessory authentication identity, accessory certificate or private key is included in the
 repository, packages, documentation or tests. Tests generate synthetic identities at runtime.
 DashPlay does not automatically download identities or provide a one-click APK importer. Local

@@ -1,0 +1,223 @@
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -66,6 +66,9 @@
+     val bluetoothLink: BluetoothLink? = null,
+     val platformAudioRoutes: ((String?, String?) -> String?)? = null,
+     val idleReleaseMs: Long? = null,
++    val platformPresence: ((String, List<String>) -> String?)? = null,
++    val platformController: ((String?, String?, Boolean) -> Boolean)? = null,
++    val platformCableRole: CableRole? = null,
+ ) : Closeable {
+     private val log = LoggerFactory.getLogger("playport")
+ 
+@@ -105,6 +108,7 @@
+     private val closed = AtomicBoolean(false)
+     private var wirelessGeneration = 0L
+     private val presenceHelper = System.getenv("CARPLAY_PRESENCE_HELPER")
++    private val hasPresence get() = presenceHelper != null || platformPresence != null
+     @Volatile private var sessionEnded = false
+     private val closingForDisplay = AtomicBoolean(false)
+     @Volatile private var bootInvite = false
+@@ -155,14 +159,14 @@
+         quickRetriesLeft = QUICK_RETRIES
+     }
+ 
+-    fun wirelessPhone(): String? = if (presenceHelper == null) config.bluetoothDeviceAddress else selectedPhone
++    fun wirelessPhone(): String? = if (!hasPresence) config.bluetoothDeviceAddress else selectedPhone
+ 
+     /** The viewer's box settings: paired phones with their BlueZ names and who is using CarPlay now. */
+     fun phonesJson(): String {
+         // The iPhone on the cable is not a Bluetooth pairing, so the presence helper never lists it: name it here,
+         // or the settings showed no phone at all while it was in use (N1, 2026-10-31).
+         val cable = if (wiredSessionActive()) wiredName ?: "iPhone" else null
+-        if (presenceHelper == null) {
++        if (!hasPresence) {
+             return if (cable != null) PhoneList.body(supported = true, raw = null, cable = cable)
+             else PhoneList.body(supported = false, raw = null)
+         }
+@@ -180,7 +184,7 @@
+      * uses, so the supervisor cannot re-select the previous phone in between. Returns an error code, or null.
+      */
+     fun switchPhone(address: String): String? {
+-        if (presenceHelper == null) return "unsupported"
++        if (!hasPresence) return "unsupported"
+         val phone = PhoneList.normalize(address)
+         if (!PhoneList.ADDRESS.matches(phone)) return "invalid"
+         if (closed.get()) return "closed"
+@@ -243,6 +246,7 @@
+     }
+ 
+     private fun presenceResult(command: String, vararg args: String): String? {
++        platformPresence?.let { provider -> return runCatching { provider(command, args.toList()) }.getOrNull() }
+         val helper = presenceHelper ?: return null
+         return runCatching {
+             val process = ProcessBuilder(listOf("/usr/bin/python3", helper, command) + args)
+@@ -290,6 +294,14 @@
+         )
+ 
+     private val listener = object : AirPlaySessionListener {
++        override fun onSetupAllowed(session: AirPlaySession): Boolean {
++            val check = platformController ?: return true
++            if (session === wiredSession) return true
++            if (session !== activeSession) return false
++            val handoff = System.nanoTime() / 1_000_000 - handoffAcceptedAt < HANDOFF_ADMIT_MS
++            return runCatching { check(session.controllerId, selectedPhone, bootInvite || handoff) }.getOrDefault(false)
++        }
++
+         override fun onSessionActive(session: AirPlaySession) {
+             log.info("CarPlay session active peer={}", session.host)
+             activeSession = session
+@@ -308,7 +320,7 @@
+             log.info("CarPlay session ended peer={}", session.host)
+             if (activeSession !== session) return
+             activeSession = null
+-            if (presenceHelper != null) presence("idle")
++            if (hasPresence) presence("idle")
+             // A session the receiver closed itself to apply a new display is already being re-invited;
+             // flagging it as ended made the supervisor start a second invitation that cut off the first
+             // (fullscreen switch took 19 s instead of ~12 s, 2026-10-11).
+@@ -392,7 +404,7 @@
+         awaitBindAddress()
+         selectedPhone = presenceResult("boot")?.takeIf { it.isNotBlank() }
+         bootInvite = selectedPhone != null
+-        if (!bootInvite && presenceHelper != null) selectedPhone = selectPhone()
++        if (!bootInvite && hasPresence) selectedPhone = selectPhone()
+         bootDeadline = System.nanoTime() / 1_000_000 + BOOTSTRAP_STALE_MS
+         startAirPlayListener()
+         // The handoff hands the iPhone this address directly, and it accepts the Bluetooth invitation
+@@ -403,7 +415,7 @@
+                 .onSuccess { if (closed.get()) runCatching { it.close() } else advertiser = it }
+                 .onFailure { log.warn("mDNS advertisement failed: {}", it.message) }
+         }, "mdns-start").apply { isDaemon = true; start() }
+-        if (config.wireless && !cablePhone && (presenceHelper == null || bootInvite || selectedPresent())) {
++        if (config.wireless && !cablePhone && (!hasPresence || bootInvite || selectedPresent())) {
+             wireless = WirelessBootstrap(this).also { it.start() }
+         }
+         startSupervisor()
+@@ -443,7 +455,7 @@
+             wiredSession?.takeIf { it === activeSession }?.let { runCatching { it.close() } }
+             wiredSession = null
+             // Whom to invite: a phone used on the cable only is not the presence helper's last phone.
+-            if (presenceHelper != null && selectedPhone == null) {
++            if (hasPresence && selectedPhone == null) {
+                 selectedPhone = presenceResult("unplugged")?.takeIf { it.matches(Regex("(?:[0-9A-F]{2}:){5}[0-9A-F]{2}")) }
+             }
+             // Invite at once, as at boot: someone who just pulled the cable is in the car with the phone.
+@@ -534,7 +546,7 @@
+                         log.info("wired iPhone connected; replacing the current session")
+                         runCatching { current.close() }
+                     }
+-                } else if (presenceHelper != null) {
++                } else if (hasPresence) {
+                     val incomingPhone = presenceResult("admit", socket.inetAddress.hostAddress)
+                     if (incomingPhone != null && !presence("allowed", incomingPhone)) {
+                         log.info("phone paused from settings; rejecting automatic CarPlay reconnect")
+@@ -784,7 +796,7 @@
+                         absentChecks = 0
+                         continue
+                     }
+-                    if (presenceHelper == null) {
++                    if (!hasPresence) {
+                         // Preserve the legacy policy on receivers that did not opt in.
+                         if (wireless?.running != true && now - lastBootstrapAt >= 20_000) restartWireless()
+                         continue
+@@ -929,7 +941,7 @@
+         val generation = ++wirelessGeneration
+         sessionEnded = false
+         lastBootstrapAt = System.nanoTime() / 1_000_000
+-        if (presenceHelper != null && selectedPhone != invitedPhone) {
++        if (hasPresence && selectedPhone != invitedPhone) {
+             invitedPhone = selectedPhone
+             invitedAt = lastBootstrapAt
+         }
+@@ -941,7 +953,7 @@
+                 Thread.sleep(750)
+                 synchronized(this@CarPlayServer) {
+                     if (closed.get() || generation != wirelessGeneration || activeSession != null) return@Thread
+-                    if (presenceHelper != null && !bootInvite && !confirmedPresent && !selectedPresent()) return@Thread
++                    if (hasPresence && !bootInvite && !confirmedPresent && !selectedPresent()) return@Thread
+                     wireless = WirelessBootstrap(this).also { it.start() }
+                 }
+             },
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt
+@@ -25,6 +25,7 @@
+ 
+ /** Session lifecycle and command callbacks for the driver/UI layer. */
+ interface AirPlaySessionListener {
++    fun onSetupAllowed(session: AirPlaySession): Boolean = true
+     fun onSessionActive(session: AirPlaySession) {}
+     fun onSessionEnded(session: AirPlaySession) {}
+     fun onVideoFrameRendered(session: AirPlaySession) {}
+@@ -75,6 +76,7 @@
+     private var clusterStreamSetups = 0
+ 
+     private val closed = AtomicBoolean(false)
++    private var rejectedSetup = false
+     private val notified = AtomicBoolean(false)
+     private var eventServer: ServerSocket? = null
+     private var eventSocket: Socket? = null
+@@ -334,6 +336,7 @@
+                     val wire = RtspMessage.buildResponse(request, response)
+                     trace("airplay control tx wireHex=${wire.toHex()}")
+                     output.write(cipher?.encrypt(wire) ?: wire)
++                    if (rejectedSetup) { output.flush(); return }
+                     if (cipher == null && pairVerify.controlKeys != null) {
+                         val keys = pairVerify.controlKeys!!
+                         cipher = ControlCipher(keys.readKey, keys.writeKey)
+@@ -443,6 +446,10 @@
+     }
+ 
+     private fun handleSetup(request: RtspMessage.Request): RtspMessage.Response {
++        if (!listener.onSetupAllowed(this)) {
++            rejectedSetup = true
++            return RtspMessage.Response(status = 403)
++        }
+         val dict = try {
+             asMap(BplistCodec.decode(request.body)) ?: return RtspMessage.Response(status = 400)
+         } catch (error: Exception) {
+--- /dev/null
++++ b/protocol/src/test/java/com/shilapi/xcertplay/airplay/AirPlaySetupAuthorizationTest.kt
+@@ -0,0 +1,42 @@
++package com.shilapi.xcertplay.airplay
++
++import java.net.InetAddress
++import java.net.ServerSocket
++import java.net.Socket
++import java.util.concurrent.atomic.AtomicInteger
++import org.junit.Assert.*
++import org.junit.Test
++
++class AirPlaySetupAuthorizationTest {
++    @Test fun rejectedControllerGetsForbiddenAndConnectionClosesBeforeMediaSetup() {
++        val gateCalls = AtomicInteger()
++        ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { listener ->
++            Socket("127.0.0.1", listener.localPort).use { client ->
++                val session = AirPlaySession(
++                    socket = listener.accept(),
++                    config = AirPlayConfig(deviceName = "test", deviceId = "02:00:00:00:00:02",
++                        btMac = "02:00:00:00:00:01", sourceVersion = "1.0",
++                        main = AirPlayDisplayConfig(widthPixels = 800, heightPixels = 480)),
++                    identity = AirPlayIdentity.generate(), pairings = PairingStore(), mfi = null,
++                    listener = object : AirPlaySessionListener {
++                        override fun onSetupAllowed(session: AirPlaySession): Boolean {
++                            gateCalls.incrementAndGet(); return false
++                        }
++                    }, media = object : AirPlayMediaHandler {},
++                )
++                try {
++                    session.start()
++                    client.soTimeout = 3000
++                    client.getOutputStream().write("SETUP / RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n".toByteArray())
++                    client.getOutputStream().flush()
++                    val input = client.getInputStream().bufferedReader()
++                    assertTrue(input.readLine().contains("403"))
++                    while (!input.readLine().isNullOrEmpty()) { }
++                    assertEquals(-1, input.read())
++                    assertEquals(1, gateCalls.get())
++                    assertTrue(session.activeStreams.isEmpty())
++                } finally { session.close() }
++            }
++        }
++    }
++}

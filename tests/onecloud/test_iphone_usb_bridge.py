@@ -127,14 +127,16 @@ class CableCarPlayOffTests(unittest.TestCase):
         # "usb tether" keeps the receiver from pausing wireless; returning after the unplug keeps it out of
         # usbmux/NCM (it used to fall through and fail with "CarPlay configuration incomplete").
         source = PATH.read_text()
-        self.assertIn("log(f\"usb {'tether' if off else 'iphone'} {serial}\".strip())", source)
+        with patch.object(bridge, 'log') as log:
+            bridge.prepare_carplay('test-phone', True, environ={'CARPLAY_USB_STATE_ACK': '1'})
+            log.assert_called_once_with('usb tether test-phone')
         self.assertIn('        wait_for_unplug(device)\n        return\n', source)
 
     def test_the_cables_carplay_does_not_decide_the_usb_internet(self):
         # The iPhone's USB internet interface is kept or released by release_tethering alone, before the
         # CarPlay question; without USB internet chosen, the cable only charges the iPhone.
         source = PATH.read_text()
-        self.assertLess(source.index('    release_tethering(device)\n    if off:'), source.index('report_tether_interface(device)\n        wait_for_unplug'))
+        self.assertLess(source.index('    release_tethering(device)'), source.index('report_tether_interface(device)\n        wait_for_unplug'))
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(bridge, 'USB_TETHER_MARK', Path(tmp) / 'usb-tether'), \
@@ -163,3 +165,69 @@ class CableCarPlayOffTests(unittest.TestCase):
                 (path / 'driver').symlink_to(driver)
             bridge.release_carplay_ncm(device)
             self.assertEqual((driver / 'unbind').read_text(), '1-2:6.3')
+
+
+class UsbPrepareTests(unittest.TestCase):
+    def test_receiver_must_confirm_before_usb_configuration_can_continue(self):
+        import io
+        import threading
+        preparing, release, finished = threading.Event(), threading.Event(), threading.Event()
+        class Reply:
+            def read(self, size):
+                preparing.set()
+                if not release.wait(2):
+                    raise TimeoutError('test callback was not released')
+                return b'RDY!'
+        errors = []
+        def run():
+            try:
+                bridge.prepare_carplay('test-phone', False, stream=Reply(),
+                                       environ={'CARPLAY_USB_STATE_ACK': '1'})
+                finished.set()
+            except Exception as error:
+                errors.append(error)
+                preparing.set()
+        with patch.object(bridge, 'log') as log:
+            worker = threading.Thread(target=run)
+            worker.start()
+            try:
+                self.assertTrue(preparing.wait(1))
+                self.assertEqual(errors, [])
+                self.assertFalse(finished.is_set())
+                log.assert_called_once_with('usb prepare test-phone')
+            finally:
+                release.set()
+                worker.join(2)
+            self.assertTrue(finished.is_set())
+
+    def test_missing_or_invalid_receiver_reply_aborts_instead_of_switching_usb(self):
+        import io
+        for reply in (b'', b'nope'):
+            with self.subTest(reply=reply), patch.object(bridge, 'log'):
+                with self.assertRaises(RuntimeError):
+                    bridge.prepare_carplay('test-phone', False, stream=io.BytesIO(reply),
+                                           environ={'CARPLAY_USB_STATE_ACK': '1'})
+
+    def test_old_receiver_and_tether_only_do_not_wait_for_new_handshake(self):
+        import io
+        for off, environ, state in [(False, {}, 'iphone'),
+                                    (True, {'CARPLAY_USB_STATE_ACK': '1'}, 'tether')]:
+            stream = io.BytesIO(b'unread')
+            with patch.object(bridge, 'log') as log:
+                bridge.prepare_carplay('test-phone', off, stream=stream, environ=environ)
+                log.assert_called_once_with('usb ' + state + ' test-phone')
+                self.assertEqual(stream.tell(), 0)
+
+    def test_receiver_can_preserve_wireless_and_return_a_tether_only_cable(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / 'cable-off'
+            env = {'CARPLAY_USB_STATE_ACK': '1', bridge.CABLE_OFF_ENV: str(marker)}
+            class Reply:
+                def read(self, size):
+                    marker.write_text('once\n')
+                    return b'RDY!'
+            with patch.object(bridge, 'log') as log:
+                self.assertTrue(bridge.prepare_carplay('test-phone', False, stream=Reply(), environ=env))
+                self.assertEqual([x.args[0] for x in log.call_args_list],
+                                 ['usb prepare test-phone', 'usb tether test-phone'])

@@ -265,6 +265,14 @@ class SettingsPage:
                     result = page.apply(self.path, form)
                 except ValueError as error:
                     result = "错误：" + str(error)
+                if isinstance(result, tuple) and result[0] == 'versions':
+                    host = urllib.parse.urlsplit('http://' + self.headers.get('Host', '')).hostname
+                    if not host:
+                        return self._send(400, '无法确定盒子地址')
+                    if ':' in host:
+                        host = '[' + host + ']'
+                    info = result[1]
+                    return self._send(303, '', extra={'Location': f'http://{host}:{info["port"]}/#{info["token"]}'})
                 if isinstance(result, tuple) and result[0] == "go":
                     return self._send(303, "", extra={"Location": result[1]})
                 if isinstance(result, tuple):   # a full page: the network is about to change
@@ -401,6 +409,9 @@ class SettingsPage:
             raise ValueError("未知操作。")
         if path == "/update":
             self.check_nonce(form)
+            if form.get('action') == 'versions':
+                import version_manager
+                return ('versions', version_manager.ensure(self.state.parent))
             if form.get("action") == "check":
                 threading.Thread(target=update.check, args=(self.state.parent,), name="update-check", daemon=True).start()
                 return "正在检查更新，几秒后刷新页面就能看到结果。"
@@ -559,6 +570,9 @@ class SettingsPage:
                       f'<span class=value>{escape(found["latest"])}</span></div>')
         checked = (time.strftime("上次检查 %m-%d %H:%M", time.localtime(found["checked_at"]))
                    if found.get("checked_at") else "还没有检查过")
+        cells += (f'<form method=post action=/update>{ui.hidden(nonce)}<button class="cell action" name=action '
+                  'value=versions>安装其他版本／恢复更新前版本</button></form>'
+                  '<p class=note>选择兼容版本，保留个人设置。版本选择页可收藏，回退后仍能使用。</p>')
         return cells + (f'<form method=post action=/update>{ui.hidden(nonce)}<button class="cell action" name=action '
                         f'value=check>检查更新</button></form><p class=note>{checked}</p>')
 
@@ -896,6 +910,10 @@ class SettingsPage:
             if value not in ('none', 'phone_hotspot') + (('usb_tether',) if self.wired_capable() else ()):
                 raise ValueError('请选择车机上网方式。')
             chosen['car_internet'] = value
+            width = form.get('usb_hotspot_width', chosen.get('usb_hotspot_width', 'auto'))
+            if width not in ('auto', '20', '40'):
+                raise ValueError('请选择热点带宽：自动、20 MHz 或 40 MHz。')
+            chosen['usb_hotspot_width'] = width
             if value == 'phone_hotspot':
                 old = _load(self.state / 'uplink-hotspot.json') or {}
                 # A new SSID must not silently reuse another hotspot's password.
@@ -923,6 +941,14 @@ class SettingsPage:
             choices.append(('usb_tether', 'USB 共享网络（手机或随身 WiFi）'))
         for value, text in choices:
             rows += f'<label class=cell><input type=radio name=car_internet value={value}{" checked" if chosen["car_internet"]==value else ""}>{text}</label>'
+        if self.wired_capable():
+            rows += '<div class=cell><span class=main><b>USB 共享时的热点带宽</b><span>自动优先尝试 80 MHz，不支持时降低；40 MHz 不支持时退到 20 MHz。改用手机热点供网时暂用 20 MHz。</span></span></div>'
+            for width, text in (('auto', '自动'), ('20', '20 MHz'), ('40', '40 MHz')):
+                checked = ' checked' if chosen.get('usb_hotspot_width') == width else ''
+                rows += f'<label class=cell><input type=radio name=usb_hotspot_width value={width}{checked}>{text}</label>'
+            actual = self.status().get('hotspot_width')
+            if actual in (20, 40, 80):
+                rows += f'<p class=note>当前热点带宽：{actual} MHz</p>'
         rows += (f'<label class=cell><span class=main><b>热点名称</b></span><input type=text name=ssid value="{escape(saved.get("ssid", ""))}" '
                  'maxlength=32 placeholder=手机热点名称 autocapitalize=off style="text-align:right" aria-label=手机热点名称></label>'
                  '<label class=cell><span class=main><b>热点密码</b></span><input type=password name=password minlength=8 maxlength=63 '

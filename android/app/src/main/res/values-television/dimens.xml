@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A TV is read from a sofa: larger text. A 1080p TV is 960x540dp, so the home screen has to fit 540dp high
+     without scrolling (a remote focusing the bottom row would scroll the title away). -->
+<resources>
+    <dimen name="gutter">32dp</dimen>
+    <dimen name="gap">16dp</dimen>
+    <dimen name="radius">18dp</dimen>
+    <dimen name="pad">20dp</dimen>
+    <dimen name="text_title">30sp</dimen>
+    <dimen name="text_head">26sp</dimen>
+    <dimen name="text_body">20sp</dimen>
+    <dimen name="text_small">16sp</dimen>
+    <dimen name="text_tiny">14sp</dimen>
+    <dimen name="button_height">56dp</dimen>
+    <dimen name="row_height">56dp</dimen>
+    <dimen name="dot">30dp</dimen>
+    <dimen name="qr">168dp</dimen>
+    <dimen name="focus_stroke">4dp</dimen>
+    <dimen name="content_max">900dp</dimen>
+</resources>

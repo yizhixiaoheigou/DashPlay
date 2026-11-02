@@ -601,12 +601,17 @@ def main():
                     uplink = None
             if uplink is None:
                 # Concurrent setup may have rewritten hostapd.conf before falling back.
+                if wants_usb_tether:
+                    from phone_uplink import usb_ap_widths
+                    width = usb_ap_widths(state, channel)[0]
                 platform.configure_hotspot(channel, width, hotspot["ssid"], ap_passphrase)
                 platform.set_ap_address(address)
                 launch_receiver(channel)
                 mark("receiver launched")
                 used = None
-                for ap_channel, ap_mhz in hotspot_attempts(channel, width):
+                attempts = ([(channel, w) for w in usb_ap_widths(state, channel)] +
+                            ([(6, 20)] if channel > 14 else [])) if wants_usb_tether else hotspot_attempts(channel, width)
+                for ap_channel, ap_mhz in attempts:
                     if used:
                         print(f"box hotspot did not start on channel {used[0]} at {used[1]} MHz; "
                               f"trying channel {ap_channel} at {ap_mhz} MHz", flush=True)
@@ -622,6 +627,7 @@ def main():
                 else:
                     raise RuntimeError("box hotspot did not start")
                 mark("AP enabled")
+                status['hotspot_width'] = used[1]
                 # DHCP only: no router or DNS option. (A head unit joining it may still treat it as its
                 # default network and lose internet: box_hotspot mode says so; the other modes avoid it.)
                 portal = setup_wizard.captive(setup, "ap")

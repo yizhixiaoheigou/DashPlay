@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_enabled="false"><shape><solid android:color="@color/card" /><corners android:radius="14dp" /></shape></item>
+    <item android:state_focused="true"><shape><solid android:color="@color/card" /><stroke android:width="@dimen/focus_stroke" android:color="@color/focus" /><corners android:radius="14dp" /></shape></item>
+    <item android:state_selected="true"><shape><solid android:color="@color/card" /><stroke android:width="2dp" android:color="@color/blue_text" /><corners android:radius="14dp" /></shape></item>
+    <item android:state_pressed="true"><shape><solid android:color="@color/fill" /><corners android:radius="14dp" /></shape></item>
+    <item><shape><solid android:color="@color/card" /><corners android:radius="14dp" /></shape></item>
+</selector>

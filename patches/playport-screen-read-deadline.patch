@@ -1,0 +1,293 @@
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/airplay/ScreenStream.kt b/protocol/src/main/java/com/shilapi/xcertplay/airplay/ScreenStream.kt
+index 046548f..dae7c4e 100644
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/ScreenStream.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/ScreenStream.kt
+@@ -7,6 +7,7 @@ import java.net.InetAddress
+ import java.net.InetSocketAddress
+ import java.net.ServerSocket
+ import java.net.Socket
++import java.net.SocketTimeoutException
+ import java.util.concurrent.atomic.AtomicBoolean
+ import java.util.concurrent.atomic.AtomicLong
+ 
+@@ -69,10 +70,10 @@ class ScreenStream(private val key: ByteArray, private val onDiagnostic: (String
+             val input = sock.getInputStream()
+             while (!closed.get()) {
+                 stats.reading()
+-                val header = readFully(input, HEADER_LEN) ?: break
++                val header = readFully(sock, input, HEADER_LEN, idleAllowed = true) ?: break
+                 val bodySize = readU32Le(header, 0)
+                 if (bodySize > MAX_BODY) break
+-                val body = readFully(input, bodySize) ?: break
++                val body = readFully(sock, input, bodySize) ?: break
+                 stats.received(HEADER_LEN + bodySize)
+                 onMessage(header, body)
+                 stats.processed()
+@@ -114,13 +115,32 @@ class ScreenStream(private val key: ByteArray, private val onDiagnostic: (String
+         }
+     }
+ 
+-    private fun readFully(input: InputStream, length: Int): ByteArray? {
++    private fun readFully(sock: Socket, input: InputStream, length: Int, idleAllowed: Boolean = false): ByteArray? {
+         if (length < 0) return null
+         val output = ByteArray(length)
+         var offset = 0
++        // A quiet screen may wait indefinitely before its next header. Once a header starts,
++        // or declares a body, incomplete data must not leave the session live forever.
++        var deadline = if (idleAllowed) 0L else System.nanoTime() + PACKET_TIMEOUT_NS
++        fun expired(): Nothing = throw SocketTimeoutException(
++            "video ${if (idleAllowed) "header" else "body"} incomplete: received=$offset expected=$length",
++        )
+         while (offset < length) {
+-            val read = input.read(output, offset, length - offset)
++            if (deadline != 0L) {
++                val remaining = deadline - System.nanoTime()
++                if (remaining <= 0) expired()
++                sock.soTimeout = ((remaining + 999_999) / 1_000_000).coerceAtMost(1000).toInt()
++            } else {
++                sock.soTimeout = 1000
++            }
++            val read = try {
++                input.read(output, offset, length - offset)
++            } catch (timeout: SocketTimeoutException) {
++                if (deadline != 0L && System.nanoTime() >= deadline) expired()
++                continue
++            }
+             if (read < 0) return null
++            if (read > 0 && deadline == 0L) deadline = System.nanoTime() + PACKET_TIMEOUT_NS
+             offset += read
+         }
+         return output
+@@ -133,6 +153,7 @@ class ScreenStream(private val key: ByteArray, private val onDiagnostic: (String
+         const val OP_VIDEO_FRAME = 0
+         const val OP_VIDEO_CONFIG = 1
+         const val MAX_BODY = 8 * 1024 * 1024
++        const val PACKET_TIMEOUT_NS = 10_000_000_000L
+     }
+ }
+ 
+diff --git a/protocol/src/test/java/com/shilapi/xcertplay/airplay/ScreenStreamReadDeadlineTest.java b/protocol/src/test/java/com/shilapi/xcertplay/airplay/ScreenStreamReadDeadlineTest.java
+new file mode 100644
+index 0000000..d2f3e5b
+--- /dev/null
++++ b/protocol/src/test/java/com/shilapi/xcertplay/airplay/ScreenStreamReadDeadlineTest.java
+@@ -0,0 +1,219 @@
++package com.shilapi.xcertplay.airplay;
++
++import kotlin.Unit;
++import org.junit.Test;
++
++import java.io.IOException;
++import java.lang.reflect.Field;
++import java.lang.reflect.Method;
++import java.net.InetAddress;
++import java.net.ServerSocket;
++import java.net.Socket;
++import java.net.SocketTimeoutException;
++import java.util.Arrays;
++import java.util.concurrent.BlockingQueue;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.LinkedBlockingQueue;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicReference;
++
++import static org.junit.Assert.*;
++
++/** Real loopback sockets; all keys and media are synthetic. No phone or accessory identity is used. */
++public class ScreenStreamReadDeadlineTest {
++    private static final long TIMEOUT_WAIT_MS = 15_000;
++    private static final byte[] NAL = {0, 0, 0, 2, 0x65, 1};
++    private static final byte[] ANNEX_B = {0, 0, 0, 1, 0x65, 1};
++
++    /** Isolate the receive loop without opening the production listener on all network interfaces. */
++    private static final class Connection implements AutoCloseable {
++        final ScreenStream screen = new ScreenStream(new byte[32], line -> Unit.INSTANCE);
++        final AtomicReference<Throwable> cause = new AtomicReference<>();
++        final CountDownLatch ended = new CountDownLatch(1);
++        final BlockingQueue<byte[]> frames = new LinkedBlockingQueue<>();
++        final Socket sender;
++        final Socket receiver;
++        final Thread worker;
++
++        Connection() throws Exception {
++            try (ServerSocket server = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
++                sender = new Socket("127.0.0.1", server.getLocalPort());
++                receiver = server.accept();
++            }
++            Field socket = ScreenStream.class.getDeclaredField("socket");
++            socket.setAccessible(true);
++            socket.set(screen, receiver);
++            Field listener = ScreenStream.class.getDeclaredField("listener");
++            listener.setAccessible(true);
++            listener.set(screen, new ScreenStream.Listener() {
++                public void onCodec(VideoCodec codec) {}
++                public void onConfig(byte[] data) {}
++                public void onFrame(byte[] data) { frames.add(data); }
++                public void onClosed(Throwable error) { cause.set(error); ended.countDown(); }
++            });
++            Method run = ScreenStream.class.getDeclaredMethod("run", Socket.class);
++            run.setAccessible(true);
++            worker = new Thread(() -> {
++                try {
++                    run.invoke(screen, receiver);
++                } catch (Exception error) {
++                    cause.set(error);
++                    ended.countDown();
++                }
++            }, "screen-read-deadline-test");
++            worker.setDaemon(true);
++            worker.start();
++        }
++
++        void send(byte[] bytes) throws IOException {
++            sender.getOutputStream().write(bytes);
++            sender.getOutputStream().flush();
++        }
++
++        void assertTimedOut(long started) throws InterruptedException {
++            assertTrue("incomplete packet never closes", ended.await(TIMEOUT_WAIT_MS, TimeUnit.MILLISECONDS));
++            assertTrue("expected read timeout, got " + cause.get(), cause.get() instanceof SocketTimeoutException);
++            assertTrue("closed substantially before the 10-second deadline",
++                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started) >= 9_000);
++        }
++
++        void finish() throws Exception {
++            sender.shutdownOutput();
++            assertTrue("EOF did not close the stream", ended.await(2_000, TimeUnit.MILLISECONDS));
++            assertNull("valid packet was rejected", cause.get());
++        }
++
++        @Override public void close() throws Exception {
++            screen.close();
++            sender.close();
++            receiver.close();
++            worker.join(2_000);
++            assertFalse("receive worker leaked", worker.isAlive());
++        }
++    }
++
++    private static byte[] header(int size) {
++        byte[] header = new byte[128];
++        for (int i = 0; i < 4; i++) header[i] = (byte) (size >>> (8 * i));
++        header[4] = (byte) 255; // Ignored opcode, exercising framing without a decoder.
++        return header;
++    }
++
++    private static void frame(Connection connection, long counter, boolean encrypted) throws Exception {
++        byte[] header = header(NAL.length + (encrypted ? 16 : 0));
++        header[4] = 0;
++        byte[] body = encrypted
++            ? AirPlayCrypto.INSTANCE.chachaSeal(new byte[32], AirPlayCrypto.INSTANCE.nonce64(counter), NAL, header)
++            : NAL;
++        connection.send(header);
++        connection.send(Arrays.copyOf(body, 3));
++        Thread.sleep(20);
++        connection.send(Arrays.copyOfRange(body, 3, body.length));
++        assertArrayEquals(ANNEX_B, connection.frames.poll(2_000, TimeUnit.MILLISECONDS));
++    }
++
++    @Test public void incompleteBodyTimesOut() throws Exception {
++        try (Connection connection = new Connection()) {
++            long started = System.nanoTime();
++            connection.send(header(811));
++            connection.send(new byte[11]);
++            connection.assertTimedOut(started);
++        }
++    }
++
++    @Test public void bodyDeadlineStartsBeforeItsFirstByte() throws Exception {
++        try (Connection connection = new Connection()) {
++            long started = System.nanoTime();
++            connection.send(header(811));
++            connection.assertTimedOut(started);
++        }
++    }
++
++    @Test public void incompleteHeaderTimesOut() throws Exception {
++        try (Connection connection = new Connection()) {
++            long started = System.nanoTime();
++            connection.send(new byte[17]);
++            connection.assertTimedOut(started);
++        }
++    }
++
++    @Test public void idleBetweenPacketsIsAllowed() throws Exception {
++        try (Connection connection = new Connection()) {
++            frame(connection, 0, false);
++            assertFalse("quiet screen disconnected", connection.ended.await(11_000, TimeUnit.MILLISECONDS));
++            frame(connection, 0, false);
++            connection.send(header(0));
++            connection.finish();
++        }
++    }
++
++    @Test public void normalFragmentedPacketsComplete() throws Exception {
++        try (Connection connection = new Connection()) {
++            byte[] header = header(200);
++            connection.send(Arrays.copyOf(header, 17));
++            Thread.sleep(1_100);
++            connection.send(Arrays.copyOfRange(header, 17, header.length));
++            connection.send(new byte[100]);
++            Thread.sleep(1_100);
++            connection.send(new byte[100]);
++            connection.finish();
++        }
++    }
++
++    @Test public void tricklingBodyDoesNotExtendDeadline() throws Exception {
++        try (Connection connection = new Connection()) {
++            long started = System.nanoTime();
++            connection.send(header(811));
++            while (TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started) < 13_000
++                    && connection.ended.getCount() > 0) {
++                try { connection.send(new byte[1]); }
++                catch (IOException closedByReceiver) { break; }
++                Thread.sleep(700);
++            }
++            assertTrue("trickle extended the deadline", connection.ended.await(2_000, TimeUnit.MILLISECONDS));
++            connection.assertTimedOut(started);
++        }
++    }
++
++    @Test public void encryptedFramesRetainNonceAndPayload() throws Exception {
++        try (Connection connection = new Connection()) {
++            frame(connection, 0, true);
++            frame(connection, 1, true);
++            connection.finish();
++            assertTrue("duplicate frame", connection.frames.isEmpty());
++        }
++    }
++
++    @Test public void invalidAuthenticationTagIsRejected() throws Exception {
++        try (Connection connection = new Connection()) {
++            byte[] header = header(NAL.length + 16);
++            header[4] = 0;
++            byte[] body = AirPlayCrypto.INSTANCE.chachaSeal(new byte[32],
++                AirPlayCrypto.INSTANCE.nonce64(0), NAL, header);
++            body[body.length - 1] ^= 1;
++            connection.send(header);
++            connection.send(body);
++            assertTrue("bad tag did not close stream", connection.ended.await(2_000, TimeUnit.MILLISECONDS));
++            assertNotNull("bad tag accepted", connection.cause.get());
++            assertTrue("unauthenticated frame delivered", connection.frames.isEmpty());
++        }
++    }
++
++    private static void explicitClose(boolean partialBody) throws Exception {
++        try (Connection connection = new Connection()) {
++            // A valid callback confirms the receive loop is running before close().
++            frame(connection, 0, false);
++            if (partialBody) {
++                connection.send(header(811));
++                connection.send(new byte[11]);
++            }
++            connection.screen.close();
++            connection.worker.join(2_000);
++            assertFalse("close did not stop receive worker", connection.worker.isAlive());
++            assertEquals("intentional close notified a failure", 1L, connection.ended.getCount());
++        }
++    }
++
++    @Test public void explicitCloseStopsIdleRead() throws Exception { explicitClose(false); }
++    @Test public void explicitCloseStopsIncompleteBodyRead() throws Exception { explicitClose(true); }
++}

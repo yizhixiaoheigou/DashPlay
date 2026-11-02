@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <dimen name="gutter">20dp</dimen>
+    <dimen name="gap">16dp</dimen>
+    <dimen name="radius">16dp</dimen>
+    <dimen name="pad">18dp</dimen>
+    <dimen name="text_title">28sp</dimen>
+    <dimen name="text_head">23sp</dimen>
+    <dimen name="text_body">17sp</dimen>
+    <dimen name="text_small">15sp</dimen>
+    <dimen name="text_tiny">13sp</dimen>
+    <dimen name="button_height">52dp</dimen>
+    <dimen name="row_height">56dp</dimen>
+    <dimen name="dot">30dp</dimen>
+    <dimen name="qr">104dp</dimen>
+    <dimen name="focus_stroke">4dp</dimen>
+    <dimen name="content_max">560dp</dimen>
+</resources>

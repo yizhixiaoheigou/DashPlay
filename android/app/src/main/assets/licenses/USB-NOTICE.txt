@@ -1,0 +1,10 @@
+DashPlay Android USB transport includes code from WheelPlay (GPL-3.0):
+https://github.com/fython/wheelplay
+Commit: c1bd07717c8e87a3130ef03477d2ca318fb66caa
+
+Ported files: Ntb16Codec, EthernetIpv6Codec, NcmFunctionDiscovery,
+IphoneCarPlayConfiguration, NcmUsbBridge, and codec tests.
+NcmUsbBridge is adapted to retain Android 5-7 compatibility and use standard IOException errors.
+The rest of the receiver is built from PlayPort and DashPlay's shared patches;
+see the repository opensource/NOTICE.md for protocol and dependency attribution.
+No CarPlay authentication identity is included.
