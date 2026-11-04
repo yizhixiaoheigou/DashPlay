@@ -188,7 +188,14 @@ def save_json(path: Path, value):
                 out.flush()
                 os.fsync(out.fileno())
             Path(name).replace(path)
-            os.sync()   # saved settings must survive switching the car off
+            # The rename must reach the disk too (the root fs commits only every 120 s; settings must survive
+            # switching the car off). Fsync the directory alone: os.sync() also flushed the mirrored logs and
+            # stalled the saving thread on every one of the summary page's half-dozen saves.
+            dirfd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dirfd)
+            finally:
+                os.close(dirfd)
         finally:
             Path(name).unlink(missing_ok=True)
 
@@ -350,7 +357,7 @@ class Scanner:
     def __init__(self, interface, own_ssid, mode, platform=None):
         self.platform = platform or get_platform(interface)
         self.interface, self.own_ssid, self.mode = interface, own_ssid, mode
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()   # reentrant: results() holds it while calling sorted()
         self.seen = {}   # ssid -> (entry, last seen)
         self.at = None
         self.busy = False   # a scan runs on its own thread (refresh)
@@ -379,7 +386,9 @@ class Scanner:
             return self.sorted()
 
     def sorted(self):
-        return sorted((entry for entry, _ in list(self.seen.values())), key=lambda item: -item["signal"])
+        # Under the lock: listing() reads from the page's thread while a scan thread inserts.
+        with self.lock:
+            return sorted((entry for entry, _ in self.seen.values()), key=lambda item: -item["signal"])
 
     def refresh(self, fresh=False):
         """results() on its own thread. The first list is two scans, several seconds (N1, 2026-10-17: "next" to the

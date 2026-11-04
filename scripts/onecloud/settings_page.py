@@ -228,12 +228,20 @@ class SettingsPage:
         page = self
 
         class Handler(BaseHTTPRequestHandler):
+            # The allowed networks change with the box's own interfaces, not per request: the page re-asks on
+            # every reload (pairing: every 3 s), and on Debian each ask forked one `ip` process (review 2026-11-04).
+            allowed_nets = []
+            allowed_at = 0.0
+            timeout = 30   # a client that stops mid-request must not hold its thread and socket forever
+
             def log_message(self, *_):   # keep tokens/passwords out of the journal
                 pass
 
             def _allowed(self):
                 client = ipaddress.ip_address(self.client_address[0].removeprefix("::ffff:"))
-                return client.is_loopback or any(client in net for net in page.allowed())
+                if time.monotonic() - Handler.allowed_at > 5:
+                    Handler.allowed_nets, Handler.allowed_at = page.allowed(), time.monotonic()
+                return client.is_loopback or any(client in net for net in Handler.allowed_nets)
 
             def _send(self, code, body, ctype="text/html; charset=utf-8", extra=None):
                 data = body if isinstance(body, bytes) else body.encode()
@@ -276,8 +284,11 @@ class SettingsPage:
             def do_POST(self):
                 if not self._allowed():
                     return self._send(403, "forbidden")
-                length = int(self.headers.get("Content-Length") or 0)
-                if length > (CERT_BODY if self.path == "/cert" else MAX_BODY):
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    return self._send(400, "bad length")
+                if not 0 <= length <= (CERT_BODY if self.path == "/cert" else MAX_BODY):
                     return self._send(413, "too large")
                 form = {k: v[0] for k, v in urllib.parse.parse_qs(self.rfile.read(length).decode(),
                                                                  keep_blank_values=True).items()}
@@ -307,6 +318,15 @@ class SettingsPage:
                 self._send(303, "", extra={"Location": back + urllib.parse.urlencode({"m": result})})
 
         self.server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+        report_error = self.server.handle_error
+
+        def quiet_error(request, client_address, error):
+            # The page reloads every few seconds; a browser or captive window abandoning a load is normal,
+            # not a traceback in the journal (and the log mirror below it).
+            if not isinstance(error, (ConnectionError, TimeoutError)):
+                report_error(request, client_address, error)
+
+        self.server.handle_error = quiet_error
         threading.Thread(target=self.server.serve_forever, name="settings-page", daemon=True).start()
 
     def stop(self):

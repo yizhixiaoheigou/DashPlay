@@ -560,20 +560,24 @@ def main():
         # The JVM needs several seconds before it first invites the iPhone: start it on what the Wi-Fi
         # configuration says while the radio comes up, and check it against the live Wi-Fi below.
         early = None
+        planned = None
         if have_identity:
             early, _ = platform.handoff(config["wifi"], live=False, external=config)
             if early:
                 ensure_leaf(state, [config["name"], setup_wizard.MDNS_NAME], [str(early["address"].ip)])
                 launch(early, has_bluez, wait=True)
                 mark(f"receiver launched early for {early['ssid']}")
+            planned = early   # the same look below would run the same three commands again
+        else:
+            planned = platform.handoff(config["wifi"], live=False, external=config)[0]
 
         # The Wi-Fi comes up some seconds after procd starts us; wait for it rather than fail. The settings page
         # opens meanwhile, so that a Wi-Fi that never comes up (the router's own switched off) still leaves a page
         # saying why (2026-10-19).
         reason = ""
         network = None
-        planned = early or platform.handoff(config["wifi"], live=False, external=config)[0]
         settings_open = False
+        waited = 0
         while not stopped.is_set():
             network, why = platform.handoff(config["wifi"], external=config)
             if network:
@@ -593,7 +597,11 @@ def main():
                 settings_open = True
                 say(f"settings page open on {host} while waiting for the Wi-Fi")
                 continue
-            stopped.wait(1)
+            # A Wi-Fi still down after half a minute is off or misconfigured, not slow: each look runs two
+            # ubus calls and an iw, far too often to keep up at 1 Hz for hours (F50, review 2026-11-04).
+            interval = 1 if waited < 30 else 5
+            stopped.wait(interval)
+            waited += interval
         if stopped.is_set():
             raise InterruptedError("Service stopping")
         status.pop("warning", None)

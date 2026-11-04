@@ -173,6 +173,9 @@ status();setInterval(status,3000);
 def make_server(root, token, address):
     root = Path(root)
     operation = threading.Lock()
+    current = [None, 0.0]   # installed version, checked when: /api/status is polled every 3 s and on
+                            # OpenWrt each look listed every installed package (apk info, one fork per poll)
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
@@ -198,7 +201,9 @@ def make_server(root, token, address):
                 return self.send(403, {'error': '请从盒子设置重新打开版本选择，或使用之前收藏的完整链接。'})
             try:
                 if self.path == '/api/status':
-                    return self.send(200, {'manager': 1, 'current': update.current_version(root, update.is_openwrt()),
+                    if current[0] is None or time.monotonic() - current[1] > 60:
+                        current[:] = [update.current_version(root, update.is_openwrt()), time.monotonic()]
+                    return self.send(200, {'manager': 1, 'current': current[0],
                         'previous': update.read(root / 'state/version-manager/previous.json').get('version'),
                         'busy': operation.locked() or update.running(root),
                         'progress': update.read(root / 'state/update-status.json')})
@@ -230,6 +235,7 @@ def make_server(root, token, address):
                     finally:
                         operation.release()
                 threading.Thread(target=work, name='version-install', daemon=True).start()
+                current[0] = None   # the install swaps the program; show the new version once it settles
                 self.send(202, {'message': '正在核对并安装所选版本，请保持供电。'})
             except Exception as error:
                 self.send(400, {'error': str(error)})
