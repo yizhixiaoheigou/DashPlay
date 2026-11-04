@@ -67,6 +67,14 @@ def derived_address(key, purpose):
     return ":".join(f"{b:02x}" for b in raw)
 
 
+def signal_group(pid, sig):
+    """Signal a child's process group; it may exit between poll() and here (ESRCH; board_zte_f50 catches the same)."""
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        pass
+
+
 def ap_width(channel, width):
     """The widest of width that the channel allows: 2.4 GHz and channel 165 have no 80 MHz block."""
     if channel <= 14 or channel == 165:
@@ -114,8 +122,11 @@ def hostapd_config(interface, channel, width, ssid, passphrase, country="CN"):
             # 149/157 pair upward, 153/161 downward; 165 has no 40 MHz partner.
             lines.append("ht_capab=[HT40+]" if channel in (36, 44, 149, 157) else "ht_capab=[HT40-]")
         if width == 80:
-            centre = {149: 155, 153: 155, 157: 155, 161: 155, 36: 42, 40: 42, 44: 42, 48: 42}[channel]
-            lines += ["vht_oper_chwidth=1", f"vht_oper_centr_freq_seg0_idx={centre}"]
+            # The DFS channels (52-144) have no 80 MHz block here: fall back to 40 MHz instead of failing
+            # (a channel out of the map once restarted the service in a loop over one config line).
+            centre = {149: 155, 153: 155, 157: 155, 161: 155, 36: 42, 40: 42, 44: 42, 48: 42}.get(channel)
+            if centre:
+                lines += ["vht_oper_chwidth=1", f"vht_oper_centr_freq_seg0_idx={centre}"]
     return "\n".join(lines) + "\n"
 
 def supports_sta_ap(iw_list):
@@ -348,11 +359,11 @@ class DebianPlatform:
             if entry[0] == name:
                 self.children.remove(entry)
                 if entry[1].poll() is None:
-                    os.killpg(entry[1].pid, signal.SIGTERM)
+                    signal_group(entry[1].pid, signal.SIGTERM)
                     try:
                         entry[1].wait(timeout=8)
                     except subprocess.TimeoutExpired:
-                        os.killpg(entry[1].pid, signal.SIGKILL)
+                        signal_group(entry[1].pid, signal.SIGKILL)
                         entry[1].wait()
 
     def check_lan_children(self):
@@ -1092,8 +1103,12 @@ class DebianPlatform:
             return
         ap, self.ap_interface = self.ap_interface, saved.get('interface') or self.ap_interface
         try:
-            for table, rule in reversed(self.usb_tether_rules(ipaddress.ip_network(saved['network']))):
-                subprocess.run(['iptables', *table, '-D', *rule], capture_output=True, timeout=5)
+            if saved.get('network'):
+                for table, rule in reversed(self.usb_tether_rules(ipaddress.ip_network(saved['network']))):
+                    subprocess.run(['iptables', *table, '-D', *rule], capture_output=True, timeout=5)
+        except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
+            # A damaged journal must not take the service down; sharing is best undone, not guaranteed.
+            print(f"usb sharing cleanup incomplete: {type(error).__name__}", flush=True)
         finally:
             self.ap_interface = ap
         subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=' + str(saved.get('forward', '0'))],
@@ -1111,35 +1126,45 @@ class DebianPlatform:
             subprocess.run(['iptables', *table, '-I', *rule], check=True, capture_output=True, timeout=5)
 
     def cleanup_phone_uplink(self):
+        """Undo a previous boot's phone uplink. Best effort: a journal left by a crash names an interface that
+        may be gone (another dongle), and one failed restore must not restart-loop the whole service."""
         path = self.run / 'phone-uplink.json'
-        if not path.exists():
+        try:
+            saved = json.loads(path.read_text())
+        except (OSError, ValueError):
+            path.unlink(missing_ok=True)
             return
-        saved = json.loads(path.read_text())
-        self.stop_child('wpa_supplicant')
-        self.remove_sta_network()
-        if saved.get('network'):
-            for table, rule in reversed(self.phone_nat_rules(ipaddress.ip_network(saved['network']))):
-                subprocess.run(['iptables', *table, '-D', *rule], capture_output=True, timeout=5)
-        subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=' + saved['forward']],
-                       capture_output=True, check=True, timeout=5)
-        subprocess.run(['iw', 'dev', 'ap0', 'del'], capture_output=True, timeout=5)
-        for args in (['down'], ['address', saved['mac']]):
-            subprocess.run(['ip', 'link', 'set', 'dev', saved['interface'], *args],
-                           check=True, capture_output=True, timeout=5)
-        subprocess.run(['ip', 'addr', 'flush', 'dev', saved['interface']], check=True, capture_output=True, timeout=5)
-        self.ap_interface = self.interface
-        path.unlink()
+        try:
+            self.stop_child('wpa_supplicant')
+            self.remove_sta_network()
+            if saved.get('network'):
+                for table, rule in reversed(self.phone_nat_rules(ipaddress.ip_network(saved['network']))):
+                    subprocess.run(['iptables', *table, '-D', *rule], capture_output=True, timeout=5)
+            subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=' + str(saved.get('forward', '0'))],
+                           capture_output=True, timeout=5)
+            subprocess.run(['iw', 'dev', 'ap0', 'del'], capture_output=True, timeout=5)
+            interface = saved.get('interface')
+            if interface:
+                for args in (['down'], ['address', saved.get('mac', '')]):
+                    subprocess.run(['ip', 'link', 'set', 'dev', interface, *args],
+                                   capture_output=True, timeout=5)
+                subprocess.run(['ip', 'addr', 'flush', 'dev', interface], capture_output=True, timeout=5)
+        except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
+            print(f"phone uplink cleanup incomplete: {type(error).__name__}", flush=True)
+        finally:
+            self.ap_interface = self.interface
+            path.unlink(missing_ok=True)
 
     def stop_all(self):
         for name, child in reversed(self.children):
             if child.poll() is None:
-                os.killpg(child.pid, signal.SIGTERM)
+                signal_group(child.pid, signal.SIGTERM)
                 try:
                     # The JVM writes its AppCDS archive while exiting; that took longer than 8 s here. A board's
                     # Bluetooth helper stops its own children within 6 s (board_zte_f50.py).
                     child.wait(timeout={"receiver": 40, "bluetooth": 15}.get(name, 8))
                 except subprocess.TimeoutExpired:
-                    os.killpg(child.pid, signal.SIGKILL)
+                    signal_group(child.pid, signal.SIGKILL)
                     child.wait()
 
     def join_log(self):

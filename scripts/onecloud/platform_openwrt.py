@@ -201,8 +201,13 @@ class OpenWrtPlatform(DebianPlatform):
         device, address = interface_address(_ubus(f"network.interface.{network['network']}"))
         if not address:
             return None, f"network {network['network']} for Wi-Fi {network['ssid']} has no IPv4 address yet"
-        info = subprocess.run(["iw", "dev", network["ifname"], "info"], capture_output=True, text=True,
-                              timeout=5).stdout if live and network["ifname"] else ""
+        info = ""
+        if live and network["ifname"]:
+            try:   # like _ubus above: a stuck call must not take the waiting service down with it
+                info = subprocess.run(["iw", "dev", network["ifname"], "info"], capture_output=True,
+                                      text=True, timeout=5).stdout
+            except (OSError, subprocess.SubprocessError):
+                pass
         channel = parse_channel(info) or (int(network["channel"]) if str(network["channel"]).isdigit() else None)
         if not channel:
             return None, f"Wi-Fi {network['ssid']} has no channel yet"
