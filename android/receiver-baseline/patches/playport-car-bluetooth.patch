@@ -1,0 +1,156 @@
+Music, calls and Siri over the car's own Bluetooth as switches of their own (2026-10-14, split out of Tesla mode
+for any car paired with the iPhone): receiver-access.json "carMusic": true (box: OpenWrt dashplay.main.car_music,
+the settings page elsewhere) makes the page leave the media card and keys to the car, close its audio output when
+idle, boost prompts and name Siri / calls / prompts in its title; "tesla": true (Tesla mode) implies it and adds
+only the Tesla browser's ways (fullscreen through a listed video site, microphone gain 4). Calls and Siri on the
+car (--car-voice, box car_voice) were a receiver option already; its comments no longer say Tesla only.
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayConfig.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayConfig.kt
+@@ -61,7 +61,7 @@
+     val hevc: Boolean = false,
+     val disableAudioOutput: Boolean = false,
+     val microphone: Boolean = false,
+-    /** false: offer no call and no Siri audio, so the iPhone keeps them on the car's own Bluetooth (DashPlay Tesla mode). */
++    /** false: offer no call and no Siri audio, so the iPhone keeps them on the car's own Bluetooth (DashPlay car_voice). */
+     val callsAndSiri: Boolean = true,
+     val manufacturer: String = "xcertplay",
+     val model: String = "xcertplay",
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt
+@@ -132,7 +132,7 @@
+         val wirelessInput = if (microphone) pcmMono or opus else null
+ 
+         // callsAndSiri false: no call and no Siri audio, the iPhone keeps them on the car's own Bluetooth (DashPlay
+-        // Tesla mode, 2026-10-14); the receiver plays prompts, alerts and music only.
++        // car_voice, found in a Tesla, 2026-10-14); the receiver plays prompts, alerts and music only.
+         return listOfNotNull(
+             format(100, "compatibility", pcm, pcmInput),
+             format(101, "compatibility", pcm),
+--- a/server/src/main/kotlin/com/playport/server/ServerConfig.kt
++++ b/server/src/main/kotlin/com/playport/server/ServerConfig.kt
+@@ -20,7 +20,8 @@
+     /** View areas of the display (the page's window shapes) and the one CarPlay starts in. */
+     val displayAreas: List<ViewArea> = emptyList(),
+     val displayArea: Int = 0,
+-    /** Calls and Siri on the car's own Bluetooth (Tesla mode, 2026-10-14): no microphone, no call or Siri audio. */
++    /** Calls and Siri on the car's own Bluetooth (DashPlay car_voice, part of Tesla mode; 2026-10-14): no microphone,
++     *  no call or Siri audio. */
+     val carVoice: Boolean = false,
+     val rightHandDrive: Boolean = false,
+     val bindAddress: String? = null,
+--- a/web/src/audio.ts
++++ b/web/src/audio.ts
+@@ -36,8 +36,8 @@
+    *  hard to hear at 1 (2026-10-14). 1 leaves them as sent. */
+   private readonly promptBoost: number;
+   private promptLimiter: DynamicsCompressorNode | null = null;
+-  /** Tesla mode: the car takes a browser that has an audio output open, even a silent one, for a music source and
+-   *  switched its media card between it and the iPhone's Bluetooth over and over (2026-10-14). The output is closed
++  /** Music over the car's Bluetooth: a Tesla took a browser that has an audio output open, even a silent one, for a
++   *  music source and switched its media card between it and the iPhone's Bluetooth over and over (2026-10-14). The output is closed
+    *  (context suspended) a few seconds after the last stream ends and opened again for the next prompt or call. */
+   private readonly idleClose: boolean;
+   private idleTimer = 0;
+--- a/web/src/boot.ts
++++ b/web/src/boot.ts
+@@ -11,11 +11,15 @@
+   try {
+     const response = await fetch('./receiver-access.json', { cache: 'no-store', credentials: 'same-origin' });
+     if (!response.ok) return;
+-    const value = await response.json() as { token?: string; settingsPort?: number; tesla?: boolean };
++    const value = await response.json() as { token?: string; settingsPort?: number; carMusic?: boolean; tesla?: boolean };
+     if (typeof value.token === 'string' && /^[0-9a-f]{32}$/.test(value.token)) localStorage.setItem('playport-token', value.token);
+     if (Number.isInteger(value.settingsPort)) (window as unknown as { playportBoxSettingsPort?: number }).playportBoxSettingsPort = value.settingsPort;
+-    // Tesla mode, set on the box (OpenWrt: uci dashplay.main.tesla_mode): music over the car's Bluetooth, prompts louder.
+-    (window as unknown as { playportTeslaMode?: boolean }).playportTeslaMode = value.tesla === true;
++    // Set on the box: carMusic, the music goes over the car's own Bluetooth (OpenWrt dashplay.main.car_music, settings
++    // page); tesla, the Tesla browser's ways (fullscreen through a listed video site, a quieter microphone). Tesla
++    // mode (dashplay.main.tesla_mode) sets both.
++    const flags = window as unknown as { playportCarMusic?: boolean; playportTeslaMode?: boolean };
++    flags.playportTeslaMode = value.tesla === true;
++    flags.playportCarMusic = value.carMusic === true || value.tesla === true;
+   } catch { /* No box behind this page, or storage blocked: the page asks for a token as before. */ }
+ }
+ start();
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -117,16 +117,19 @@
+   }
+   lastPaintAt = now;
+ }, () => send({ type:'keyframe' }), fit);
+-// Tesla mode, turned on by the person on the box (2026-10-14): the music goes to the car over Bluetooth, so the
+-// steering wheel, media card and volume are the car's own; this page plays only prompts and calls, prompts boosted.
+-// ?promptgain=1..8 overrides the boost.
+-const teslaMode = (window as unknown as { playportTeslaMode?: boolean }).playportTeslaMode === true;
+-const promptGain = Number(new URLSearchParams(location.search).get('promptgain')) || (teslaMode ? 3 : 1);
++// Music over the car's Bluetooth, turned on by the person on the box (found in a Tesla, 2026-10-14; any car paired
++// with the iPhone): the steering wheel, media card and volume are the car's own; this page plays prompts (boosted)
++// and whatever else the iPhone still sends. ?promptgain=1..8 overrides the boost. Tesla mode sets it too, and adds
++// the Tesla browser's ways (fullscreen below, microphone gain in mic.ts).
++const boxFlags = window as unknown as { playportCarMusic?: boolean; playportTeslaMode?: boolean };
++const carMusic = boxFlags.playportCarMusic === true;
++const teslaMode = boxFlags.playportTeslaMode === true;
++const promptGain = Number(new URLSearchParams(location.search).get('promptgain')) || (carMusic ? 3 : 1);
+ // Music the iPhone still sends here is played: it sends music to one place at a time, and after Siri from the
+ // CarPlay screen it sent it here for ~27 s before going back to the car's Bluetooth, silent while it was dropped.
+-const audio = new AudioEngine(error, { promptBoost: promptGain, idleClose: teslaMode });
+-/** Tesla mode: the car's media card shows the page's title and address whenever the page sounds (Siri, prompts,
+- *  calls); name it instead (2026-10-14). The last voice stream to start wins; the title goes back when none is left. */
++const audio = new AudioEngine(error, { promptBoost: promptGain, idleClose: carMusic });
++/** Music over the car's Bluetooth: the car's media card shows the page's title and address whenever the page sounds
++ *  (Siri, prompts, calls; a Tesla, 2026-10-14); name it instead. The last voice stream to start wins; the title goes back when none is left. */
+ const voiceLabels: Record<string, string> = { speechrecognition: 'Siri', telephony: '通话', default: '导航播报' };
+ const voices = new Map<number, string>();
+ function showVoice() {
+@@ -135,14 +138,14 @@
+   media.announce(label);
+ }
+ function voiceStarted(streamType: number, name: string) {
+-  if (!teslaMode) return;
++  if (!carMusic) return;
+   voices.delete(streamType);
+   if (voiceLabels[name]) voices.set(streamType, voiceLabels[name]);
+   showVoice();
+ }
+-function voiceStopped(streamType: number) { if (teslaMode && voices.delete(streamType)) showVoice(); }
++function voiceStopped(streamType: number) { if (carMusic && voices.delete(streamType)) showVoice(); }
+ const lag = new LagProbe();
+-const media = new SystemMedia(send, () => { void audio.unlock().catch(error); }, () => audio.pauseMusic(), teslaMode);
++const media = new SystemMedia(send, () => { void audio.unlock().catch(error); }, () => audio.pauseMusic(), carMusic);
+ const microphone = new MicrophoneUplink((payload, opus) => {
+   const frame = new Uint8Array(payload.length + 1); frame[0] = opus ? 0x11 : 0x10; frame.set(payload, 1); connection.sendBinary(frame);
+ }, message => { el('mic-status').textContent = message; });
+@@ -478,7 +481,7 @@
+   send({type:'stats',stats:{fps:reportFrames/seconds,decodeMs:video.decodeLatencyMs,queue:video.decodeQueueSize,
+     kbps:reportBytes*8/1000/seconds,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,
+     width:canvas.width,height:canvas.height,...(touchCount?{touchMs:touchSum/touchCount,touches:touchCount}:{}),...(musicBytes?{musicKbps:musicBytes*8/1000/seconds}:{}),
+-    chrome:chromeMajor,build:BUILD,webView,teslaMode:teslaMode?1:0,promptGain,...(revived?{revived}:{}),fastDecoder:fastDecoder()?1:0,hevcDecodes:hevcDecodes?1:0,hevc:display?.hevc?1:0,...microphone.report(),...audio.farReport(),...media.report(),...musicTimeline(),...audio.musicReport(),...video.takeStalls(),...lag.take(performance.now())}});
++    chrome:chromeMajor,build:BUILD,webView,carMusic:carMusic?1:0,teslaMode:teslaMode?1:0,promptGain,...(revived?{revived}:{}),fastDecoder:fastDecoder()?1:0,hevcDecodes:hevcDecodes?1:0,hevc:display?.hevc?1:0,...microphone.report(),...audio.farReport(),...media.report(),...musicTimeline(),...audio.musicReport(),...video.takeStalls(),...lag.take(performance.now())}});
+   judgeDecoder(video.decodeLatencyMs, reportFrames/seconds);
+   reportFrames=0;reportBytes=0;reportStart=now;touchSum=0;touchCount=0;musicBytes=0;
+ },10000);
+--- a/web/src/media-session.ts
++++ b/web/src/media-session.ts
+@@ -46,8 +46,9 @@
+   private refreshMetadata() {
+     if (this.supported) navigator.mediaSession.metadata = this.active && typeof MediaMetadata !== "undefined" ? new MediaMetadata(this.info) : null;
+   }
+-  /** Off in Tesla mode: the car took the page for a second music source beside the iPhone on its Bluetooth, paused
+-   *  one for the other (its pause reached the page and went on to the iPhone) and the two kept fighting (2026-10-14).
++  /** Off with the music over the car's Bluetooth: a Tesla took the page for a second music source beside the
++   *  iPhone, paused one for the other (its pause reached the page and went on to the iPhone) and the two kept
++   *  fighting (2026-10-14).
+    *  There the music is the car's own; the page names no song and passes on no media key. */
+   readonly supported: boolean;
+   /** Whether the iPhone says it plays; undefined while it has not said. */
+@@ -79,8 +80,8 @@
+     }
+   }
+   private command(index: number) { if (this.active) this.send({ type: 'media', media: index }); }
+-  /** While Siri, a call or a prompt sounds from this page and no music does (Tesla mode): what the car's media card
+-   *  shows instead of the page address (a Tesla showed the page and its address during Siri, 2026-10-14). null
++  /** While Siri, a call or a prompt sounds from this page and no music does (music over the car's Bluetooth): what
++   *  the card shows instead of the page address (a Tesla showed the page and its address during Siri, 2026-10-14). null
+    *  puts the song back. */
+   announce(label: string | null) {
+     if (!this.supported || typeof MediaMetadata === 'undefined') return;

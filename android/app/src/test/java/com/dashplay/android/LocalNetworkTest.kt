@@ -7,6 +7,26 @@ import org.junit.Test
 class LocalNetworkTest {
     private fun address(name: String, ip: String) = name to InetAddress.getByName(ip)
 
+    @Test fun systemHotspotModeWaitsInsteadOfServingTheUplink() {
+        assertNull(LocalNetwork.choose(listOf(address("eth1", "192.168.5.111"),
+            address("wlan0", "192.168.5.104")), setOf("eth1", "wlan0"),
+            requireHotspot = true))
+    }
+
+    @Test fun sy910SystemHotspotUsesItsRandomAddressWithEthernetPresent() {
+        val selected = LocalNetwork.choose(listOf(address("eth1", "192.168.5.111"),
+            address("wlan0", "192.168.43.204")), setOf("eth1"),
+            clientKinds = mapOf("eth1" to LocalNetwork.Kind.ETHERNET), requireHotspot = true)!!
+        assertEquals("wlan0", selected.name)
+        assertEquals("192.168.43.204", selected.address.hostAddress)
+        assertEquals(LocalNetwork.Kind.HOTSPOT, selected.kind)
+    }
+
+    @Test fun systemHotspotModeDoesNotGuessClientWifiWhenMetadataFails() {
+        assertNull(LocalNetwork.choose(listOf(address("wlan0", "192.168.5.104")), null,
+            requireHotspot = true))
+    }
+
     @Test fun xiaomiConcurrentHotspotHasRandomHostAndWlan2() {
         val choice = LocalNetwork.choose(listOf(address("wlan0", "192.168.20.45"), address("wlan2", "10.123.45.162")), setOf("wlan0"))!!
         assertEquals("wlan2", choice.name)

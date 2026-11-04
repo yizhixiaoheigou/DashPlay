@@ -1,0 +1,168 @@
+Viewer: window shapes keep their true proportions, the whole set fitted to the stream once (2026-10-22).
+
+Each shape was fitted on its own to at least 1280 on the long side, so a split screen's third grew to
+1280 like the full window, and CarPlay, which lays out by physical width, showed both the same amount.
+A shape is now the window's CSS size times the pixels used (windowShape), and areaPlan fits the whole
+set with one factor into 1280..max (2560 with a fast decoder). Stored shapes move to f50-window-shapes;
+the old f50-view-areas records were already fitted and are dropped. Tests: thirds, a 2x Mac at 2560,
+and a small page alone.
+
+--- a/web/src/display-fit.ts
++++ b/web/src/display-fit.ts
+@@ -36,13 +36,27 @@
+ }
+ /** Both orientations are declared together only while the stream grows by at most this much over one orientation's. */
+ export const MIXED_GROWTH = 1.1;
++/** A window's shape as remembered for view areas: its CSS size times the pixels used (1, or the device pixel ratio with
++ *  a fast decoder), not yet fitted to the stream's limits: areaPlan fits the whole set at once, so the shapes keep their
++ *  true proportions (2026-10-22: each fitted on its own, a split screen's third grew to 1280 like the full screen, and
++ *  CarPlay, which lays out by physical width, showed both the same). */
++export function windowShape(cssWidth: number, cssHeight: number, pixels: number): Area {
++  return { width: Math.max(2, Math.round(cssWidth * pixels / 2) * 2), height: Math.max(2, Math.round(cssHeight * pixels / 2) * 2) };
++}
++/** The factor that brings a stream of `width` x `height` (the envelope of the shapes) within suggestedResolution's
++ *  limits: the long side 1280 to `max`, the short side at least 480. */
++function fitFactor(width: number, height: number, max: number) {
++  const long = Math.max(width, height), short = Math.min(width, height);
++  const factor = long > max ? max / long : long < 1280 ? 1280 / long : 1;
++  return Math.max(factor, 480 / Math.max(1, short));
++}
+ /** View areas (2026-10-14): each window shape the browser has shown (normal, fullscreen, the car's dock shown or not)
+  *  becomes an area at the stream's top left, the stream as large as all of them. A shape seen before is reached by
+  *  switching area, without reconnecting CarPlay; a new shape, or one that wants a clearly sharper size, declares the
+  *  areas again (one reconnect). Returns what to send and the shapes to keep, or null when nothing changes.
+  *  The shapes are kept most recently used last; the areas declared are the most recent ones, ordered by size, so the
+  *  same shapes always make the same areas whichever of them the window has now (2026-10-21). */
+-export function areaPlan<T extends AreaDisplay>(display: T, target: Area, hevc: boolean, known: Area[]): { display: T; shapes: Area[] } | null {
++export function areaPlan<T extends AreaDisplay>(display: T, target: Area, hevc: boolean, known: Area[], max = 1920): { display: T; shapes: Area[] } | null {
+   const landscape = (s: Area) => s.width >= s.height, wide = landscape(target);
+   const all = known.filter(s => s.width > 0 && s.height > 0).map(s => ({ width: s.width, height: s.height }));
+   let found = all.findIndex(s => landscape(s) === wide && !aspectChanged(s, target));
+@@ -63,8 +77,11 @@
+       pixels(recent) <= MIXED_GROWTH * Math.max(pixels(ofOrientation(true)), pixels(ofOrientation(false)))) chosen = recent;
+   chosen = [...chosen].sort((a, b) => a.width - b.width || a.height - b.height);
+   const at = chosen.indexOf(entry);
+-  const width = Math.max(...chosen.map(s => s.width)), height = Math.max(...chosen.map(s => s.height));
+-  const areas = chosen.length > 1 ? chosen : [];
++  // One factor for all: the stream within its limits, every area the same share of it as its window of the screen.
++  const factor = fitFactor(Math.max(...chosen.map(s => s.width)), Math.max(...chosen.map(s => s.height)), max);
++  const fitted = chosen.map(s => ({ width: Math.round(s.width * factor / 2) * 2, height: Math.round(s.height * factor / 2) * 2 }));
++  const width = Math.max(...fitted.map(s => s.width)), height = Math.max(...fitted.map(s => s.height));
++  const areas = fitted.length > 1 ? fitted : [];
+   const declared = display.areas ?? [];
+   const same = display.width === width && display.height === height && display.hevc === hevc &&
+     declared.length === areas.length && declared.every((a, i) => a.width === areas[i].width && a.height === areas[i].height);
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -6,7 +6,7 @@
+ import { Connection } from './ws';
+ import { SystemMedia } from './media-session';
+ import { LagProbe } from './lag';
+-import { suggestedResolution, areaPlan, areaSize, areaFor, sameStream, showsShape, frameRateCheck, type Area } from './display-fit';
++import { suggestedResolution, windowShape, areaPlan, areaSize, areaFor, sameStream, showsShape, frameRateCheck, type Area } from './display-fit';
+ import { t, language, setLanguage, type Key } from './i18n';
+ import { isNight, parseNightMode } from './night';
+ import { reachable, TESLA_HOPS } from './tesla-fullscreen';
+@@ -84,8 +84,11 @@
+   if (expectRestart || (holding && holdForDisplay)) return;
+   // With view areas the stream is larger than the area in use: the area fills the view from the top left and the
+   // rest of the picture lies outside it (areaSize, display-fit.ts).
++  // The area's share of the stream as declared: a stream decoded at another size than declared (a canvas scaled for
++  // the old UI size, 2026-10-22) cut the area's right and bottom off when measured against the decoded size.
+   const areas = display?.areas ?? [], area = areas.length > 1 ? areas[display?.area ?? 0] : undefined;
+-  const size = areaSize(canvas.width, canvas.height, area, screen.clientWidth, screen.clientHeight);
++  const size = area && display ? areaSize(display.width, display.height, area, screen.clientWidth, screen.clientHeight)
++    : areaSize(canvas.width, canvas.height, undefined, screen.clientWidth, screen.clientHeight);
+   surface.style.width = `${size.width}px`; surface.style.height = `${size.height}px`;
+   screen.classList.toggle('area', !!area);
+ }
+@@ -414,7 +417,7 @@
+   if (current && !expectRestart && !holding) { display = current; showDisplay(); }
+   if (busy() || !display) return;
+   const urgent = urgentChange; urgentChange = '';
+-  const target=autoTarget(), plan=areaPlan(display,target,wantHevc(),storedShapes());
++  const target=autoTarget(), plan=areaPlan(display,target,wantHevc(),storedShapes(),fastDecoder()?2560:1920);
+   if (!plan) return;
+   const next=plan.display,key=`${next.width}x${next.height}${next.hevc?'-h265':''}/${(next.areas??[]).map(a=>`${a.width}x${a.height}`).join(',')}/${next.area??0}`;
+   if (key===lastAutoTarget) return;
+@@ -428,27 +431,33 @@
+   const now = waits ? areaFor(display, target) : -1;
+   if (now >= 0 && now !== (display.area ?? 0) && !(await saveDisplay({ ...display, area: now }, { reason: 'area' }))) { error(t('autoFail')); return; }
+   if (!(await saveDisplay(next, { defer: waits, reason }))) { error(t('autoFail')); return; }
+-  saveFlag('f50-view-areas', JSON.stringify(plan.shapes));
++  saveFlag(SHAPES_KEY, JSON.stringify(plan.shapes));
+   fit();
+ }
+ /** The window shapes this browser has shown, kept as CarPlay view areas (areaPlan, display-fit.ts): switching
+  *  between them (fullscreen in and out, the car's dock, a Tesla's own fullscreen) moves CarPlay to another area
+  *  without reconnecting; only a shape seen the first time reconnects, once (2026-10-14, replacing the earlier
+  *  "renegotiate a close shape in fullscreen only, once per browser"). */
++/** Shapes as windowShape gives them since 2026-10-22; the earlier key held each shape fitted on its own, learned anew. */
++const SHAPES_KEY = 'f50-window-shapes';
+ function storedShapes(): Area[] {
+-  try { const value = JSON.parse(readFlag('f50-view-areas') || '[]'); return Array.isArray(value) ? value.filter(a => Number.isInteger(a?.width) && Number.isInteger(a?.height)) : []; }
++  try { const value = JSON.parse(readFlag(SHAPES_KEY) || '[]'); return Array.isArray(value) ? value.filter(a => Number.isInteger(a?.width) && Number.isInteger(a?.height)) : []; }
+   catch { return []; }
+ }
++/** This window's shape (windowShape, display-fit.ts): areaPlan fits it, with the others remembered, to the stream. */
+ function autoTarget() {
+   const pixels=fastDecoder()?Math.min(2,Math.max(1,window.devicePixelRatio||1)):1;
+-  return suggestedResolution(screen.clientWidth*pixels,screen.clientHeight*pixels,fastDecoder()?2560:1920);
++  return windowShape(screen.clientWidth,screen.clientHeight,pixels);
+ }
+ el<HTMLSelectElement>('codec').value = readFlag('f50-codec') || 'auto';
+ el<HTMLSelectElement>('codec').onchange=() => { saveFlag('f50-codec', el<HTMLSelectElement>('codec').value); lastAutoTarget=''; urgentChange='manual'; scheduleAuto(); };
+ autoFit.onchange=() => { localStorage.setItem('f50-auto-fit',String(autoFit.checked)); lastAutoTarget=''; urgentChange='manual'; render(); scheduleAuto(); };
+ el<HTMLFormElement>('display-form').onsubmit=event => {
+   event.preventDefault();
+-  const size=autoFit.checked?autoTarget():{width:Number(el<HTMLInputElement>('width').value),height:Number(el<HTMLInputElement>('height').value)};
++  // Automatic display keeps the box's stream and its areas, changing only frame rate, size or codec: sent without the
++  // areas, the largest window then showed less (2026-10-22).
++  const size:Pick<Display,'width'|'height'|'areas'|'area'>=autoFit.checked?(display?{width:display.width,height:display.height,areas:display.areas,area:display.area}:suggestedResolution(autoTarget().width,autoTarget().height,fastDecoder()?2560:1920))
++    :{width:Number(el<HTMLInputElement>('width').value),height:Number(el<HTMLInputElement>('height').value)};
+   if (![size.width,size.height].every(v=>Number.isInteger(v)&&v>=480&&v<=3840&&v%2===0)) { error(t('range')); return; }
+   void saveDisplay({...size,fps:Number(el<HTMLSelectElement>('fps').value),uiScale:Number(el<HTMLSelectElement>('ui-scale').value),hevc:wantHevc()},{reason:'manual'});
+ };
+@@ -466,7 +475,7 @@
+   connection.send({type:'stats',stats:{ev,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,width:screen.clientWidth,height:screen.clientHeight,want:wantFullscreen?1:0,...viewport()}});
+ }
+ /** Which page build runs (raised with each build tried in the car). */
+-const BUILD = 202610212300;
++const BUILD = 202610221200;
+ /** What the browser says of the space it gives the page, to find the car's bar over a fullscreen page (2026-10-13):
+  *  window, visual viewport (and its offset), screen, available screen, outer window, pixel ratio. */
+ function viewport(): Record<string, number> {
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -6,7 +6,7 @@
+   const {outputText}=ts.transpileModule(source,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ESNext}});
+   return import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
+ }
+-const {suggestedResolution,aspectChanged,shownSize,areaPlan,areaSize,areaFor,sameStream,showsShape,MAX_AREAS,frameRateCheck}=await load('display-fit');
++const {suggestedResolution,windowShape,aspectChanged,shownSize,areaPlan,areaSize,areaFor,sameStream,showsShape,MAX_AREAS,frameRateCheck}=await load('display-fit');
+ { // 60 fps the decoder cannot keep up with (Zeekr 7X): two 10 s reports in a row with two catch-ups each go to 30 fps.
+   let c=frameRateCheck(0,3,60);assert.deepEqual(c,{run:1,lower:false},'one report is not enough');
+   assert.deepEqual(frameRateCheck(c.run,2,60),{run:0,lower:true},'two in a row lower it');
+@@ -311,6 +311,22 @@
+   assert.equal(areaFor(xp4,side),-1,'a new one is not');
+   assert.equal(areaFor({width:1280,height:720,hevc:false},page),-1,'nor without areas');
+ }
++{ // A screen split in thirds (2026-10-22): the areas keep the windows' proportions, the set fitted to the stream at once
++  // (each shape fitted on its own made a third as wide as the full screen, and CarPlay showed both the same).
++  const full=windowShape(1280,720,1), two=windowShape(853,720,1), third=windowShape(427,720,1);
++  assert.deepEqual([two,third],[{width:854,height:720},{width:428,height:720}]);
++  let p=areaPlan({width:1280,height:720,hevc:true},two,true,[full]);
++  assert.deepEqual(p.display.areas,[two,full],'two thirds of the screen, two thirds of the stream');
++  p=areaPlan(p.display,third,true,p.shapes);
++  assert.deepEqual([p.display.width,p.display.height,p.display.areas],[1280,720,[third,two,full]],'the third joins at its own width');
++  // A Mac at 2x with a fast decoder: 1728x1000 CSS px is 3456x2000, fitted to 2560 together with its half.
++  const big=windowShape(1728,1000,2), half=windowShape(864,1000,2);
++  const m=areaPlan({width:1280,height:720,hevc:true},big,true,[half],2560);
++  assert.deepEqual([m.display.width,m.display.height,m.display.areas],[2560,1482,[{width:1280,height:1482},{width:2560,height:1482}]]);
++  assert.equal(m.display.area,1,'the large window in use');
++  // A small car page alone still gets at least 1280 on the long side, as suggestedResolution gave it.
++  assert.deepEqual(areaPlan({width:1280,height:720,hevc:false},windowShape(876,518,1),false,[]).display,
++    {width:1280,height:756,hevc:false,areas:[],area:0}); }
+ console.log('View areas: shapes learned once, switched without reconnecting.');
+ { // Tesla fullscreen leaves the page only when its video sites answer (offline Tesla, simulated 2026-10-14).
+   const {reachable,TESLA_HOPS}=await load('tesla-fullscreen');

@@ -1,0 +1,545 @@
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+index 08d8310..4113bf2 100644
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -86,6 +86,8 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+     @Volatile private var selectedPhone: String? = null
+     @Volatile private var invitedPhone: String? = null
+     @Volatile private var invitedAt = 0L
++    /** Explicit switch from the viewer: until this phone connects, AirPlay from any other phone is refused. */
++    @Volatile private var switchingTo: String? = null
+     @Volatile private var handoffAcceptedAt = Long.MIN_VALUE / 2
+     @Volatile private var handoffRetried = false
+     /** Until when, and how many more times, a failed invitation is repeated at once (after a display change). */
+@@ -126,6 +128,65 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+ 
+     fun wirelessPhone(): String? = if (presenceHelper == null) config.bluetoothDeviceAddress else selectedPhone
+ 
++    /** The viewer's box settings: paired phones with their BlueZ names and who is using CarPlay now. */
++    fun phonesJson(): String {
++        if (presenceHelper == null) return PhoneList.body(supported = false, raw = null)
++        // BlueZ busy or not yet up: hide the section instead of showing an empty, wrong list.
++        val raw = presenceResult("devices") ?: return PhoneList.body(supported = false, raw = null)
++        return PhoneList.body(supported = true, raw = raw)
++    }
++
++    /**
++     * The viewer's explicit "switch to this phone". Unlike automatic selection this may replace the phone using
++     * CarPlay: its session ends (it stays on the Wi-Fi), the chosen paired phone is invited, and AirPlay from any
++     * other phone is refused until it connects. The presence helper writes the same bounded grant a first pairing
++     * uses, so the supervisor cannot re-select the previous phone in between. Returns an error code, or null.
++     */
++    fun switchPhone(address: String): String? {
++        if (presenceHelper == null) return "unsupported"
++        val phone = PhoneList.normalize(address)
++        if (!PhoneList.ADDRESS.matches(phone)) return "invalid"
++        if (closed.get()) return "closed"
++        if (cablePhone) return "cable"
++        if (switchingTo == phone) return "busy"
++        // Checked and written before the old session ends: the grant names the phone to invite next.
++        if (!presence("switch", phone)) return "not-paired"
++        synchronized(this) {
++            if (closed.get() || cablePhone) return "busy"
++            selectedPhone = phone
++            switchingTo = phone
++            // Only the chosen phone's own handoff may admit an unidentified peer; an old boot grant or the
++            // previous phone's handoff must not let it back in while the switch is under way.
++            bootInvite = false
++            handoffAcceptedAt = Long.MIN_VALUE / 2
++            invitedPhone = null
++            ++wirelessGeneration
++            val link = wireless
++            wireless = null
++            link?.close()
++            activeSession?.close()
++        }
++        log.info("switching CarPlay to the phone chosen in the viewer")
++        Thread({
++            try {
++                // The old session goes in its reader thread; invite the chosen phone only after it has ended.
++                val deadline = System.nanoTime() / 1_000_000 + 5_000
++                while (activeSession != null && System.nanoTime() / 1_000_000 < deadline) Thread.sleep(100)
++                restartWireless(confirmedPresent = true)
++                // The grant lasts 90 s. If the chosen phone ignores it, let the previous phone come back.
++                val giveUp = System.nanoTime() / 1_000_000 + 80_000
++                while (switchingTo == phone && activeSession == null && System.nanoTime() / 1_000_000 < giveUp) Thread.sleep(500)
++            } catch (_: InterruptedException) {
++                Thread.currentThread().interrupt()
++            } finally {
++                synchronized(this@CarPlayServer) {
++                    if (switchingTo == phone) switchingTo = null
++                }
++            }
++        }, "phone-switch").apply { isDaemon = true; start() }
++        return null
++    }
++
+     private fun presenceResult(command: String, vararg args: String): String? {
+         val helper = presenceHelper ?: return null
+         return runCatching {
+@@ -176,6 +237,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+             activeSession = session
+             bootInvite = false
+             invitedPhone = null
++            switchingTo = null
+             handoffAcceptedAt = Long.MIN_VALUE / 2
+             handoffRetried = false
+             quickRetriesLeft = 0
+@@ -240,6 +302,8 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+     fun start() {
+         hub.inputHandler = ::routeInput
+         hub.onApplyDisplay = ::applyDisplay
++        hub.onPhones = ::phonesJson
++        hub.onSwitchPhone = ::switchPhone
+         hub.onMicrophoneData = { opus, payload -> bridge.sendMicrophonePayload(payload, opus) }
+         hub.onViewerJoined = { streamType ->
+             if (bridge.hasRecoveryHandler) {
+@@ -382,11 +446,21 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+                     }
+                 } else if (presenceHelper != null) {
+                     val incomingPhone = presenceResult("admit", socket.inetAddress.hostAddress)
++                    val target = switchingTo
++                    val handoff = System.nanoTime() / 1_000_000 - handoffAcceptedAt < HANDOFF_ADMIT_MS
++                    // While the viewer switches phones, the previous phone must not slip back in: it stays on
++                    // the Wi-Fi, but AirPlay from it is refused until the chosen phone has its session.
++                    if (target != null && incomingPhone != null && incomingPhone != target) {
++                        log.info("switching to another phone; rejecting AirPlay connection from {}", socket.remoteSocketAddress)
++                        socket.close()
++                        continue
++                    }
+                     val current = activeSession
+                     if (current != null) {
+-                        // A second phone must never replace an active or negotiating session. The
+-                        // owner returning after a Wi-Fi drop replaces its own stale session instead.
+-                        if (incomingPhone == null || incomingPhone != selectedPhone) {
++                        // A second phone must never replace an active or negotiating session, except the phone
++                        // chosen in the viewer (or its accepted handoff, whose address may not answer ARP yet).
++                        val replacing = mayReplaceSession(incomingPhone, selectedPhone, target, handoff)
++                        if (!replacing) {
+                             log.info("receiver busy; rejecting additional AirPlay connection from {}", socket.remoteSocketAddress)
+                             socket.close()
+                             continue
+@@ -394,7 +468,6 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+                         log.info("current phone reconnected; replacing its stale session")
+                         runCatching { current.close() }
+                     }
+-                    val handoff = System.nanoTime() / 1_000_000 - handoffAcceptedAt < HANDOFF_ADMIT_MS
+                     if (incomingPhone != null) selectedPhone = incomingPhone
+                     else if (handoff) {
+                         // A phone that just joined may not answer ARP yet (2026-10-11: rejected twice ~2 s
+@@ -839,6 +912,15 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+         internal fun shouldRestartWireless(active: Boolean, running: Boolean, elapsedMs: Long, present: Boolean, justEnded: Boolean = false): Boolean =
+             !active && present && (justEnded || elapsedMs >= (if (running) 15_000L else 5_000L))
+ 
++        /**
++         * Whether an AirPlay connection may replace the session in progress. Normally only the phone already
++         * selected; during the viewer's explicit switch, only the chosen phone (or its accepted handoff, whose
++         * address may not answer ARP yet). The previous phone stays on Wi-Fi but must not take CarPlay back.
++         */
++        internal fun mayReplaceSession(incomingPhone: String?, selectedPhone: String?, switchingTo: String?, handoff: Boolean): Boolean =
++            if (switchingTo != null) incomingPhone == switchingTo || (incomingPhone == null && handoff)
++            else incomingPhone != null && incomingPhone == selectedPhone
++
+         /** A failed invitation is repeated at once while [now] is before [until] and retries are [left]. */
+         internal fun quickRetry(now: Long, until: Long, left: Int): Boolean = left > 0 && now < until
+ 
+diff --git a/server/src/main/kotlin/com/playport/server/WebHub.kt b/server/src/main/kotlin/com/playport/server/WebHub.kt
+index fc9ea68..2b4cbce 100644
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -27,7 +27,9 @@ import kotlinx.coroutines.cancel
+ import kotlinx.coroutines.channels.Channel
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
+ import kotlinx.serialization.Serializable
++import kotlinx.serialization.builtins.ListSerializer
+ import kotlinx.serialization.json.Json
+ import java.nio.file.Files
+ import java.nio.file.Path
+@@ -81,6 +83,46 @@ data class DisplayRequest(
+ /** What became of a display request: an error, or applied now, or kept until the session ends ([DisplayRequest.defer]). */
+ data class DisplayOutcome(val error: String? = null, val deferred: Boolean = false)
+ 
++/** One paired phone in the viewer's box settings ("已连接设备"): the address the switch uses, its BlueZ
++ *  alias, and what the box remembers about it. */
++@Serializable
++data class PhoneEntry(
++    val address: String,
++    val name: String = "",
++    val active: Boolean = false,
++    val last: Boolean = false,
++)
++
++@Serializable
++data class PhoneListBody(val supported: Boolean = false, val phones: List<PhoneEntry> = emptyList())
++
++@Serializable
++data class PhoneSwitchRequest(val address: String = "")
++
++@Serializable
++data class PhoneSwitchError(val error: String)
++
++/** Parsing and encoding for the phone list the presence helper prints (`devices`: a JSON array). */
++object PhoneList {
++    private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
++    val ADDRESS = Regex("(?:[0-9A-F]{2}:){5}[0-9A-F]{2}")
++    const val MAX_PHONES = 16
++
++    fun normalize(address: String): String = address.trim().uppercase()
++
++    /** Only well-formed, unique addresses: malformed helper output must not reach the page. */
++    fun parse(raw: String?): List<PhoneEntry> = runCatching {
++        json.decodeFromString(ListSerializer(PhoneEntry.serializer()), raw.orEmpty())
++    }.getOrDefault(emptyList()).mapNotNull { entry ->
++        val address = normalize(entry.address)
++        if (!ADDRESS.matches(address)) null
++        else entry.copy(address = address, name = entry.name.take(64).ifBlank { address })
++    }.distinctBy { it.address }.take(MAX_PHONES)
++
++    fun body(supported: Boolean, raw: String?): String =
++        json.encodeToString(PhoneListBody.serializer(), PhoneListBody(supported, parse(raw)))
++}
++
+ @Serializable
+ data class ServerMessage(
+     val type: String,
+@@ -161,6 +203,12 @@ class WebHub(
+     /** Applies a display change; returns null on success or an error message. */
+     @Volatile var onApplyDisplay: ((DisplayRequest) -> DisplayOutcome)? = null
+ 
++    /** Paired phones for the box settings (a [PhoneListBody] as JSON), from the presence helper. */
++    @Volatile var onPhones: (() -> String)? = null
++
++    /** Explicitly switch CarPlay to a paired phone: null on success, or an error code for the page. */
++    @Volatile var onSwitchPhone: ((String) -> String?)? = null
++
+     /** Browser microphone payloads: (isOpus, payload). */
+     @Volatile var onMicrophoneData: ((Boolean, ByteArray) -> Unit)? = null
+ 
+@@ -376,6 +424,62 @@ class WebHub(
+                 call.respondText(if (outcome.deferred) """{"ok":true,"deferred":true}""" else """{"ok":true}""",
+                     io.ktor.http.ContentType.Application.Json)
+             }
++            get("/api/phones") {
++                if (call.request.queryParameters["token"] != config.accessToken || !call.fromOwnPage()) {
++                    call.respondText(
++                        """{"error":"invalid token"}""",
++                        io.ktor.http.ContentType.Application.Json,
++                        io.ktor.http.HttpStatusCode.Forbidden,
++                    )
++                    return@get
++                }
++                // The paired phones are personal data: token and same page only, like the display POST.
++                // The presence helper runs Python and BlueZ: never on the event loop that carries the picture.
++                val body = withContext(Dispatchers.IO) { onPhones?.invoke() }
++                    ?: PhoneList.body(supported = false, raw = null)
++                call.respondText(body, io.ktor.http.ContentType.Application.Json)
++            }
++            post("/api/phones/switch") {
++                if (call.request.queryParameters["token"] != config.accessToken || !call.fromOwnPage()) {
++                    call.respondText(
++                        """{"error":"invalid token"}""",
++                        io.ktor.http.ContentType.Application.Json,
++                        io.ktor.http.HttpStatusCode.Forbidden,
++                    )
++                    return@post
++                }
++                val request = try {
++                    json.decodeFromString(PhoneSwitchRequest.serializer(), call.receiveText())
++                } catch (_: Exception) {
++                    call.respondText(
++                        """{"error":"invalid"}""",
++                        io.ktor.http.ContentType.Application.Json,
++                        io.ktor.http.HttpStatusCode.BadRequest,
++                    )
++                    return@post
++                }
++                val switcher = onSwitchPhone
++                if (switcher == null) {
++                    call.respondText(
++                        json.encodeToString(PhoneSwitchError.serializer(), PhoneSwitchError("unsupported")),
++                        io.ktor.http.ContentType.Application.Json,
++                        io.ktor.http.HttpStatusCode.Conflict,
++                    )
++                    return@post
++                }
++                val error = withContext(Dispatchers.IO) { switcher.invoke(PhoneList.normalize(request.address)) }
++                if (error != null) {
++                    val code = if (error == "invalid") io.ktor.http.HttpStatusCode.BadRequest
++                        else io.ktor.http.HttpStatusCode.Conflict
++                    call.respondText(
++                        json.encodeToString(PhoneSwitchError.serializer(), PhoneSwitchError(error)),
++                        io.ktor.http.ContentType.Application.Json,
++                        code,
++                    )
++                    return@post
++                }
++                call.respondText("""{"ok":true}""", io.ktor.http.ContentType.Application.Json)
++            }
+             webSocket("/ws") {
+                 val token = call.request.queryParameters["token"]
+                 if (token != config.accessToken || !call.fromOwnPage()) {
+diff --git a/server/src/test/kotlin/com/playport/server/PhoneListTest.kt b/server/src/test/kotlin/com/playport/server/PhoneListTest.kt
+new file mode 100644
+index 0000000..5f0a5f6
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/PhoneListTest.kt
+@@ -0,0 +1,38 @@
++package com.playport.server
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** The viewer's "已连接设备" list: only well-formed paired addresses reach the page, with BlueZ names. */
++class PhoneListTest {
++    @Test fun aMalformedHelperAnswerNeverReachesThePage() {
++        assertEquals(emptyList<PhoneEntry>(), PhoneList.parse(null))
++        assertEquals(emptyList<PhoneEntry>(), PhoneList.parse("not json"))
++        assertEquals(emptyList<PhoneEntry>(), PhoneList.parse("""[{"address":"nope","name":"X"}]"""))
++    }
++
++    @Test fun addressesAreNormalisedDeduplicatedAndLimited() {
++        val raw = """[
++            {"address":"02:00:00:00:00:0b","name":"Bob iPhone","active":true,"last":false},
++            {"address":"02:00:00:00:00:0b","name":"duplicate"},
++            {"address":"02:00:00:00:00:0a","name":"","last":true}
++        ]"""
++        assertEquals(listOf("02:00:00:00:00:0B", "02:00:00:00:00:0A"), PhoneList.parse(raw).map { it.address })
++        assertEquals("Bob iPhone", PhoneList.parse(raw)[0].name)
++        // An empty alias falls back to the address, so the page always has something to show.
++        assertEquals("02:00:00:00:00:0A", PhoneList.parse(raw)[1].name)
++    }
++
++    @Test fun aBoxWithoutThePresenceHelperReportsNoDevices() {
++        val body = PhoneList.body(supported = false, raw = null)
++        assertTrue(body.contains("\"supported\":false"))
++        assertTrue(body.contains("\"phones\":[]"))
++    }
++
++    @Test fun theAddressIsWhatTheSwitchUses() {
++        assertTrue(PhoneList.ADDRESS.matches(PhoneList.normalize(" 02:00:00:00:00:0a ")))
++        assertFalse(PhoneList.ADDRESS.matches("02:00:00:00:00"))
++    }
++}
+diff --git a/server/src/test/kotlin/com/playport/server/PhoneSwitchTest.kt b/server/src/test/kotlin/com/playport/server/PhoneSwitchTest.kt
+new file mode 100644
+index 0000000..4525df8
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/PhoneSwitchTest.kt
+@@ -0,0 +1,28 @@
++package com.playport.server
++
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** The viewer's switch is the one place that may replace the phone using CarPlay; otherwise no preemption. */
++class PhoneSwitchTest {
++    private val a = "02:00:00:00:00:0A"
++    private val b = "02:00:00:00:00:0B"
++
++    @Test fun thePreviousPhoneMayNotTakeCarPlayBackDuringASwitch() {
++        assertFalse(CarPlayServer.mayReplaceSession(a, b, b, handoff = false))
++        assertFalse(CarPlayServer.mayReplaceSession(a, b, b, handoff = true))
++    }
++
++    @Test fun theChosenPhoneOrItsUnidentifiedHandoffMayReplaceTheSession() {
++        assertTrue(CarPlayServer.mayReplaceSession(b, b, b, handoff = false))
++        assertTrue(CarPlayServer.mayReplaceSession(null, b, b, handoff = true))
++        assertFalse(CarPlayServer.mayReplaceSession(null, b, b, handoff = false))
++    }
++
++    @Test fun withoutASwitchOnlyTheCurrentOwnersReconnectReplacesItsStaleSession() {
++        assertTrue(CarPlayServer.mayReplaceSession(a, a, null, handoff = false))
++        assertFalse(CarPlayServer.mayReplaceSession(b, a, null, handoff = false))
++        assertFalse(CarPlayServer.mayReplaceSession(null, a, null, handoff = true))
++    }
++}
+diff --git a/web/index.html b/web/index.html
+index bb9e2cd..420fbe1 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -24,6 +24,11 @@
+     <button id="fullscreen" class="cell" type="button"><span class="tile blue"><svg class="ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path class="expand" d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><path class="collapse" d="M3 8h5V3m8 0v5h5M8 21v-5H3m13 5v-5h5"/></svg></span><span class="main"><b id="fullscreen-text">全屏</b></span></button>
+     <a id="box-link-panel" class="cell" href="/" hidden><span class="tile green"><svg class="ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2.8" width="10" height="18.4" rx="2.6"/><path d="M10.8 5.2h2.4"/></svg></span><span class="main"><b data-i18n="boxLink"></b><span data-i18n="boxLinkHintLive"></span></span><span class="chev"></span></a>
+   </div>
++  <div id="devices-block" hidden>
++    <p class="group-title" data-i18n="devices"></p>
++    <div class="group" id="device-list"></div>
++    <p id="devices-status" class="foot" role="status"></p>
++  </div>
+   <p class="group-title" data-i18n="volume"></p>
+   <div class="group"><div class="cell volume"><svg class="ico dim" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><path d="M4 9h3l5-4v14l-5-4H4z"/></svg><input id="volume" type="range" min="0" max="100" value="100"/><svg class="ico dim" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 9h3l5-4v14l-5-4H4z" fill="currentColor" stroke="none"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></svg><output id="volume-value">100%</output></div></div>
+   <p id="audio-status" class="foot"></p>
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+index 280f019..b1c1bb9 100644
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -2,6 +2,14 @@ const messages = {
+   settings: ['盒子设置', 'Box settings'], close: ['关闭', 'Close'], done: ['完成', 'Done'],
+   boxLink: ['添加 iPhone · 网络设置', 'Add iPhone · Network'], boxLinkHint: ['配对新手机、选择热点', 'Pair a phone, choose the hotspot'],
+   boxLinkHintLive: ['离开画面，配对手机、更换热点', 'Leaves the picture to pair phones or change the hotspot'],
++  devices: ['已连接的手机', 'Phones'], devicesHint: ['点一下切换到那部手机：现在这部不会断开 WiFi，只是 CarPlay 会断开，另一部一般 10–30 秒接上；对方的蓝牙要打开。', 'Tap a phone to switch to it: the current one stays on Wi-Fi, only CarPlay ends; the other takes over in about 10–30 s with Bluetooth on.'],
++  deviceInUse: ['正在使用', 'In use'], deviceLast: ['上次使用', 'Last used'], deviceIdle: ['未连接', 'Not connected'], deviceSwitch: ['切换到这部', 'Switch to this'],
++  devicesOne: ['目前只配对了这一部；配对第二部后，可以直接在这里切换。', 'Only one phone is paired; add a second to switch here.'],
++  deviceSwitching: ['正在切换到「{name}」，现在这部会先断开 CarPlay…', 'Switching to “{name}”; the current CarPlay ends first…'],
++  deviceUnsupported: ['这部盒子不能切换手机。', 'This box cannot switch phones.'], deviceNotPaired: ['这部手机没有配对，请先在盒子的设置页添加。', 'This phone is not paired; add it on the box settings page.'],
++  deviceCable: ['现在用数据线连着 CarPlay，拔掉数据线后再切换。', 'CarPlay is using the cable; unplug it before switching.'],
++  deviceBusy: ['正在切换，请稍等。', 'A switch is already in progress.'], deviceFail: ['切换失败，请稍后重试。', 'Switch failed. Try again later.'],
++  deviceNoPhones: ['还没有配对的手机。', 'No paired phones yet.'],
+   playerSettings: ['画面与声音', 'Display and sound'], displaySettings: ['画面参数', 'Display settings'], performanceMode: ['性能模式', 'Performance mode'], performanceModeHint: ['开：先按最高分辨率放大再缩回窗口，更清楚但更吃解码；关：按窗口实际尺寸（最小宽度 720），清晰度可能下降', 'On: upsize then shrink into the window, sharper but heavier; off: the window own size (min width 720), clarity may drop'], customSize: ['自定义分辨率', 'Custom resolution'], customSizeHint: ['关闭时跟随窗口', 'Off: follow the window'], language: ['语言', 'Language'],
+   waiting: ['正在等待 iPhone', 'Waiting for iPhone'], waitingHint: ['已添加的 iPhone 打开蓝牙和 Wi-Fi 后会自动连接。第一次使用，请先添加 iPhone。', 'An added iPhone connects by itself with Bluetooth and Wi-Fi on. First time here? Add your iPhone.'],
+   connecting: ['正在连接盒子…', 'Connecting to receiver…'], reconnecting: ['连接中断，正在自动重连…', 'Disconnected. Reconnecting automatically…'],
+diff --git a/web/src/main.ts b/web/src/main.ts
+index 5bf45bd..68ba90f 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -85,6 +85,107 @@ function render() {
+   const night = isNight(parseNightMode(nightSelect.value), new Date(), darkQuery.matches);
+   el('night-status').textContent = `${t('nightNow')}${t(night ? 'nightOn' : 'nightOff')}`;
+   el('night-status').title = t(darkQuery.matches ? 'browserDark' : 'browserLight');
++  if (!devicesBlock.hidden) renderDevices();
++}
++
++// The box's paired phones, for switching CarPlay without touching the Wi-Fi: the current phone stays
++// connected to the hotspot, only its CarPlay session ends and the chosen phone is invited over Bluetooth.
++interface BoxPhone { address: string; name: string; active?: boolean; last?: boolean; }
++interface BoxPhones { supported?: boolean; phones?: BoxPhone[]; }
++const devicesBlock = el('devices-block');
++const deviceList = el('device-list');
++const devicesStatus = el('devices-status');
++let boxPhones: BoxPhone[] = [];
++let devicesLoading = false;
++let switchingTo: string | null = null;
++let deviceNotice = '';
++const deviceAddress = (phone: BoxPhone) => `蓝牙 …${phone.address.slice(-5)}`;
++function renderDevices() {
++  deviceList.textContent = '';
++  if (!boxPhones.length) {
++    const row = document.createElement('div'); row.className = 'cell';
++    const main = document.createElement('span'); main.className = 'main';
++    const text = document.createElement('span'); text.textContent = t('deviceNoPhones');
++    main.append(text); row.append(main); deviceList.append(row);
++    devicesStatus.textContent = deviceNotice;
++    return;
++  }
++  // With one paired phone there is nothing to switch to: show it, not a button that invites itself.
++  const canSwitch = boxPhones.length > 1;
++  for (const phone of boxPhones) {
++    const active = phone.active === true;
++    // A div for the phone in use and for a single phone (nothing to do), buttons when there is a choice.
++    const row = document.createElement(active || !canSwitch ? 'div' : 'button') as HTMLDivElement & HTMLButtonElement;
++    row.className = active ? 'cell on' : 'cell';
++    if (!active && canSwitch) row.type = 'button';
++    const main = document.createElement('span'); main.className = 'main';
++    const name = document.createElement('b'); name.textContent = phone.name || phone.address;
++    const detail = document.createElement('span'); detail.textContent = phone.last && !active && canSwitch ? `${t('deviceLast')} · ${deviceAddress(phone)}` : deviceAddress(phone);
++    main.append(name, detail);
++    const value = document.createElement('span'); value.className = 'value';
++    value.textContent = active ? t('deviceInUse')
++      : switchingTo === phone.address ? t('deviceSwitching').replace('{name}', phone.name || phone.address)
++      : canSwitch ? t('deviceSwitch') : phone.last ? t('deviceLast') : t('deviceIdle');
++    row.append(main, value);
++    if (!active && canSwitch) {
++      row.disabled = switchingTo !== null;
++      row.onclick = () => { void switchPhone(phone); };
++    }
++    deviceList.append(row);
++  }
++  devicesStatus.textContent = deviceNotice || (canSwitch ? t('devicesHint') : t('devicesOne'));
++}
++async function loadDevices() {
++  if (!token || devicesLoading) return;
++  devicesLoading = true;
++  deviceNotice = '';
++  try {
++    const r = await fetch(`/api/phones?token=${encodeURIComponent(token)}`, { cache: 'no-store' });
++    if (!r.ok) throw new Error();
++    const body = await r.json() as BoxPhones;
++    if (!body.supported) { devicesBlock.hidden = true; return; }
++    boxPhones = Array.isArray(body.phones) ? body.phones : [];
++    devicesBlock.hidden = false;
++    renderDevices();
++  } catch {
++    // An older receiver has no such endpoint: the section simply stays hidden.
++    devicesBlock.hidden = true;
++  } finally {
++    devicesLoading = false;
++  }
++}
++function deviceError(code: string): string {
++  switch (code) {
++    case 'unsupported': return t('deviceUnsupported');
++    case 'not-paired': return t('deviceNotPaired');
++    case 'cable': return t('deviceCable');
++    case 'busy': return t('deviceBusy');
++    default: return t('deviceFail');
++  }
++}
++async function switchPhone(phone: BoxPhone) {
++  if (switchingTo) return;
++  switchingTo = phone.address;
++  deviceNotice = t('deviceSwitching').replace('{name}', phone.name || phone.address);
++  renderDevices();
++  try {
++    const r = await fetch(`/api/phones/switch?token=${encodeURIComponent(token)}`, {
++      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address: phone.address }),
++    });
++    const body = await r.json().catch(() => ({})) as { error?: string };
++    if (!r.ok) throw new Error(body.error || '');
++    // The phone in use loses CarPlay (not the Wi-Fi); show the chosen one as in use and confirm from
++    // the box again in a few seconds, once the new session has set the presence state.
++    boxPhones = boxPhones.map(entry => ({ ...entry, active: entry.address === phone.address }));
++    deviceNotice = '';
++    toast(t('deviceSwitching').replace('{name}', phone.name || phone.address));
++    window.setTimeout(() => { if (!devicesBlock.hidden) void loadDevices(); }, 8000);
++  } catch (error) {
++    deviceNotice = deviceError((error as Error).message);
++  } finally {
++    switchingTo = null;
++    if (!devicesBlock.hidden) renderDevices();
++  }
+ }
+ function fit() {
+   // While CarPlay renegotiates, the last picture stays laid out as it was (the new areas belong to the next stream).
+@@ -163,6 +264,8 @@ const promptGain = Number(new URLSearchParams(location.search).get('promptgain')
+ // Music the iPhone still sends here is played: it sends music to one place at a time, and after Siri from the
+ // CarPlay screen it sent it here for ~27 s before going back to the car's Bluetooth, silent while it was dropped.
+ const audio = new AudioEngine(error, { promptBoost: promptGain, idleClose: carMusic });
++  };
++}
+ /** Music over the car's Bluetooth: the car's media card shows the page's title and address whenever the page sounds
+  *  (Siri, prompts, calls; a Tesla, 2026-10-14); name it instead. The last voice stream to start wins; the title goes back when none is left. */
+ const voiceLabels: Record<string, string> = { speechrecognition: 'Siri', telephony: '通话', default: '导航播报' };
+@@ -251,6 +354,8 @@ function server(message: ServerMessage) {
+     endExpectRestart(); reset(forDisplay && (painted || holding), forDisplay); state = 'waiting';
+   }
+   else { endExpectRestart(); void loadDisplay(); active = true; canvas.inert = false; state = 'starting'; media.setActive(true); syncNight(); if(message.nowPlaying) media.setMetadata(message.nowPlaying); if(message.artwork) media.setArtwork(message.revision ?? 0,message.artwork); }
++  // The phone using CarPlay may have changed (a switch from this or another page): refresh the list once.
++  if (message.sessionActive && panel.open) window.setTimeout(() => { if (!devicesBlock.hidden) void loadDevices(); }, 2000);
+   render();
+ }
+ async function unlock() {
+@@ -266,6 +371,7 @@ volume.oninput = setVolume; setVolume();
+ function openPanel() {
+   if (!panel.open) { panel.classList.remove('closing'); panel.showModal(); }
+   void loadDisplay();
++  void loadDevices();
+ }
+ /** Leave along the path it came in (to the right), unless motion is reduced. */
+ function closePanel() {
+diff --git a/web/src/style.css b/web/src/style.css
+index ca2870c..777d1f5 100644
+--- a/web/src/style.css
++++ b/web/src/style.css
+@@ -49,6 +49,7 @@ a.cell:active, button.cell:active, summary.cell:active, label.cell:active { back
+ .cell .main b { display:block; font-weight:400; }
+ .cell .main span { display:block; color:var(--secondary); font-size:13px; line-height:1.35; margin-top:1px; }
+ .cell .value { color:var(--secondary); font-size:15px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; max-width:55%; }
++.cell.on .value { color:var(--tint); }
+ .tile { width:30px; height:30px; flex:none; border-radius:7px; display:grid; place-items:center; color:#fff; }
+ .tile .ico { width:19px; height:19px; }
+ .tile.blue { background:var(--tint); } .tile.green { background:var(--green); } .tile.gray { background:var(--gray); }

@@ -1,0 +1,26 @@
+diff --git a/server/src/main/kotlin/com/playport/server/Main.kt b/server/src/main/kotlin/com/playport/server/Main.kt
+index bf94371..af6dc74 100644
+--- a/server/src/main/kotlin/com/playport/server/Main.kt
++++ b/server/src/main/kotlin/com/playport/server/Main.kt
+@@ -39,8 +39,11 @@ fun main(args: Array<String>) {
+ 
+     val webRoot = Path.of("web/dist").toAbsolutePath().normalize()
+     val tls = TlsCertificate.loadOrCreate(config.stateDir, listOf(server.bindAddress))
++    // A box that is a client of the car hotspot and the iPhone's AP at once serves the viewer on every
++    // address (the head unit comes through the car hotspot); AirPlay stays on bindAddress.
++    val webHost = System.getenv("CARPLAY_WEB_HOST")?.takeIf { it.isNotBlank() } ?: server.bindAddress.hostAddress
+     val http = if (config.insecureHttp) {
+-        embeddedServer(Netty, port = config.httpPort, host = server.bindAddress.hostAddress) {
++        embeddedServer(Netty, port = config.httpPort, host = webHost) {
+             server.hub.install(this, webRoot)
+         }
+     } else {
+@@ -49,7 +52,7 @@ fun main(args: Array<String>) {
+             environment = applicationEnvironment { },
+             configure = {
+                 sslConnector(tls.keyStore, tls.alias, { tls.password }, { tls.password }) {
+-                    host = server.bindAddress.hostAddress
++                    host = webHost
+                     port = config.httpPort
+                 }
+             },

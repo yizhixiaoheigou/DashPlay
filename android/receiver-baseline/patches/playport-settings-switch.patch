@@ -1,0 +1,15 @@
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -789,6 +789,11 @@
+                     val now = System.nanoTime() / 1_000_000
+                     val disconnect = presenceResult("disconnect-request")
+                     if (disconnect != null && disconnectPhone(disconnect)) continue
++                    // The settings page's own 切换 button: the same switch as the viewer's phone rows, so both
++                    // places can hand CarPlay to another phone (2026-10-31). The helper consumes the request.
++                    presenceResult("switch-request")?.let { phone ->
++                        switchPhone(phone)?.let { log.info("switch requested in the settings page not done: {}", it) }
++                    }
+                     // The phone on the cable owns CarPlay; its session is no Wi-Fi presence either.
+                     if (cablePhone) { idleTimer.action(now, true, activeSession); continue }
+                     // Learn the phone's Wi-Fi identity before an idle release can end its session: a phone invited

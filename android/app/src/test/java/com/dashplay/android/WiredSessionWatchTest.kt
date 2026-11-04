@@ -16,10 +16,10 @@ class WiredSessionWatchTest {
 
     @Test fun retriesAcceptedStartWithoutTearingDownThePendingUsbNetwork() {
         val w = watch()
-        assertEquals(Step.WAITING, w.step(false, 15 * s, true))
-        assertEquals(Step.RETRY_START, w.step(false, 20 * s, true))
-        assertEquals(Step.WAITING, w.step(false, 21 * s, true))
-        assertEquals(Step.RETRY_START, w.step(false, 40 * s, true))
+        assertEquals(Step.WAITING, w.step(false, 2 * s, true))
+        assertEquals(Step.RETRY_START, w.step(false, 3 * s, true))
+        assertEquals(Step.WAITING, w.step(false, 4 * s, true))
+        assertEquals(Step.RETRY_START, w.step(false, 6 * s, true))
         assertEquals(Step.RESTART, w.step(false, 60 * s, true))
     }
 
@@ -30,6 +30,14 @@ class WiredSessionWatchTest {
         assertEquals(Step.LIVE, w.step(true, 26 * s, true))
         assertEquals(Step.GONE, w.step(false, 50 * s, true))
         assertEquals(Step.RESTART, w.step(false, 60 * s, true))
+    }
+
+    @Test fun displayReinviteFallsBackWithoutWaitingTheFullInitialConnectTimeout() {
+        val w = WiredSessionWatch(startedAt = 0L, startWaitNanos = 10 * s)
+        assertEquals(Step.RETRY_START, w.step(false, 3 * s, true))
+        assertEquals(Step.RETRY_START, w.step(false, 6 * s, true))
+        assertEquals(Step.RETRY_START, w.step(false, 9 * s, true))
+        assertEquals(Step.RESTART, w.step(false, 10 * s, true))
     }
 
     @Test fun staysLiveWhileTheSessionLastsWellPastTheStartTimeout() {

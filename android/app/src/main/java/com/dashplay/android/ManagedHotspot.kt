@@ -93,7 +93,10 @@ class ManagedHotspot(private val context: Context, private val changed: () -> Un
             }
         }
         override fun create(done: (Result<Unit>) -> Unit) {
-            check(Build.VERSION.SDK_INT >= 29)
+            if (Build.VERSION.SDK_INT < 29) {
+                done(Result.failure(IllegalStateException("此设备不支持应用本地热点，请使用系统热点或外部 Wi-Fi。")))
+                return
+            }
             val current = open()
             val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
             @Suppress("DEPRECATION") val station = wifi.connectionInfo

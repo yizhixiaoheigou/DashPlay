@@ -1,0 +1,2830 @@
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/iap2/message/Iap2ArtworkReceiver.kt b/protocol/src/main/java/com/shilapi/xcertplay/iap2/message/Iap2ArtworkReceiver.kt
+new file mode 100644
+index 0000000..b794a70
+--- /dev/null
++++ b/protocol/src/main/java/com/shilapi/xcertplay/iap2/message/Iap2ArtworkReceiver.kt
+@@ -0,0 +1,127 @@
++package com.shilapi.xcertplay.iap2.message
++
++import java.io.ByteArrayOutputStream
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++
++/** Bounded, single-current-artwork receiver for iAP2 file transfer session v1/v2. */
++class Iap2ArtworkReceiver(
++    private val send: (ByteArray) -> Unit,
++    private val complete: (revision: Long, transferId: Int, bytes: ByteArray) -> Boolean,
++    private val clock: () -> Long,
++    private val onDiagnostic: (String) -> Unit = {},
++) {
++    private data class Transfer(val id: Int, val revision: Long, val size: Int,
++        val buffer: ByteArrayOutputStream = ByteArrayOutputStream(), var first: Boolean = true,
++        var deadline: Long = 0)
++    private var expectedId: Int? = null
++    private var revision = 0L
++    private var active: Transfer? = null
++    private val pendingSetups = LinkedHashMap<Int, Pair<ByteArray, Long>>()
++
++    @Synchronized fun expect(id: Int?, trackRevision: Long) {
++        if (id == expectedId && revision == trackRevision) return
++        active?.let { reply(it.id, CANCEL) }
++        active = null
++        // Retire the old advertised transfer, but keep unassociated SETUPs while an
++        // incremental metadata update has not yet supplied the next artwork identifier.
++        expectedId?.takeIf { it != id }?.let { oldId ->
++            pendingSetups.remove(oldId)?.let { reply(oldId, CANCEL) }
++        }
++        expectedId = id
++        revision = trackRevision
++        if (id == null) return
++        val setup = pendingSetups.remove(id)
++        pendingSetups.keys.toList().forEach { reply(it, CANCEL) }
++        pendingSetups.clear()
++        if (setup != null && setup.second > clock()) receive(setup.first)
++    }
++
++    @Synchronized fun receive(bytes: ByteArray) {
++        expire()
++        if (bytes.size < 2) return
++        val id = bytes[0].toInt() and 0xff
++        val kind = bytes[1].toInt() and 0xff
++        if (kind == CANCEL || kind == FAILURE) {
++            diagnostic("artwork peer ${if (kind == CANCEL) "CANCEL" else "FAILURE"} id=$id")
++            if (active?.id == id) active = null
++            pendingSetups.remove(id)
++            return
++        }
++        if (kind == SETUP) {
++            val type = if (bytes.size >= 12) ByteBuffer.wrap(bytes, 10, 2).order(ByteOrder.BIG_ENDIAN).short.toInt() and 0xffff else null
++            val size = if (bytes.size >= 10) ByteBuffer.wrap(bytes, 2, 8).order(ByteOrder.BIG_ENDIAN).long else null
++            diagnostic("artwork SETUP id=$id packetBytes=${bytes.size} type=${type ?: "v1"} declaredBytes=${size ?: "invalid"}")
++            if (bytes.size !in 10..12 || id < 128) { reply(id, CANCEL); return }
++            val artwork = bytes.size == 10 || bytes.size == 12 &&
++                ByteBuffer.wrap(bytes, 10, 2).order(ByteOrder.BIG_ENDIAN).short.toInt() == 2
++            if (size == null || size !in 1..MAX_BYTES.toLong() || !artwork) { reply(id, CANCEL); return }
++            if (id != expectedId) {
++                // Control and file queues can be consumed in a different order. Do not start yet.
++                if (pendingSetups.size >= 4) { reply(id, CANCEL); return }
++                pendingSetups[id] = bytes.copyOf() to (clock() + TIMEOUT_MS)
++                diagnostic("artwork SETUP queued id=$id bytes=$size; awaiting metadata")
++                return
++            }
++            if (active != null) { reply(id, CANCEL); active = null; return }
++            active = Transfer(id, revision, size.toInt(), deadline = clock() + TIMEOUT_MS)
++            reply(id, START)
++            return
++        }
++        val transfer = active
++        if (transfer == null || transfer.id != id) {
++            diagnostic("artwork unexpected DATA id=$id kind=$kind packetBytes=${bytes.size}")
++            reply(id, CANCEL); return
++        }
++        val isFirst = kind == FIRST || kind == FIRST_LAST
++        val last = kind == LAST || kind == FIRST_LAST
++        if (kind !in listOf(DATA, FIRST, LAST, FIRST_LAST) || isFirst != transfer.first ||
++            bytes.size - 2 > transfer.size - transfer.buffer.size()) {
++            reply(id, CANCEL); active = null; return
++        }
++        transfer.first = false
++        transfer.buffer.write(bytes, 2, bytes.size - 2)
++        if (isFirst || last) diagnostic("artwork DATA id=$id first=$isFirst last=$last received=${transfer.buffer.size()}/${transfer.size}")
++        transfer.deadline = clock() + TIMEOUT_MS
++        if (last) {
++            active = null
++            if (transfer.buffer.size() != transfer.size) { reply(id, FAILURE); return }
++            val data = transfer.buffer.toByteArray()
++            // The coordinator decodes JPEG on its artwork worker, outside the control loop.
++            if (data.size < 3 || data[0] != 0xff.toByte() || data[1] != 0xd8.toByte()) {
++                reply(id, FAILURE); return
++            }
++            reply(id, if (complete(transfer.revision, id, data)) SUCCESS else FAILURE)
++        }
++    }
++
++    @Synchronized fun expire() {
++        pendingSetups.filterValues { clock() >= it.second }.keys.toList().forEach {
++            pendingSetups.remove(it); reply(it, CANCEL)
++        }
++        active?.takeIf { clock() >= it.deadline }?.let { active = null; reply(it.id, CANCEL) }
++    }
++    private fun reply(id: Int, kind: Int) {
++        val action = when (kind) { START -> "START"; CANCEL -> "CANCEL"; SUCCESS -> "SUCCESS"; else -> "FAILURE" }
++        try {
++            send(byteArrayOf(id.toByte(), kind.toByte()))
++            diagnostic("artwork $action queued id=$id revision=$revision")
++        } catch (failure: Exception) {
++            // A rejected reply belongs to this transfer, not to the metadata/control loop or
++            // the lifetime of the file receiver. Later transfers must still be processed.
++            if (active?.id == id) active = null
++            pendingSetups.remove(id)
++            diagnostic("artwork $action SEND FAILED id=$id revision=$revision: ${failure.javaClass.simpleName}: ${failure.message}")
++        }
++    }
++    private fun diagnostic(message: String) {
++        try { onDiagnostic(message) } catch (_: Exception) { /* Logging must not affect transfer. */ }
++    }
++    companion object {
++        const val MAX_BYTES = 4 * 1024 * 1024
++        private const val TIMEOUT_MS = 15_000L
++        private const val SETUP = 4; private const val START = 1; private const val CANCEL = 2
++        private const val DATA = 0; private const val FIRST = 0x80; private const val LAST = 0x40
++        private const val FIRST_LAST = 0xc0; private const val SUCCESS = 5; private const val FAILURE = 6
++    }
++}
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/iap2/message/Iap2Messages.kt b/protocol/src/main/java/com/shilapi/xcertplay/iap2/message/Iap2Messages.kt
+index d9d7fd1..36b3b86 100644
+--- a/protocol/src/main/java/com/shilapi/xcertplay/iap2/message/Iap2Messages.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/iap2/message/Iap2Messages.kt
+@@ -278,10 +278,10 @@ object Iap2ControlMessages {
+     fun subscriptions(): List<Iap2Frame> = listOf(
+         Iap2Messages.build(Iap2Endpoints.START_NOW_PLAYING_UPDATES) {
+             group(0) {
+-                listOf(1, 4, 6, 12, 26).forEach(::void)
++                listOf(0, 1, 4, 6, 12, 26).forEach(::void)
+             }
+             group(1) {
+-                listOf(0, 1, 7).forEach(::void)
++                listOf(0, 1, 2, 7, 12, 16).forEach(::void)
+             }
+         },
+         Iap2Messages.build(Iap2Endpoints.START_ROUTE_GUIDANCE_UPDATES) {
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/iap2/session/Iap2Session.kt b/protocol/src/main/java/com/shilapi/xcertplay/iap2/session/Iap2Session.kt
+index df92521..d4660d0 100644
+--- a/protocol/src/main/java/com/shilapi/xcertplay/iap2/session/Iap2Session.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/iap2/session/Iap2Session.kt
+@@ -26,7 +26,7 @@ class Iap2Session private constructor(
+
+     fun awaitReady(timeoutMillis: Long): Boolean {
+         val ready = channel.awaitReady(timeoutMillis)
+-        emitTrace("IAP2 READY [$traceContext] ready=$ready")
++        emitTrace("IAP2 READY [$traceContext] ready=$ready ${channel.fileTransferStatus()}")
+         return ready
+     }
+
+@@ -79,6 +79,10 @@ class Iap2Session private constructor(
+         }
+     }
+
++    fun sendFileTransfer(bytes: ByteArray, isCurrent: () -> Boolean = { true }) =
++        channel.sendFileTransfer(bytes, isCurrent = isCurrent)
++    fun recvFileTransfer(timeoutMillis: Long): ByteArray? = channel.recvFileTransfer(timeoutMillis)
++
+     fun reader(frame: Iap2Frame): Iap2BodyReader = Iap2Messages.reader(frame)
+
+     override fun close() {
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2CsmChannel.kt b/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2CsmChannel.kt
+index ce8e89c..9fc4a23 100644
+--- a/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2CsmChannel.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2CsmChannel.kt
+@@ -121,6 +121,19 @@ class Iap2CsmChannel private constructor(
+         }
+     }
+
++    fun sendFileTransfer(bytes: ByteArray, timeoutMillis: Long = DEFAULT_SEND_TIMEOUT_MILLIS,
++        isCurrent: () -> Boolean = { true }) {
++        requireTimeout(timeoutMillis)
++        checkOpen()
++        if (!link.sendFileTransfer(bytes, timeoutMillis, isCurrent)) {
++            throw IOException("File-transfer reply could not be queued: ${link.fileTransferStatus()}")
++        }
++    }
++
++    fun fileTransferStatus(): String = link.fileTransferStatus()
++
++    fun recvFileTransfer(timeoutMillis: Long): ByteArray? = link.recvFileTransfer(timeoutMillis)
++
+     /** Closes the owned iAP2 link and its owned byte stream. */
+     override fun close() {
+         val close = synchronized(stateLock) {
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2LinkChannel.kt b/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2LinkChannel.kt
+index 7e56590..c79540c 100644
+--- a/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2LinkChannel.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2LinkChannel.kt
+@@ -12,7 +12,7 @@ import kotlin.math.min
+  * for readiness, queue complete session-10 payloads, receive session-10 payloads, or close this
+  * channel.  This class owns and closes [underlying].
+  *
+- * It deliberately does not parse CSM control messages or implement EA, file transfer, media, UI,
++ * It deliberately does not parse CSM control messages or implement EA, file contents, media, UI,
+  * or any Lockdown setup.
+  */
+ class Iap2LinkChannel private constructor(
+@@ -20,13 +20,18 @@ class Iap2LinkChannel private constructor(
+     private val linkConfig: Iap2LinkConfig,
+     private val initiateNegotiation: Boolean,
+ ) : AutoCloseable {
+-    private data class Command(val control: ByteArray)
++    private data class Command(val control: ByteArray, val fileTransfer: Boolean = false,
++        val isCurrent: () -> Boolean = { true })
+
+     private val lock = Object()
+     private val commands = ArrayDeque<Command>()
+     private var commandBytes = 0
+     private val controls = ArrayDeque<ByteArray>()
+     private var controlBytes = 0
++    private val files = ArrayDeque<ByteArray>()
++    private var fileBytes = 0
++    private var fileTransferSupported = false
++    private var peerSessions: List<Iap2LinkEngine.SessionDescriptor>? = null
+
+     private var ready = false
+     private var peerMaxControlPayloadBytes: Int? = null
+@@ -55,6 +60,11 @@ class Iap2LinkChannel private constructor(
+      */
+     fun peerMaxControlPayloadBytes(): Int? = synchronized(lock) { peerMaxControlPayloadBytes }
+
++    fun fileTransferStatus(): String = synchronized(lock) {
++        "negotiated=${peerSessions != null} writable=$ready closed=${terminated || closing} " +
++            "sessions=${peerSessions?.joinToString { "${it.id}/${it.kind}/v${it.version}" } ?: "pending"}"
++    }
++
+     /**
+      * Copies and queues one raw session-10 payload.  Returns false after close/termination or when
+      * the bounded command queue is full.  A peer LSP length violation is discovered by the worker
+@@ -104,6 +114,32 @@ class Iap2LinkChannel private constructor(
+         }
+     }
+
++    /** [isCurrent] must be non-blocking; it is checked under the queue lock and before dispatch. */
++    fun sendFileTransfer(bytes: ByteArray, timeoutMillis: Long, isCurrent: () -> Boolean = { true }): Boolean {
++        require(bytes.size <= Iap2LinkEngine.MAX_PAYLOAD_BYTES && timeoutMillis >= 0)
++        val copy = bytes.copyOf()
++        synchronized(lock) {
++            throwTerminalFailureLocked()
++            // Writable is transient flow control, not negotiation state. As with control
++            // messages, queue a reply and let the sole link pump wait for peer acknowledgements.
++            if (!fileTransferSupported || !isCurrent()) return false
++            waitFor(timeoutMillis) { terminated || closing || !isCurrent() || hasCommandCapacityLocked(copy.size) }
++            throwTerminalFailureLocked()
++            if (terminated || closing || !isCurrent()) return false
++            return enqueueCommandLocked(copy, fileTransfer = true, isCurrent = isCurrent)
++        }
++    }
++
++    fun recvFileTransfer(timeoutMillis: Long): ByteArray? {
++        require(timeoutMillis >= 0)
++        synchronized(lock) {
++            waitFor(timeoutMillis) { files.isNotEmpty() || terminated }
++            throwTerminalFailureLocked()
++            if (files.isEmpty()) return null
++            return files.removeFirst().also { fileBytes -= it.size }
++        }
++    }
++
+     /**
+      * Marks the channel closed, directly closes its owned stream to break a blocking recv, then
+      * waits a bounded time for the worker.  Stream or worker failures are rethrown, including
+@@ -185,7 +221,9 @@ class Iap2LinkChannel private constructor(
+                     }
+                 }
+             } ?: return
+-            engine.sendControl(command.control, nowMillis())
++            if (!command.isCurrent()) continue
++            if (command.fileTransfer) engine.sendFileTransfer(command.control, nowMillis())
++            else engine.sendControl(command.control, nowMillis())
+             if (isClosing()) return
+         }
+     }
+@@ -203,6 +241,8 @@ class Iap2LinkChannel private constructor(
+                     if (event.value) {
+                         // The engine only emits writable after validating this is positive.
+                         peerMaxControlPayloadBytes = engine.peerSynchronization().maxLength - 10
++                        peerSessions = engine.peerSynchronization().sessions
++                        fileTransferSupported = engine.peerSynchronization().sessions.any { it.kind == 1 && it.version in 1..2 }
+                     }
+                     ready = event.value && !terminated
+                     lock.notifyAll()
+@@ -227,6 +267,22 @@ class Iap2LinkChannel private constructor(
+                     }
+                 }
+
++                is Iap2LinkEngine.Event.FileTransfer -> {
++                    val overflow = synchronized(lock) {
++                        if (files.size >= 256 || event.bytes.size > MAX_PENDING_CONTROL_BYTES - fileBytes) true
++                        else {
++                            files += event.bytes
++                            fileBytes += event.bytes.size
++                            lock.notifyAll()
++                            false
++                        }
++                    }
++                    if (overflow) {
++                        finish(IOException("iAP2 received-file queue limit exceeded"))
++                        return false
++                    }
++                }
++
+                 is Iap2LinkEngine.Event.Dead -> {
+                     finish(IOException(event.reason ?: "iAP2 link ended"))
+                     return false
+@@ -259,6 +315,8 @@ class Iap2LinkChannel private constructor(
+         ready = false
+         commands.clear()
+         commandBytes = 0
++        files.clear()
++        fileBytes = 0
+         controls.clear()
+         controlBytes = 0
+         terminalFailure = combineFailures(terminalFailure, failure)
+@@ -290,9 +348,10 @@ class Iap2LinkChannel private constructor(
+         commands.size < MAX_PENDING_COMMANDS && bytes <= MAX_PENDING_COMMAND_BYTES - commandBytes
+
+     /** lock must already be held. */
+-    private fun enqueueCommandLocked(bytes: ByteArray): Boolean {
++    private fun enqueueCommandLocked(bytes: ByteArray, fileTransfer: Boolean = false,
++        isCurrent: () -> Boolean = { true }): Boolean {
+         if (!hasCommandCapacityLocked(bytes.size)) return false
+-        commands += Command(bytes)
++        commands += Command(bytes, fileTransfer, isCurrent)
+         commandBytes += bytes.size
+         lock.notifyAll()
+         return true
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2LinkEngine.kt b/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2LinkEngine.kt
+index 4fd7d65..a048c45 100644
+--- a/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2LinkEngine.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2LinkEngine.kt
+@@ -28,6 +28,7 @@ class Iap2LinkEngine(
+
+     sealed class Event {
+         data class Control(val bytes: ByteArray) : Event()
++        data class FileTransfer(val bytes: ByteArray) : Event()
+         data class Writable(val value: Boolean) : Event()
+         data class Dead(val reason: String?) : Event()
+     }
+@@ -253,6 +254,13 @@ class Iap2LinkEngine(
+         sendPacket(Packet(0, CONTROL_SESSION_ID, bytes.copyOf()), nowMillis)
+     }
+
++    fun sendFileTransfer(bytes: ByteArray, nowMillis: Long) {
++        val descriptor = peerSynchronization.sessions.firstOrNull { it.kind == 1 && it.version in 1..2 }
++            ?: throw IllegalStateException("Peer has no supported file-transfer session")
++        require(bytes.size <= MAX_PAYLOAD_BYTES && peerPayloadIsAcceptable(bytes))
++        sendPacket(Packet(0, descriptor.id, bytes.copyOf()), nowMillis)
++    }
++
+     private fun parseAvailable(nowMillis: Long): Boolean {
+         if (state == State.DEAD) return false
+         if (state == State.DETECTING) {
+@@ -427,7 +435,10 @@ class Iap2LinkEngine(
+         while (outOfOrder.isNotEmpty() && sequenceDistance(outOfOrder.first().sequence, lastReceivedInOrder) == 1) {
+             val inOrder = outOfOrder.removeAt(0)
+             lastReceivedInOrder = inOrder.sequence
+-            if (inOrder.sessionId == CONTROL_SESSION_ID) enqueueEvent(Event.Control(inOrder.payload))
++            when (inOrder.sessionId) {
++                CONTROL_SESSION_ID -> enqueueEvent(Event.Control(inOrder.payload))
++                FILE_TRANSFER_SESSION_ID -> enqueueEvent(Event.FileTransfer(inOrder.payload))
++            }
+         }
+
+         if (peerSynchronization.maxAcknowledgements == 0) return
+diff --git a/protocol/src/test/java/com/shilapi/xcertplay/iap2/message/Iap2ArtworkReceiverTest.kt b/protocol/src/test/java/com/shilapi/xcertplay/iap2/message/Iap2ArtworkReceiverTest.kt
+new file mode 100644
+index 0000000..282d957
+--- /dev/null
++++ b/protocol/src/test/java/com/shilapi/xcertplay/iap2/message/Iap2ArtworkReceiverTest.kt
+@@ -0,0 +1,113 @@
++package com.shilapi.xcertplay.iap2.message
++
++import org.junit.Assert.*
++import org.junit.Test
++import java.nio.ByteBuffer
++
++class Iap2ArtworkReceiverTest {
++    private val replies = mutableListOf<ByteArray>()
++    private val completed = mutableListOf<Triple<Long,Int,ByteArray>>()
++    private var now = 0L
++    private fun receiver(valid: Boolean = true) = Iap2ArtworkReceiver(replies::add,
++        { revision, id, bytes -> completed.add(Triple(revision,id,bytes)); valid }, { now })
++    private fun setup(size: Long = 4, id: Int = 128, type: Int = 2, version: Int = 2) =
++        ByteBuffer.allocate(if (version == 1) 10 else 12).put(id.toByte()).put(4).putLong(size)
++            .apply { if (version == 2) putShort(type.toShort()) }.array()
++    private fun data(kind: Int, vararg bytes: Int, id: Int = 128) = byteArrayOf(id.toByte(),kind.toByte(), *bytes.map(Int::toByte).toByteArray())
++    private fun replyKinds() = replies.map { it[1].toInt() and 255 }
++
++    @Test fun setupCanPrecedeMetadataAndFragmentsCompleteExactlyOnce() {
++        val r = receiver(); r.receive(setup()); assertTrue(replies.isEmpty())
++        r.expect(128, 7); assertEquals(listOf(1), replyKinds())
++        r.receive(data(0x80,255,216)); r.receive(data(0x40,255,217))
++        assertEquals(listOf(1,5), replyKinds()); assertEquals(7L, completed.single().first)
++        assertArrayEquals(byteArrayOf(-1,-40,-1,-39), completed.single().third)
++        r.receive(data(0x40,1)); assertEquals(1, completed.size)
++    }
++
++    @Test fun changingTrackCancelsOldTransferAndLateChunksCannotCompleteIt() {
++        val r = receiver(); r.expect(128, 1); r.receive(setup()); r.receive(data(0x80,255,216))
++        r.expect(129, 2); r.receive(data(0x40,255,217))
++        assertTrue(completed.isEmpty()); assertTrue(replyKinds().contains(2))
++    }
++
++    @Test fun initialSetupSurvivesMetadataThatDoesNotYetContainArtworkId() {
++        val r = receiver()
++        r.receive(setup())
++        r.expect(null, 1) // Playback app / title arrive in separate incremental messages.
++        r.expect(null, 2)
++        assertTrue(replies.isEmpty())
++        r.expect(128, 2)
++        assertEquals(listOf(1), replyKinds())
++        r.receive(data(0xc0,255,216,255,217))
++        assertEquals(2L, completed.single().first)
++        assertEquals(listOf(1,5), replyKinds())
++    }
++
++    @Test fun nextSetupSurvivesTrackChangeWhileOldTransferIsCancelled() {
++        val r = receiver()
++        r.expect(128, 1); r.receive(setup()); r.receive(data(0x80,255,216))
++        r.receive(setup(id = 129)) // New file queue wins the race against new metadata.
++        r.expect(null, 2)
++        assertEquals(listOf(1,2), replyKinds())
++        r.expect(129, 2)
++        r.receive(data(0xc0,255,216,255,217, id = 129))
++        assertEquals(129, completed.single().second)
++        assertEquals(listOf(1,2,1,5), replyKinds())
++    }
++
++    @Test fun overLimitWrongTypeWrongOrderTruncationAndDecodeFailureAreRejected() {
++        val r = receiver(false); r.expect(128, 1)
++        r.receive(setup(Iap2ArtworkReceiver.MAX_BYTES + 1L)); r.receive(setup(type = 3))
++        assertEquals(listOf(2,2), replyKinds())
++        r.receive(setup()); r.receive(data(0,255,216)) // Missing FIRST.
++        assertTrue(completed.isEmpty())
++        r.receive(setup()); r.receive(data(0xc0,255,216,255)) // Truncated size.
++        assertEquals(6, replyKinds().last())
++        r.receive(setup()); r.receive(data(0xc0,255,216,255,217))
++        assertEquals(6, replyKinds().last()) // Decoder rejected JPEG contents.
++    }
++
++    @Test fun versionOneArtworkTimeoutAndSenderCancellationAreHandled() {
++        val r = receiver(); r.expect(128, 1); r.receive(setup(version = 1))
++        now = 15001; r.expire(); assertEquals(2, replyKinds().last())
++        r.receive(setup()); r.receive(data(2)); r.receive(data(0xc0,255,216,255,217))
++        assertTrue(completed.isEmpty())
++    }
++
++    @Test fun failedStartRetiresOnlyThatTransferAndLaterArtworkStillCompletes() {
++        val diagnostics = mutableListOf<String>()
++        var failReply = true
++        val r = Iap2ArtworkReceiver({ bytes ->
++            if (failReply) throw java.io.IOException("Synthetic transport backpressure")
++            replies.add(bytes)
++        }, { revision, id, bytes -> completed.add(Triple(revision, id, bytes)); true }, { now }, diagnostics::add)
++        r.expect(128, 1)
++        r.receive(setup()) // Rejected START retires this transfer.
++        assertTrue(diagnostics.any { it.contains("START SEND FAILED") })
++        assertFalse(diagnostics.any { it.contains("START queued") })
++        r.receive(data(0xc0,255,216,255,217)) // Late data cannot complete the retired transfer.
++        assertTrue(completed.isEmpty())
++        failReply = false
++        r.expect(129, 2)
++        r.receive(setup(id = 129))
++        r.receive(data(0xc0,255,216,255,217, id = 129))
++        assertEquals(listOf(1,5), replyKinds())
++        assertEquals(129, completed.single().second)
++    }
++
++    @Test fun failedCancellationStillAllowsTheNextAdvertisedArtworkToStart() {
++        var failCancel = false
++        val r = Iap2ArtworkReceiver({ bytes ->
++            if (failCancel && bytes[1].toInt() == 2) throw java.io.IOException("Synthetic queue timeout")
++            replies.add(bytes)
++        }, { revision, id, bytes -> completed.add(Triple(revision, id, bytes)); true }, { now })
++        r.expect(128, 1); r.receive(setup())
++        r.receive(setup(id = 129))
++        failCancel = true
++        r.expect(129, 2) // Called by the control loop; must not fail its connection.
++        r.receive(data(0xc0,255,216,255,217, id = 129))
++        assertEquals(listOf(1,1,5), replyKinds())
++        assertEquals(2L, completed.single().first)
++    }
++}
+diff --git a/protocol/src/test/java/com/shilapi/xcertplay/transport/Iap2FileTransferLinkTest.kt b/protocol/src/test/java/com/shilapi/xcertplay/transport/Iap2FileTransferLinkTest.kt
+new file mode 100644
+index 0000000..95cb7d5
+--- /dev/null
++++ b/protocol/src/test/java/com/shilapi/xcertplay/transport/Iap2FileTransferLinkTest.kt
+@@ -0,0 +1,47 @@
++package com.shilapi.xcertplay.transport
++
++import org.junit.Assert.*
++import org.junit.Test
++
++class Iap2FileTransferLinkTest {
++    private fun pair(): Pair<Iap2LinkEngine, Iap2LinkEngine> {
++        val a = Iap2LinkEngine(); val b = Iap2LinkEngine()
++        a.start(false, 0); b.start(false, 0)
++        repeat(6) {
++            b.feed(a.takeOutput(), 0); a.feed(b.takeOutput(), 0)
++        }
++        assertEquals(Iap2LinkEngine.State.NORMAL, a.state())
++        assertEquals(Iap2LinkEngine.State.NORMAL, b.state())
++        while (a.pollEvent() != null) {}
++        while (b.pollEvent() != null) {}
++        return a to b
++    }
++
++    @Test fun fileAndNavigationPayloadsUseTheSameLinkWithSeparateEvents() {
++        val (a,b) = pair()
++        val navigation = byteArrayOf(0x52,1,0)
++        val file = byteArrayOf(-128,4,0,0)
++        a.sendControl(navigation, 1); a.sendFileTransfer(file, 1)
++        b.feed(a.takeOutput(), 1)
++        assertArrayEquals(navigation, (b.pollEvent() as Iap2LinkEngine.Event.Control).bytes)
++        assertArrayEquals(file, (b.pollEvent() as Iap2LinkEngine.Event.FileTransfer).bytes)
++        assertNull(b.pollEvent())
++    }
++
++    @Test fun missingFilePacketIsRetransmittedBeforeLaterControlPayloadIsDelivered() {
++        val (a,b) = pair()
++        val file = byteArrayOf(-128,-64,-1,-40,-1,-39)
++        a.sendFileTransfer(file, 1)
++        a.takeOutput() // Simulate a lost datagram.
++        a.sendControl(byteArrayOf(0x52,1), 2)
++        b.feed(a.takeOutput(), 2)
++        assertNull(b.pollEvent()) // Control packet waits in the common sequence window.
++        a.feed(b.takeOutput(), 3)
++        a.advanceTime(20000)
++        b.feed(a.takeOutput(), 20000)
++        val received = mutableListOf<Iap2LinkEngine.Event>()
++        while (true) received.add(b.pollEvent() ?: break)
++        assertTrue(received.any { it is Iap2LinkEngine.Event.FileTransfer && it.bytes.contentEquals(file) })
++        assertTrue(received.any { it is Iap2LinkEngine.Event.Control })
++    }
++}
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+index bdfdc19..60d521b 100644
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -1,5 +1,6 @@
+ package com.playport.server
+
++import com.shilapi.xcertplay.airplay.AirPlayIcon
+ import com.shilapi.xcertplay.airplay.AirPlayConfig
+ import com.shilapi.xcertplay.airplay.AirPlayContact
+ import com.shilapi.xcertplay.airplay.AirPlayDeviceInfo
+@@ -88,7 +89,8 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+             microphone = true,
+             manufacturer = config.manufacturer,
+             model = config.model,
+-            oemLabel = config.deviceName,
++            oemLabel = "设置",
++            icons = listOf(AirPlayIcon(180, 180, checkNotNull(javaClass.getResourceAsStream("/f50-settings.png")).use { it.readBytes() })),
+         )
+
+     private val listener = object : AirPlaySessionListener {
+@@ -100,7 +102,8 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+
+         override fun onSessionEnded(session: AirPlaySession) {
+             log.info("CarPlay session ended peer={}", session.host)
+-            if (activeSession === session) activeSession = null
++            if (activeSession !== session) return
++            activeSession = null
+             bridge.endMicrophone()
+             hub.setSessionState(false, null)
+         }
+@@ -110,6 +113,12 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+             hub.setSessionState(true, info.name)
+         }
+
++        override fun onHostUiRequested(session: AirPlaySession) {
++            if (activeSession !== session) return
++            log.info("CarPlay requested receiver settings")
++            hub.hostUiRequested()
++        }
++
+         override fun onTransportError(message: String) {
+             log.warn("AirPlay transport error: {}", message)
+         }
+@@ -236,6 +245,25 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+             log.warn("could not open tunneled iAP2 link: {}", error.message)
+             return false
+         }
++        val metadata = NowPlayingState()
++        val tunnelSession = activeSession
++        val tunnelDone = java.util.concurrent.atomic.AtomicBoolean(false)
++        val artwork = com.shilapi.xcertplay.iap2.message.Iap2ArtworkReceiver(
++            send = { channel.sendFileTransfer(it) { !tunnelDone.get() && activeSession === tunnelSession } },
++            complete = { revision, id, bytes ->
++                activeSession === tunnelSession && metadata.value.revision == revision && metadata.artworkId == id && hub.artwork(revision, bytes)
++            },
++            clock = { System.nanoTime() / 1_000_000 },
++            onDiagnostic = { log.debug(it) },
++        )
++        Thread({
++            try {
++                while (!tunnelDone.get() && activeSession === tunnelSession && !channel.isClosed) {
++                    channel.recvFileTransfer(250)?.let(artwork::receive)
++                    artwork.expire()
++                }
++            } catch (_: Exception) { log.debug("Artwork transport ended") }
++        }, "wireless-artwork").apply { isDaemon = true; start() }
+         Thread(
+             {
+                 try {
+@@ -247,6 +275,15 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+                         endpoint = endpoint,
+                         timeoutMillis = Iap2WirelessControlClient.NO_TIMEOUT_MILLIS,
+                         onReady = { log.info("wireless iAP2 tunnel ready; CarPlay is live") },
++                        onIncoming = { frame ->
++                            if (activeSession === tunnelSession) {
++                                try { metadata.accept(frame)?.let {
++                                    hub.nowPlaying(it)
++                                    artwork.expect(metadata.artworkId, it.revision)
++                                } }
++                                catch (_: Exception) { log.debug("Ignoring malformed NowPlaying update") }
++                            }
++                        },
+                         onProgress = { log.debug("iAP tunnel $it") },
+                     )
+                     when (result.terminal) {
+@@ -255,7 +292,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+                     }
+                 } catch (error: Exception) {
+                     log.warn("tunneled iAP2 control failed: {}", error.message)
+-                }
++                } finally { tunnelDone.set(true) }
+             },
+             "wireless-tunnel-control",
+         ).apply {
+diff --git a/server/src/main/kotlin/com/playport/server/NowPlaying.kt b/server/src/main/kotlin/com/playport/server/NowPlaying.kt
+new file mode 100644
+index 0000000..464458a
+--- /dev/null
++++ b/server/src/main/kotlin/com/playport/server/NowPlaying.kt
+@@ -0,0 +1,45 @@
++package com.playport.server
++
++import com.shilapi.xcertplay.iap2.body.Iap2BodyReader
++import com.shilapi.xcertplay.iap2.wire.Iap2Frame
++import kotlinx.serialization.Serializable
++
++@Serializable
++data class NowPlaying(val title: String = "", val artist: String = "", val album: String = "", val durationMs: Long? = null, val positionMs: Long? = null, val speed: Double = 1.0, val revision: Long = 0)
++
++/** Merge partial iPhone updates; clear stale song fields only at a confirmed item boundary. */
++class NowPlayingState {
++    @Volatile var value = NowPlaying(); private set
++    @Volatile var artworkId: Int? = null; private set
++    private var persistentId: Long? = null
++    private var queueIndex: Long? = null
++    private var player: String? = null
++    @Synchronized fun accept(frame: Iap2Frame): NowPlaying? {
++        if (frame.messageId != 0x5001) return null
++        val body = Iap2BodyReader.of(frame)
++        val item = body.optionalGroup(0)
++        val playback = body.optionalGroup(1)
++        val id = item?.optionalU64(0)
++        val queue = playback?.optionalU32(2)
++        val app = playback?.optionalString(16)
++        // Parse everything before mutating state, so malformed input is atomic.
++        val title = item?.optionalString(1)?.take(1024)
++        val artist = item?.optionalString(12)?.take(1024)
++        val album = item?.optionalString(6)?.take(1024)
++        val duration = item?.optionalU32(4)
++        val position = playback?.optionalU32(1)
++        val speed = playback?.optionalU16(12)?.div(100.0)
++        val artwork = item?.optionalU8(26)?.also { require(it >= 128) }
++        val changed = (app != null && player != null && app != player) ||
++            (if (id != null && persistentId != null) id != persistentId else queue != null && queueIndex != null && queue != queueIndex)
++        if (changed) { value = NowPlaying(revision = value.revision + 1); persistentId = null; queueIndex = null; artworkId = null }
++        persistentId = id ?: persistentId
++        queueIndex = queue ?: queueIndex
++        player = app ?: player
++        if (artwork != null && artworkId != null && artwork != artworkId && !changed) value = value.copy(revision = value.revision + 1)
++        artworkId = artwork ?: artworkId
++        value = value.copy(title = title ?: value.title, artist = artist ?: value.artist, album = album ?: value.album,
++            durationMs = duration ?: value.durationMs, positionMs = position ?: value.positionMs, speed = speed ?: value.speed)
++        return value
++    }
++}
+diff --git a/server/src/main/kotlin/com/playport/server/WebHub.kt b/server/src/main/kotlin/com/playport/server/WebHub.kt
+index cf071ed..3408ba4 100644
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -63,6 +63,9 @@ data class DisplayRequest(
+ @Serializable
+ data class ServerMessage(
+     val type: String,
++    val nowPlaying: NowPlaying? = null,
++    val artwork: String? = null,
++    val revision: Long? = null,
+     val deviceName: String? = null,
+     val sessionActive: Boolean = false,
+     val width: Int? = null,
+@@ -127,15 +130,38 @@ class WebHub(
+     }
+
+     @Volatile private var sessionActive = false
++    @Volatile private var nowPlaying = NowPlaying()
++
++    @Volatile private var artwork: String? = null
++
++    @Synchronized fun artwork(revision: Long, bytes: ByteArray): Boolean {
++        if (!sessionActive || nowPlaying.revision != revision) return false
++        artwork = "data:image/jpeg;base64," + java.util.Base64.getEncoder().encodeToString(bytes)
++        broadcastJson(ServerMessage(type = "artwork", artwork = artwork, revision = revision))
++        return true
++    }
++
++    @Synchronized fun nowPlaying(value: NowPlaying) {
++        if (!sessionActive || value == nowPlaying) return
++        if (value.revision != nowPlaying.revision) artwork = null
++        nowPlaying = value
++        broadcastJson(ServerMessage(type = "now-playing", nowPlaying = value))
++    }
++
+     @Volatile private var phoneName: String? = null
+
+     fun setVideoCodec(type: Int, codec: VideoCodec) {
+         codecsByStream[type] = codec
+     }
+
++    fun hostUiRequested() {
++        broadcastJson(ServerMessage(type = "host-ui", sessionActive = sessionActive))
++    }
++
+     fun videoCodec(type: Int): VideoCodec? = codecsByStream[type]
+
+     fun setSessionState(active: Boolean, name: String?) {
++        if (!active) { nowPlaying = NowPlaying(); artwork = null }
+         sessionActive = active
+         phoneName = name
+         broadcastJson(
+@@ -283,6 +309,9 @@ class WebHub(
+                                 ServerMessage.serializer(),
+                                 ServerMessage(
+                                     type = "hello",
++                                    nowPlaying = nowPlaying,
++                                    artwork = artwork,
++                                    revision = nowPlaying.revision,
+                                     deviceName = config.deviceName,
+                                     sessionActive = sessionActive,
+                                     width = display.width,
+diff --git a/server/src/main/resources/f50-settings.png b/server/src/main/resources/f50-settings.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..f96599a47dc689b746b802a5de76ee5f7db628dc
+GIT binary patch
+literal 4703
+zcmb`L`8O2a|Hl<EkwmhMeP6~hnPNi1Ap4fc&SXipu}gR-TL?vHEH%m4X+hI4yr-Cv
+zWn>Fs#y<9)$vR(s|AEgrpY!?Q-h0lyulqQ!d(U~j&g=PlW@&E7&MLslz`($6bQ@-U
+zy4L?4fU~Fbr@9xO3=CY-MlhW_k%g;8(OGwfUjMrerM4V^wVtXnc62>?ai-1oDRUwq
+z{@uewdj%^=V99ccbpZ(LVASb16!4(YdQ{QO_Hi|meYCmT0Sg0zZ;ID$a_Z<?rhJmk
+zoT~ZW{qN7-=s-#|Y4ir|<&WDm{P}?xYB-H{Xo6zFTF}?_TS7<?H!a6HHMkjMS(FZ|
+z7#M;XWX^hByv5pa=JpvVgPbUf=($;j_x}j~!=1&LbvBs6`quyOu-v%q7C?@jjq3F5
+zQi(E)E~^2b9IKr=e0;aOKmSosqMIo|_k`;0^b-?&2^8<pw_W{i28{ObTXJx;iARuq
+z9tG*+0iGZY_-GFJ{oDN7*GOrQd%9YVAQPMv_4|`%r*y^x7nPZv?Xs{!RnPu>n4fR7
+z!etB7r;B(f9wSo(&H1sWIrt^kkk)i~F_gBaN-FR`Cw(N^{|RJG9KU=)LI>;So}SxX
+z95ob01uZPC_yn@gTa&)dM6u7egE8-X5|}<$ypxR?T>)xD(8IS6TSx0X-?}xl!I|I!
+zwc@Bwl!xEffWGa&gyqsSB`BQPpnM@JgL)1HODTaUJ-%&RSs{sDOnv7!8n>YxM^7FC
+zl0T*e$Ok;i8A1s%&6Fg5dk==Ud^t+J5<-<_?fiXxrtnXQk@`9+X)?AEC2KtX)7F&y
+zyMdZ9WKl!;c$fowT&}k(%7Tv+b;TT2s|vTowzq*5`MU&6Z$G*G9b?~C>Vck#il~j6
+zN6}*x0~Ywiv{kE=+#hSni=Dp0j<<*2;~z&M=a}-cdh{@RUEoO1G7kFHsAar<@8imo
+z<y@*?G9sf&d*W_PgRaV2&;6Fz&3KkN#}^@jB#d##vpAS0X9=#2<IQE_FZgnk?$mtZ
+z_KSDbkMD=|LoVssK35)krPu!Fc8iKn(l;p2nDf?tc1U#!%el)d8vU|C`UpApPr)F5
+z2}$&&mrC|(iiN#b<{Ig-;sGh?4bpR#^c?RCNU>;jSvVg`dH~R<c99y~xa^)Fpu;g6
+z$PQ2VU4V?Ybd=@MGWJX@ht2M)DHl?*N#hOkqkHK4yN$OhrC1C)f+v2|z=g2^i8I(j
+zu#?gcKx2x{M?TM;295~a0X{?V@S>mgU_pZr*qWWw>5?5L6+s=@8@+6S`%o3KS-n_c
+zUp=Xw^XiR{t?sABV+#}Iu@4V>+1C9Z8nso`)2(WTSn(dJf2gjw6Xe&B{@l`B)u&gz
+ze2}P@M9S~_rMa+zy|v!44C543C6iiP{ib)@nn;+OEx7oa`_Z)!>d{PTnyGWoIS!-q
+z=^yiJ*OyjXXNy@tL@C&PNn^7P9Tjul>Ml~@{_<FB?&sA{Q4K`<P6)@v_kqzncD??i
+zsYf5U5?)^7dBDjeb}sE6Oio?DE3EhR)lIUpYmB>H*-Brqoc}W-ef3Lg(`R3Nsl3U(
+zHJRcsF4zw3d!TKz==5tu4<K!&X@RmH<F$R*vuQ8yb(N$=kYyuD051|UVvh3FV@v}M
+z7k>7OXdVq{H}`=&0$wY-w2y>O0C~EXeKgv`alU?%cU>;VBM6`Jx{JR?-nApksVZ0#
+zkfv}wTCpcb^-|A$$L#Y<9LDVwqvzk$X|iU>B!iAl*P~tw*XZxPKQcr_60&BZE;}Ft
+zoz#`7>eJ=g2f?Co9+-pX5CEa{Ogti>d<p+#Cok^L=TN*cGRfpYJ4H|E7QY0aj2V1R
+zBC{?g&e5hDw9BZFYPk3+gcR_MIKGhl>K1j9yJaEDGweEKb<gn4NZhPXHvbaXx(5#n
+zB_yFI4!VYLuM1I?#CD$*!`xZ~ymvL<DJb;{CA4-&Bst4Aw72-`V*M|hwy8szxwq+3
+z>@%BRu4{eqT+W9H&Zk>Q*}n><3AIp18<NnkNNqVGW>Re4=E`?bgJ<j{(1n!IC!IwX
+z+!JKsRW7kY8Scp(o}eqLBGDl;#V6m<Xd$(z6fFpeYObY-&a;wn2v#B4#%rs3T5q%@
+z>++lM5r9qMt)C-Y`yrx?LehmHMOi0)u|0$yY-Rt9IGb)QwMRY7>EYF>s}7@OwOhe$
+zkQymr<r>B-rEvh<Cx1hd(p`y$S~#Ya`RKTD6%YN6Xf=UmE@SOC`&oy{cdaibWD)Hj
+zUIjPch7^s|<1HGZC}*B$8H~>gobh;8_E01G(P2mw_>rD;CJL_9pCQ{Th=<q<9H~<U
+z2*+QKGKyWCZS+PM*;6mR!af7>iFA5J?Cvf4zV1`dn3s@gb^v|s44WvNNw6#x_eDS>
+z<fQEHKolA{xJsyVD=G$oS(a?OmvpD@0}Z$KF|}W$xfbK+9$hgXFi87p5IDG2laS?a
+zNjTY0?Fz(fJk}fd)zZ3JTUM-v`~um%jKUgBO`U{=*-k5%KUG|A?Bbz>%~6Th%B<0d
+zV=9S0wd=aYxAJp%-g(qre15>9;EuB~u?!htAM|9El7R=5Dq2B<bi9cNLQUD=Y}LJr
+zxZ8jYf!E)CZ=L>0>yRG5w+u$Af>S*AF%n(1G&yu*g&z4$B|e5XPk*|ybS=-`u+>j$
+zDcFrJS!W5#uqeF{$L{16*i%>E1#QRcPax{fw=lN~_uV;;iMQ%|dKmZ$LCz+*p{j)u
+z+Tx0*=_q_+v!^0Z8RvJJTZra78EI@MNyjgm8+KSYXgAtF6#!$6)IJqWR{~GM`??qJ
+zjVU?)bcj*sLd!eu3H>?QR`y>YXYZ6jq$*){8IwD4k3*LB18WL@k?-y}5xSU|KH{Xk
+z7A;zB_`3yrHuDV(wvDgY<@COZnSVK|ny3B8RXO1Jt)G|$ETvYE4;627w8yJd@QWNS
+z`G#Y<9`qGBzt~D07G+k0<ybMYb8q)-{)wo=dQ4=jbs#yNp_g>^jV=6*oHeVu5YEn!
+z<`?D{Vwa%Rpy?6)lfD*gO_eVh;bq3BT?XG;9&56ht89LEE0hL}k3?1ZhQhZxMEUZ5
+zdBa!*=fsmTGtg@58g9N0MMLRU1c>fUf!lNh1@FtfI2dKmnX<}$bWC+|3MQoIMmjl_
+zgA6}}3(fywuH$|<VRd{n)b`r7RWh&3fqD_YO~aw@E{FvVa$f>sX-aV$G8Ehr+h=nj
+zyS+y(afZw?Np?E?!`IR+`&A6W8or(8&h_Z2IgwUu3$$|7U~q2Zc+%**eN)&Nwy5c*
+zs^=%a;oIEJmPn4yx-OikPa=F_sa12od*Nn92Zb8B{x3c=(+dgrf_*nK>)>RHpX?ky
+z5Soxl5dz4a9{@EmosUflLFoI<ti=e!r#(x)zO?l~^33^Is|GVI7QB<yspHzOiu_q)
+z1A8r&xUQ!$8KiH-_lVn9gOA#$R&sq7aEU@I^L&wHKY8C}`~V-eO+~YvtCdyU{6mi!
+z+zzLaMJ1nw!SCcTbH4YQ<-2HVWop(G(xY1Qqs{dVlnq|LJ4sX!iPD5?7}<#6%>QjL
+zcK#u@*K;Qr;%dM7(?V&X5UH}G7P0!{ccVJxtg3)hhW0+nH<e5B!+E{TKR>*4D%7CN
+znbYx1xz8H6+z3Y2$-x)2pPcjE@;jGu_P?zR4OlBn0x-lg!RY|&h>4)&v%%>p61yYp
+zUrrw0*8AsIpxQV?KGdAKpKl^)xzfnr2P3hZ<fvd{atx_pXZLTL2tpb8-!}8rdzy&>
+zDxL1(PHi?`M0`(_ZkW1$YT|+l!2EoFy;-^eg;)5+&WjvO8hL*mVws4Y(#`(;;;fmk
+zVNpszyiWFSS<CIe9J|{8=T!XVu!jBRp#E|o(|<YP+^6@M1)|iPe5`?wvVZ@alvqz<
+zGxJ^kO3dp!by1?(;h9P`7&{d&D8m?-9)J-g8hr!41uAtQwl*G}ng$QrqMgRP6?UPi
+zVK*MBclZ9oX$@x9HqW@6DO`6R+8LYl_GSrAZWP*Bvyd9Rno7roUC`|)tyg@#AUM2+
+z4Om=2Eop{fSb1-(WM-mGC<-%$Zko~kOnKIpGs?P}4#KNGfkMNBv#HMe+L<CW!)x$S
+zEyDq%YkxJ&=HjLSXXi+`t2A)Xh2wZ)l2LJCDWPL4FaAn9Vj`-{;u>T~0opAA@D!qE
+z@olqO2wy2ajp>|ELdgflC2z~mEAsI6tRSzsJK^PY@AKajhMR#y_Pwc=grKjhxs1sy
+z{kc-b*bb8582~Cwqv<JKeQns;*ajTZzE8bZn+9&nb=OfLjgqGCIeVKG+spE3M-A)v
+z&B7DNWSpAwhaqFSN#~W589pl5d8|1i&h>g(9*jqvwX?`E*C~{g^Xy(1e|sDc_U<i!
+z6~P0$SLA8ZPR}#F01zXc);|$Lw{$z9YPJncv<=6ma3C^#9F3CAb?+V=Jgjv#{~%lV
+zWHQ(TKsX*9Z;eGPx|$)gA_`~F&)w>2Li~|%?}+j0qxl%yZ>*jxixCtB;B^2Yinu?%
+z^MK|Y9Y#XH_?g=Bf>Va%#Bht<ig_;eThocqF{L6OIV!fYrGEGOY1|uA7iBwjpcd`$
+zR&xCuj!~q2=W1fiNq-j>fp1QxubJE%3wN@RV&cj|UD9q?fg(?mO?Yl@ym|;4w(Ue6
+zEOu1dxu`)J1k`8>%E=vXz{0Zj9IZPJL1MU_YfnVf6!U32tFFKT-=*GpS*kow9!rVU
+z+BH_uP(Qk*RZb}WUAorBt2vr$bQm7dmbmiLeN)zqkAO5QP+J{!EoF2cY~0GId~DgO
+zLf;Rp)%*evCd<8vwkBAA96^Q7uTfndAN80We-*@!+_8OrDZ#2l=sPCoMzP(FPxb>)
+z@z8FOr+9D2X!s&F@B=p)fiqcaiSrJOtCqy2eGnwhGar5)KsRsHIBIsbo!bt!IqTW|
+z^N!xo-j0yV=Lg$eV~v5@gTn=+8^y!wssJi0zFhJ3sdy?H9!2bqL%l7E%VkqnP^_lD
+z&xo!2BiXdNm{P4*JBIcZ{7@K75~E!}C(Q9uVtQUJ>gt3qOJYFx4{(-z-p8XyByvl&
+ztu(#T4nrBA+WEK&FDSTR3s0X*dv`9yPmVW#bC%FEe7rz4L*K*Qcq#uYBr>PyWs3Hn
+z=_=<LBDpyz7VB2=zMJ;^lKAw>zn3-OfKre7W>N)veiXM>-R+81hmrOBlF|3v2xAk`
+zfpI%_N$8=Vj~sS67!+lz!}q=HsVIpXe50M^H#eV|V))ubpA`+^0hGX#t7Ibkz^dWv
+z&U+$NS967icl)Dl8YGhA3M3u~D2UwaxiWXEg+4d-eD#TwIOI%#MU*b=B&7igLoz?Q
+zkpRSW6?uI8*iEAW%xa%Z3vFkeD~VGLlGjft0GbPDUX4eXXr8o<t;d2vs=D%*x$}BB
+zQ<o2%Ewq|ePDEDK2Ps^cRSA*1_BoE5qq<f(^O4=b6M>q0v%6KXFG5nM@~tL@jOFC<
+zj9+yf<@a~fc*ikr<b+(W&T`w(iUq7pe85CwzKC$Fg6<}UDTejw6{lZ~!+ztB>A&qx
+zA}8G*ii1Z!e<05S_OzXh2hLTMtmXiDyAKPX-eJ#0fRG)~BVo_#`utL>Nmj9Z(f1Wh
+zX)Wl^;+F5q{)ZdHy6R}}-dLMqt|XVz<Mi?l&i92(@TP@1!7?dfjW6)6Z~OyPa}9q&
+z#mqGJ7t$2sRj%__(^E$dIXL_l$V~x;w1c7vt;K58%LI3(CLQ<I(v3MjEN%*%8<DEt
+zo3`%&A$r)1IRaHV#Q?PXSG5*Rv2LCqM=AAMAeQ14SI-O+>hbHMcblP~ycn79vfsN!
+z{!JdJg2>C`1;m(U_R#M;H2K(MHgj4;JnQ-W>Pxw*xwr?anwEJzF>jt<RI)ZG>dS*?
+yy$w|N@5tve6POEPQ$PQ|Y=iu#?uz&f{Y;9GOclOGa^tjd#9*Xv4y)C5i~m369wD0m
+
+literal 0
+HcmV?d00001
+
+diff --git a/server/src/test/kotlin/com/playport/server/NowPlayingTest.kt b/server/src/test/kotlin/com/playport/server/NowPlayingTest.kt
+new file mode 100644
+index 0000000..eaa6bf9
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/NowPlayingTest.kt
+@@ -0,0 +1,29 @@
++package com.playport.server
++import com.shilapi.xcertplay.iap2.message.Iap2Messages
++import org.junit.Assert.*
++import org.junit.Test
++class NowPlayingTest {
++    @Test fun durationPositionAndArtworkArePartialAndBoundToTrack() {
++        val state = NowPlayingState()
++        state.accept(Iap2Messages.buildRaw(0x5001) { group(0) { u64(0,1); u32(4,200000); u8(26,128) }; group(1) { u32(1,50000) } })
++        assertEquals(200000L,state.value.durationMs)
++        assertEquals(50000L,state.value.positionMs)
++        assertEquals(128,state.artworkId)
++        state.accept(Iap2Messages.buildRaw(0x5001) { group(1) { u32(1,52000) } })
++        assertEquals(200000L,state.value.durationMs)
++        assertEquals(52000L,state.value.positionMs)
++        state.accept(Iap2Messages.buildRaw(0x5001) { group(0) { u64(0,2) } })
++        assertNull(state.value.durationMs); assertNull(state.value.positionMs); assertNull(state.artworkId)
++    }
++
++    @Test fun partialUpdatesAndTrackChanges() {
++        val state = NowPlayingState()
++        state.accept(Iap2Messages.buildRaw(0x5001) { group(0) { u64(0,1); string(1,"Song"); string(12,"Artist"); string(6,"Album") } })
++        state.accept(Iap2Messages.buildRaw(0x5001) { group(1) { u8(0,2) } })
++        assertEquals(NowPlaying("Song","Artist","Album"),state.value)
++        state.accept(Iap2Messages.buildRaw(0x5001) { group(0) { string(1,"Updated title") } })
++        assertEquals("Artist",state.value.artist)
++        state.accept(Iap2Messages.buildRaw(0x5001) { group(0) { u64(0,2); string(1,"Next") } })
++        assertEquals(NowPlaying("Next",revision = 1),state.value)
++    }
++}
+diff --git a/server/src/test/kotlin/com/playport/server/OemSettingsTest.kt b/server/src/test/kotlin/com/playport/server/OemSettingsTest.kt
+new file mode 100644
+index 0000000..135c6ab
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/OemSettingsTest.kt
+@@ -0,0 +1,24 @@
++package com.playport.server
++
++import com.shilapi.xcertplay.airplay.AirPlayInfoPlist
++import org.junit.Assert.*
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++
++class OemSettingsTest {
++    @get:Rule val temporary = TemporaryFolder()
++    @Test fun advertisesRealSettingsIconToPhone() {
++        val root = temporary.root.toPath()
++        CarPlayServer(ServerConfig(identityDir = root, stateDir = root.resolve("state"), bindAddress = "127.0.0.1")).use { server ->
++            val info = AirPlayInfoPlist.build(server.airPlayConfig)
++            assertEquals(true, info["oemIconVisible"])
++            assertEquals("设置", info["oemIconLabel"])
++            val icon = (info["oemIcons"] as List<*>).single() as Map<*, *>
++            val bytes = icon["imageData"] as ByteArray
++            assertArrayEquals(byteArrayOf(-119,80,78,71,13,10,26,10), bytes.take(8).toByteArray())
++            assertEquals(180, java.nio.ByteBuffer.wrap(bytes,16,4).int)
++            assertEquals(180, java.nio.ByteBuffer.wrap(bytes,20,4).int)
++        }
++    }
++}
+diff --git a/web/check-car.mjs b/web/check-car.mjs
+new file mode 100644
+index 0000000..993c162
+--- /dev/null
++++ b/web/check-car.mjs
+@@ -0,0 +1,57 @@
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import ts from 'typescript';
++async function load(name, transform = s => s) {
++  const source=transform(readFileSync(new URL(`./src/${name}.ts`,import.meta.url),'utf8'));
++  const {outputText}=ts.transpileModule(source,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ESNext}});
++  return import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
++}
++const {fittedSize,suggestedResolution,aspectChanged}=await load('display-fit');
++for(const [w,h] of [[1920,1080],[2560,1440],[1920,720],[720,1280],[800,480],[320,700]]){
++ const size=fittedSize(1280,720,w,h); assert.ok(size.width<=w+.01&&size.height<=h+.01);assert.ok(Math.abs(size.width/size.height-16/9)<.0001);
++ const target=suggestedResolution(w,h);assert.ok(Object.values(target).every(v=>v>=480&&v<=1920&&v%2===0));
++ assert.ok(!aspectChanged(target,target));
++}
++assert.equal(aspectChanged({width:1280,height:720},{width:1920,height:1080}),false);
++assert.equal(aspectChanged({width:1280,height:720},{width:1920,height:720}),true);
++const actions={},sent=[],positions=[];
++Object.defineProperty(globalThis,'navigator',{value:{mediaSession:{setActionHandler:(a,h)=>actions[a]=h,setPositionState:p=>positions.push(p)}},configurable:true});
++globalThis.MediaMetadata=class {constructor(value){Object.assign(this,value);}};
++const {SystemMedia}=await load('media-session');
++const media=new SystemMedia(m=>sent.push(m),()=>{});
++actions.nexttrack();assert.equal(sent.length,0,'No commands before phone connection');
++media.setActive(true);actions.play();actions.pause();actions.previoustrack();actions.nexttrack();
++assert.deepEqual(sent.map(x=>x.media),[1,2,5,4],'Use distinct play and pause HID commands, not toggle');
++media.setPlaying(true);assert.equal(navigator.mediaSession.playbackState,'playing');
++media.setMetadata({title:'Test song',artist:'Test artist',album:'Test album'});
++media.setPlaying(false);assert.equal(navigator.mediaSession.metadata.title,'Test song');assert.equal(navigator.mediaSession.playbackState,'paused');
++media.setMetadata({title:'Next',artist:'Artist',album:'Album',durationMs:200000,positionMs:50000,revision:1});
++assert.equal(positions.at(-1).duration,200);assert.equal(positions.at(-1).position,50);
++media.setArtwork(0,'data:image/jpeg;base64,/9j/');assert.equal(navigator.mediaSession.metadata.artwork.length,0,'Reject old-track cover');
++media.setArtwork(1,'data:image/jpeg;base64,/9j/');assert.equal(navigator.mediaSession.metadata.artwork.length,1);
++media.setMetadata({title:'Another',artist:'',album:'',revision:2});assert.equal(navigator.mediaSession.metadata.artwork.length,0,'Clear old cover on track change');
++assert.equal(positions.at(-1),undefined,'Missing duration must clear old timeline');
++media.setActive(false);assert.equal(navigator.mediaSession.playbackState,'none');assert.equal(navigator.mediaSession.metadata,null);
++// Music must take exactly one route; voice/navigation keep the existing Web Audio path.
++const edges=[];let music;let packets=0;
++class Node {gain={value:1};connect(to){edges.push(to);}disconnect(){}}
++globalThis.AudioContext=class {state='running';destination={speaker:true};createGain(){return new Node();}resume(){return Promise.resolve();}};
++globalThis.TestMusic=class {static supported(){return true;}constructor(config){music=this;this.configKey=JSON.stringify([config.sampleRate,config.channels,Array.from(config.description)]);}unlocked=false;playing=false;configKey="";pause(){this.playing=false;this.paused=true;}volume(){}unlock(){this.unlocked=true;return Promise.resolve();}packet(){packets++;}close(){this.closed=true;}};
++const {AudioEngine}=await load('audio',s=>s.replace(/^import .*?;$/gm,'')+'\nconst MusicOutput=globalThis.TestMusic;const AudioCodec={AacLc:1,Opus:2,Lpcm:3};\nfunction audioStartTime(){return 0;}');
++const audio=new AudioEngine(()=>{});assert.equal(edges.length,1);assert.equal(edges[0].speaker,true);
++audio.handleConfig({streamType:102,codec:1,name:'media',sampleRate:48000,channels:2,description:new Uint8Array([0x11,0x90])});
++audio.handlePacket({streamType:102,timestampUs:0,data:new Uint8Array([1,2])});assert.equal(packets,1);
++assert.equal(audio.isPlaying,false,'Do not claim playing before actual media playback');
++await audio.unlock();assert.equal(audio.isUnlocked,true);music.playing=true;assert.equal(audio.isPlaying,true);
++audio.stopStream(102);assert.equal(music.closed,undefined,"Pause retains native media element");assert.equal(music.paused,true);
++const pausedMusic=music;
++audio.handleConfig({streamType:102,codec:1,name:'media',sampleRate:48000,channels:2,description:new Uint8Array([0x11,0x90])});
++assert.equal(music,pausedMusic,'Resume reuses the native media element');
++audio.stopAll();assert.equal(music.closed,true);assert.equal(audio.isPlaying,false);
++const {aacInit,aacFragment}=await load('aac-mp4');
++const init=aacInit(48000,2,new Uint8Array([0x11,0x90]));
++function boxes(data){const result=[];for(let offset=0;offset<data.length;){const size=new DataView(data.buffer,data.byteOffset+offset,4).getUint32(0);assert.ok(size>=8&&offset+size<=data.length);result.push(new TextDecoder().decode(data.slice(offset+4,offset+8)));offset+=size;}return result;}
++assert.deepEqual(boxes(init),['ftyp','moov']);
++assert.deepEqual(boxes(aacFragment(1,0,[new Uint8Array([1,2,3])])),['moof','mdat']);
++assert.throws(()=>aacInit(48000,2,new Uint8Array()));
++console.log('Car checks passed: aspect fit, media keys, disconnect state, single music route, MP4 framing.');
+diff --git a/web/check.mjs b/web/check.mjs
+index 77a5d73..9b799d1 100644
+--- a/web/check.mjs
++++ b/web/check.mjs
+@@ -21,6 +21,7 @@ globalThis.window = {
+   addEventListener: (name, handler) => listeners.set(name, handler),
+   removeEventListener: (name) => listeners.delete(name),
+   requestAnimationFrame: (handler) => { frames.push(handler); return frames.length; },
++  cancelAnimationFrame: (id) => { frames[id - 1] = () => {}; },
+ };
+ const surface = Object.assign(new Element(), {
+   inert: false, style: {}, focus() {}, setPointerCapture() {},
+@@ -66,7 +67,24 @@ assert.deepEqual(messages.pop().contacts, [{ id: 0, x: .5, y: .5, down: true },
+ listeners.get('pointerup')(pointer(1, 0, 0));
+ listeners.get('pointercancel')(pointer(2, 0, 0));
+ flush();
+-assert.deepEqual(messages.pop().contacts, [], 'Release every contact, including cancelled touches');
++assert.ok(messages.pop().contacts.every(c => !c.down), 'Release every contact, including cancelled touches');
++messages.length = 0;
++// A complete quick click may happen before the next animation frame.
++messages.length = 0;
++listeners.get('pointerdown')(pointer(7, 212.5, 250));
++listeners.get('pointerup')(pointer(7, 212.5, 250));
++flush();
++assert.ok(messages.some(m => m.contacts?.some(c => c.down)), 'A quick tap must deliver a down report');
++assert.deepEqual(messages.at(-1).contacts, [{ id: 0, x: .5, y: .5, down: false }], 'Lift preserves the hit target');
++messages.length = 0;
++listeners.get('pointerdown')(pointer(8, 212.5, 250));
++listeners.get('pointerdown')(pointer(9, 212.5, 250));
++listeners.get('pointerup')(pointer(8, 212.5, 250));
++listeners.get('pointermove')(pointer(9, 212.5, 250));
++flush();
++assert.equal(messages.at(-1).contacts[1].id, 1, 'Second finger retains its HID slot');
++assert.equal(messages.at(-1).contacts[0].down, false);
++controller.reset();
+ controller.detach();
+ assert.equal(listeners.size, 0);
+ console.log('Viewer input check passed: keyboard isolation, native controls, portrait/landscape coordinates, multi-touch, and release.');
+diff --git a/web/index.html b/web/index.html
+index 8912e88..f29cfc6 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -1,119 +1,21 @@
+ <!doctype html>
+-<html lang="en">
+-  <head>
+-    <meta charset="UTF-8" />
+-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+-    <meta name="theme-color" content="#111310" />
+-    <meta name="description" content="Your CarPlay, on any screen. A wireless viewer by PlayPort." />
+-    <title>PlayPort · CarPlay viewer</title>
+-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect width='48' height='48' rx='14' fill='%23d4f68a'/%3E%3Cpath d='M17 12h10a9 9 0 0 1 0 18h-4v7h-6V12zm6 6v6h4a3 3 0 0 0 0-6h-4z' fill='%23111310'/%3E%3C/svg%3E" />
+-    <link rel="stylesheet" href="./src/style.css" />
+-  </head>
+-  <body>
+-    <svg class="icon-library" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+-      <symbol id="i-screen" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="3"/><path d="M8 21h8m-4-4v4"/></symbol>
+-      <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h7m4 0h5M4 17h3m4 0h9"/><circle cx="13" cy="7" r="2"/><circle cx="9" cy="17" r="2"/></symbol>
+-      <symbol id="i-audio" viewBox="0 0 24 24"><path d="M4 9H2v6h2l6 4V5L4 9Zm10-1a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/></symbol>
+-      <symbol id="i-mute" viewBox="0 0 24 24"><path d="M4 9H2v6h2l6 4V5L4 9Zm11 0 6 6m0-6-6 6"/></symbol>
+-      <symbol id="i-keyboard" viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="3"/><path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 12h.01M10 12h.01M14 12h.01M18 12h.01M7 15h10"/></symbol>
+-      <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20.5 13A9 9 0 0 1 11 3.5 9 9 0 1 0 20.5 13Z"/></symbol>
+-      <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1V10Z"/></symbol>
+-      <symbol id="i-back" viewBox="0 0 24 24"><path d="m10 5-7 7 7 7m-7-7h18"/></symbol>
+-      <symbol id="i-select" viewBox="0 0 24 24"><path d="M20 5v9a3 3 0 0 1-3 3H4m5-5-5 5 5 5"/></symbol>
+-      <symbol id="i-prev" viewBox="0 0 24 24"><path d="M5 5v14m14-14L8 12l11 7V5Z"/></symbol>
+-      <symbol id="i-next" viewBox="0 0 24 24"><path d="M19 5v14M5 5l11 7-11 7V5Z"/></symbol>
+-      <symbol id="i-play" viewBox="0 0 24 24"><path d="m5 5 10 7-10 7V5Zm14 0v14"/></symbol>
+-      <symbol id="i-siri" viewBox="0 0 24 24"><path d="M4 10v4m4-7v10m4-14v18m4-14v10m4-7v4"/></symbol>
+-      <symbol id="i-phone" viewBox="0 0 24 24"><path d="m8 3 2 5-3 2a14 14 0 0 0 7 7l2-3 5 2v4a1 1 0 0 1-1 1A18 18 0 0 1 3 4a1 1 0 0 1 1-1h4Z"/></symbol>
+-      <symbol id="i-mic-off" viewBox="0 0 24 24"><path d="m3 3 18 18M9 9v3a3 3 0 0 0 5 2m1-4V5a3 3 0 0 0-5-2M5 10v2a7 7 0 0 0 12 5m2-7v2m-7 7v3m-4 0h8"/></symbol>
+-      <symbol id="i-expand" viewBox="0 0 24 24"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/></symbol>
+-      <symbol id="i-focus" viewBox="0 0 24 24"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><rect x="8" y="8" width="8" height="8" rx="2"/></symbol>
+-      <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5m-4-5a8 8 0 0 1 13-2l2 2M4 17l2 2a8 8 0 0 0 13-2"/></symbol>
+-      <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+-      <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M2 8a16 16 0 0 1 20 0M5 12a11 11 0 0 1 14 0m-11 4a6 6 0 0 1 8 0"/><circle cx="12" cy="20" r=".5"/></symbol>
+-      <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4 12h16m-6-6 6 6-6 6"/></symbol>
+-    </svg>
+-    <div id="app" data-session="idle">
+-      <header id="header">
+-        <a class="brand" href="./" aria-label="PlayPort viewer"><span class="brand-mark" aria-hidden="true">p<span></span></span><span>PlayPort<span class="brand-subtitle">WIRELESS CARPLAY</span></span></a>
+-        <div class="header-right">
+-          <div id="status" role="status"><span id="status-dot" data-state="idle"></span><span id="status-text">Connecting…</span></div>
+-          <button id="btn-focus" class="quiet-button" aria-pressed="false" title="Hide the chrome and focus on CarPlay"><svg class="icon"><use href="#i-focus"/></svg><span>Focus mode</span></button>
+-          <button id="btn-fullscreen" class="icon-button" aria-label="Enter fullscreen" title="Fullscreen"><svg class="icon"><use href="#i-expand"/></svg></button>
+-        </div>
+-      </header>
+-      <div class="app-body">
+-        <nav class="rail" aria-label="Viewer tools">
+-          <div class="rail-top">
+-            <button id="btn-viewer" class="rail-button active" aria-current="page" title="CarPlay viewer"><svg class="icon"><use href="#i-screen"/></svg><span>Viewer</span></button>
+-            <button id="btn-display" class="rail-button" aria-haspopup="dialog" aria-controls="display-panel" title="Display settings"><svg class="icon"><use href="#i-sliders"/></svg><span>Display</span></button>
+-            <button id="btn-audio" class="rail-button" aria-haspopup="dialog" aria-controls="audio-panel" title="Audio mixer"><svg class="icon"><use href="#i-audio"/></svg><span>Audio</span></button>
+-          </div>
+-          <div class="rail-bottom">
+-            <button id="btn-night" class="rail-button" data-remote aria-pressed="false" title="Switch CarPlay to night mode" disabled><svg class="icon"><use href="#i-moon"/></svg><span>Night</span></button>
+-            <button id="btn-help" class="rail-button" aria-haspopup="dialog" aria-controls="help-panel" title="Connection help and keyboard shortcuts"><svg class="icon"><use href="#i-keyboard"/></svg><span>Guide</span></button>
+-          </div>
+-        </nav>
+-        <main class="workspace">
+-          <div class="workspace-heading"><div><p class="eyebrow">YOUR PHONE. A BIGGER PICTURE.</p><h1>CarPlay viewer<span class="heading-dot">.</span></h1></div><div class="connection-note"><svg class="icon"><use href="#i-wifi"/></svg><span>Wireless by nature.<br/><strong>Connected to your world.</strong></span></div></div>
+-          <section class="viewer" aria-label="CarPlay screen">
+-            <div class="viewer-bar"><div class="viewer-label"><span id="viewer-indicator"></span><span id="viewer-state">STANDBY</span><span class="viewer-divider"></span><span id="device-name">Your iPhone</span></div><div class="viewer-tools"><span class="touch-label">Touch & keyboard</span><button id="btn-keyframe" class="icon-button small" data-remote aria-label="Refresh video" title="Refresh video if the picture freezes" disabled><svg class="icon"><use href="#i-refresh"/></svg></button></div></div>
+-            <div id="screen-container">
+-              <div id="surface"><canvas id="screen" width="1280" height="720" tabindex="0" aria-label="Live CarPlay screen. Use touch or the keyboard to control your iPhone." inert></canvas></div>
+-              <div id="overlay">
+-                <div class="connection-art" aria-hidden="true"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><div class="phone-outline"><span></span><svg class="icon"><use href="#i-wifi"/></svg></div><span class="orbit-spark"></span></div>
+-                <p class="eyebrow" id="overlay-eyebrow">READY WHEN YOU ARE</p><h2 id="overlay-title">Your next drive starts here.</h2>
+-                <p id="overlay-text" role="status">Connect your iPhone to PlayPort to bring CarPlay to this screen.</p>
+-                <button id="btn-setup" class="primary-button">Connection guide<svg class="icon"><use href="#i-arrow"/></svg></button>
+-                <div class="setup-note"><span>01 <b>Pair your iPhone</b></span><span class="setup-line"></span><span>02 <b>Make yourself at home</b></span></div>
+-              </div>
+-            </div>
+-            <div class="viewer-footer"><span id="stream-info">Waiting for a video stream</span><span id="mic-status" role="status"></span><span class="stream-caption">CARPLAY / LIVE VIEW</span></div>
+-          </section>
+-          <div id="toolbar" class="control-dock" role="group" aria-label="CarPlay controls">
+-            <div class="control-group navigation-controls">
+-              <button id="btn-back" class="control-button" data-remote title="Back · Esc" disabled><svg class="icon"><use href="#i-back"/></svg><span>Back</span></button>
+-              <button id="btn-home" class="control-button" data-remote title="CarPlay home · Home" disabled><svg class="icon"><use href="#i-home"/></svg><span>Home</span></button>
+-              <button id="btn-select" class="control-button" data-remote title="Select · Enter" disabled><svg class="icon"><use href="#i-select"/></svg><span>Select</span></button>
+-            </div>
+-            <div class="control-group media-controls" role="group" aria-label="Media playback">
+-              <button id="btn-prev" class="icon-button" data-remote aria-label="Previous track" title="Previous track" disabled><svg class="icon"><use href="#i-prev"/></svg></button>
+-              <button id="btn-play" class="play-button" data-remote aria-label="Play or pause" title="Play / pause · Space" disabled><svg class="icon"><use href="#i-play"/></svg></button>
+-              <button id="btn-next" class="icon-button" data-remote aria-label="Next track" title="Next track" disabled><svg class="icon"><use href="#i-next"/></svg></button>
+-            </div>
+-            <div class="control-group voice-controls">
+-              <button id="btn-siri" class="control-button siri-button" data-remote title="Talk to Siri · S" disabled><svg class="icon"><use href="#i-siri"/></svg><span>Siri</span></button>
+-              <button id="btn-answer" class="control-button" data-remote title="Answer or end a call" disabled><svg class="icon"><use href="#i-phone"/></svg><span>Call</span></button>
+-              <button id="btn-call-mute" class="control-button" data-remote title="Toggle call microphone mute" disabled><svg class="icon"><use href="#i-mic-off"/></svg><span>Mute call</span></button>
+-            </div>
+-          </div>
+-          <footer class="workspace-footer"><span class="keyboard-hint"><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd><span>to navigate</span><span class="footer-dot">·</span><kbd>↵</kbd><span>to select</span></span><div class="quick-volume"><button id="btn-mute" class="icon-button small" aria-label="Mute audio" aria-pressed="false" title="Mute audio"><svg class="icon"><use id="mute-icon" href="#i-audio"/></svg></button><input id="volume-quick" type="range" min="0" max="100" value="100" aria-label="Master volume"/><output id="volume-value" for="volume-quick">100%</output><span id="audio-unlock-hint">Click to enable sound</span></div></footer>
+-        </main>
+-      </div>
+-      <button id="btn-exit-focus" class="quiet-button" hidden><svg class="icon"><use href="#i-focus"/></svg>Exit focus</button>
+-      <div id="error-banner" class="hidden" role="alert"><span id="error-text"></span><button id="btn-error-close" class="icon-button small" aria-label="Dismiss error"><svg class="icon"><use href="#i-close"/></svg></button></div>
+-      <div id="toast" role="status" hidden></div>
+-    </div>
+-    <dialog id="audio-panel" class="drawer" aria-labelledby="audio-title">
+-      <div class="panel-heading"><div><p class="eyebrow">MAKE IT SOUND LIKE YOU</p><h2 id="audio-title">Audio mixer</h2></div><button id="btn-audio-close" class="icon-button" aria-label="Close audio mixer"><svg class="icon"><use href="#i-close"/></svg></button></div>
+-      <p class="panel-intro">Music, directions, and conversations. Find your balance.</p>
+-      <section class="panel-section"><div class="section-heading"><h3>Master volume</h3><output id="audio-master-value" for="audio-master">100%</output></div><div class="master-slider"><svg class="icon"><use href="#i-audio"/></svg><input id="audio-master" type="range" min="0" max="100" value="100" aria-label="Master volume"/></div><p class="panel-hint">Volume is saved for this browser.</p></section>
+-      <section class="panel-section"><div class="section-heading"><h3>Individual streams</h3><span class="section-tag">LIVE</span></div><div id="audio-streams"></div><p id="audio-status" class="empty-streams">When your iPhone plays audio, each stream gets its own volume control here.</p></section>
+-      <div class="panel-tip"><svg class="icon"><use href="#i-siri"/></svg><p>Siri and calls use your browser’s microphone. Allow microphone access when prompted to talk back.</p></div>
+-    </dialog>
+-    <dialog id="display-panel" class="drawer" aria-labelledby="display-title">
+-      <div class="panel-heading"><div><p class="eyebrow">A SCREEN THAT FITS</p><h2 id="display-title">Display settings</h2></div><button id="btn-display-close" class="icon-button" aria-label="Close display settings"><svg class="icon"><use href="#i-close"/></svg></button></div>
+-      <p class="panel-intro">Fine-tune the picture for the screen in front of you.</p>
+-      <form id="display-form"><fieldset id="display-fields">
+-        <section class="panel-section"><div class="section-heading"><h3>Screen resolution</h3><span class="section-tag">01</span></div><div id="display-presets" class="preset-grid"></div><div class="dimension-fields"><label for="display-width">Width <span>px</span><input id="display-width" type="number" min="480" max="3840" step="2" placeholder="1280" required/></label><span class="dimension-times">×</span><label for="display-height">Height <span>px</span><input id="display-height" type="number" min="480" max="3840" step="2" placeholder="720" required/></label></div><button id="btn-display-match" type="button" class="text-button"><svg class="icon"><use href="#i-expand"/></svg>Match this window</button></section>
+-        <section class="panel-section"><div class="section-heading"><h3>Picture & performance</h3><span class="section-tag">02</span></div><div class="field"><label for="display-codec">Video codec</label><select id="display-codec"><option value="h264">H.264 · Most compatible</option><option value="h265">H.265 / HEVC · Sharper picture</option></select></div><div class="field-pair"><div class="field"><label for="display-fps">Frame rate</label><select id="display-fps"><option value="60">60 fps · Smooth</option><option value="30">30 fps · Efficient</option></select></div><div class="field"><label for="display-uiscale">CarPlay UI size</label><select id="display-uiscale"><option value="75">Smaller · 75%</option><option value="85">Small · 85%</option><option value="100" selected>Default · 100%</option><option value="115">Large · 115%</option></select></div></div></section>
+-      </fieldset><div class="apply-area"><p class="restart-note"><svg class="icon"><use href="#i-refresh"/></svg>Applying restarts CarPlay. Your iPhone reconnects in a few seconds.</p><button id="btn-display-apply" class="primary-button" type="submit">Apply display settings<svg class="icon"><use href="#i-arrow"/></svg></button><p id="display-status" class="panel-hint" role="status"></p></div></form>
+-    </dialog>
+-    <dialog id="help-panel" class="guide-dialog" aria-labelledby="help-title">
+-      <div class="panel-heading"><div><p class="eyebrow">A FEW THINGS TO KNOW</p><h2 id="help-title">Make yourself at home.</h2></div><button id="btn-help-close" class="icon-button" aria-label="Close guide"><svg class="icon"><use href="#i-close"/></svg></button></div>
+-      <section class="panel-section"><h3>Connect your iPhone</h3><ol class="connection-steps"><li><span>01</span><div><strong>Open your personal viewer link</strong><p>Use the HTTPS link printed by the PlayPort server. It includes your access token.</p></div></li><li><span>02</span><div><strong>Pair with PlayPort over Bluetooth</strong><p>On your iPhone, open Settings → Bluetooth and select the server’s device name. If asked for a PIN, enter <b>3939</b>.</p></div></li><li><span>03</span><div><strong>Let CarPlay take the wheel</strong><p>Keep the iPhone and server on the same Wi-Fi network. Accept the CarPlay prompt on your iPhone; the screen appears automatically.</p></div></li></ol></section>
+-      <section class="panel-section"><h3>Keep your hands on the keyboard</h3><div class="shortcut-grid"><div><span>Navigate</span><span><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd></span></div><div><span>Select</span><kbd>Enter</kbd></div><div><span>Go back</span><kbd>Esc</kbd></div><div><span>CarPlay home</span><kbd>Home</kbd></div><div><span>Play / pause</span><kbd>Space</kbd></div><div><span>Talk to Siri</span><kbd>S</kbd></div></div><p class="panel-hint">Touch or click the live screen to control CarPlay directly. If video freezes, use the refresh button above the screen.</p></section>
+-    </dialog>
+-    <script type="module" src="./src/main.ts"></script>
+-  </body>
+-</html>
++<html lang="zh-CN"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/><meta name="color-scheme" content="dark"/><title>F50 CarPlay</title><link rel="stylesheet" href="/src/style.css"/></head>
++<body><main id="app">
++  <div id="screen-container"><div id="surface"><canvas id="screen" width="1280" height="720" tabindex="0" aria-label="CarPlay" inert></canvas></div></div>
++  <div id="overlay" role="status"><h1>CarPlay</h1><p id="connection-text"></p><p id="connection-hint"></p></div>
++  <button id="btn-settings" aria-haspopup="dialog" aria-controls="settings"><span aria-hidden="true">⚙</span><span data-i18n="settings">设置</span></button>
++  <button id="audio-unlock" data-i18n="sound" hidden>轻点启用声音</button>
++  <div id="error-banner" role="alert" hidden><span data-i18n="error"></span><details><summary data-i18n="technical"></summary><p id="error-text"></p></details><button id="dismiss-error" data-i18n="close"></button></div>
++</main>
++<dialog id="settings" aria-labelledby="settings-title"><header><h2 id="settings-title" data-i18n="settings"></h2><button id="btn-close" data-i18n="close"></button></header><div class="settings-body">
++  <label class="row"><span data-i18n="language"></span><select id="language"><option value="zh">简体中文</option><option value="en">English</option></select></label>
++  <label class="volume"><span data-i18n="volume"></span><output id="volume-value">100%</output><input id="volume" type="range" min="0" max="100" value="100"/></label>
++  <p id="audio-status" class="hint"></p>
++  <section><div class="section-title"><h3 data-i18n="display"></h3><button id="fullscreen" data-i18n="fullscreen"></button></div>
++  <label class="check"><input id="auto-fit" type="checkbox"/><span data-i18n="auto"></span></label><p class="hint" data-i18n="autoHint"></p>
++  <form id="display-form"><fieldset id="display-fields"><div class="pair"><label><span data-i18n="width"></span><input id="width" type="number" min="480" max="3840" step="2" required/></label><label><span data-i18n="height"></span><input id="height" type="number" min="480" max="3840" step="2" required/></label></div><div class="pair"><label><span data-i18n="ui"></span><select id="ui-scale"><option value="85" data-i18n="small"></option><option value="100" data-i18n="standard"></option><option value="115" data-i18n="large"></option></select></label><label><span data-i18n="fps"></span><select id="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label></div></fieldset><button id="apply" class="primary" data-i18n="apply"></button><p id="display-status" class="hint" role="status"></p></form></section>
++  <details><summary data-i18n="diagnostics"></summary><p id="capabilities"></p><p id="media-support"></p><p id="stats"></p><p data-i18n="micHint"></p><p id="mic-status"></p><p class="hint" data-i18n="privacy"></p></details>
++  <details><summary data-i18n="advanced"></summary><div id="fallback-controls"><button data-command="home" data-i18n="home"></button><button data-command="back" data-i18n="back"></button><button data-command="previous" data-i18n="previous"></button><button data-command="play" data-i18n="play"></button><button data-command="next" data-i18n="next"></button><button data-command="refresh" data-i18n="refresh"></button></div></details>
++  <p class="hint" data-i18n="savedHere"></p>
++</div></dialog>
++<script type="module" src="/src/main.ts"></script></body></html>
+diff --git a/web/package.json b/web/package.json
+index 2bc2cf2..4476def 100644
+--- a/web/package.json
++++ b/web/package.json
+@@ -5,7 +5,7 @@
+   "type": "module",
+   "scripts": {
+     "dev": "vite",
+-    "test": "node check.mjs && node check-audio.mjs",
++    "test": "node check.mjs && node check-audio.mjs && node check-car.mjs",
+     "build": "tsc && vite build",
+     "preview": "vite preview"
+   },
+diff --git a/web/src/aac-mp4.ts b/web/src/aac-mp4.ts
+new file mode 100644
+index 0000000..fb8e9fd
+--- /dev/null
++++ b/web/src/aac-mp4.ts
+@@ -0,0 +1,29 @@
++/** Minimal ISO-BMFF framing for the receiver's raw AAC-LC access units (1024 samples). */
++const join = (...parts: Uint8Array[]) => { const b=new Uint8Array(parts.reduce((n,p)=>n+p.length,0));let i=0;for(const p of parts){b.set(p,i);i+=p.length;}return b; };
++const text = (s:string) => new TextEncoder().encode(s);
++const u32 = (...values:number[]) => { const b=new Uint8Array(values.length*4);const v=new DataView(b.buffer);values.forEach((x,i)=>v.setUint32(i*4,x));return b; };
++const u16 = (...values:number[]) => { const b=new Uint8Array(values.length*2);const v=new DataView(b.buffer);values.forEach((x,i)=>v.setUint16(i*2,x));return b; };
++const zeros = (n:number) => new Uint8Array(n);
++const box = (type:string,...parts:Uint8Array[]) => { const data=join(...parts);return join(u32(data.length+8),text(type),data); };
++const full = (type:string,flags:number,...parts:Uint8Array[]) => box(type,u32(flags),...parts);
++const matrix = u32(0x10000,0,0,0,0x10000,0,0,0,0x40000000);
++function descriptor(tag:number,data:Uint8Array):Uint8Array {
++  const length=[data.length&127];let n=data.length>>>7;while(n){length.unshift((n&127)|128);n>>>=7;}
++  return join(new Uint8Array([tag,...length]),data);
++}
++export function aacInit(rate:number,channels:number,asc:Uint8Array):Uint8Array {
++  if(rate<=0||rate>65535||channels<1||channels>2||asc.length<2) throw new Error('Unsupported AAC configuration');
++  const es=descriptor(3,join(u16(1),new Uint8Array([0]),descriptor(4,join(new Uint8Array([0x40,0x15,0,0,0]),u32(256000,128000),descriptor(5,asc))),descriptor(6,new Uint8Array([2]))));
++  const mp4a=box('mp4a',zeros(6),u16(1),zeros(8),u16(channels,16,0,0),u32(rate*65536),full('esds',0,es));
++  const stbl=box('stbl',full('stsd',0,u32(1),mp4a),full('stts',0,u32(0)),full('stsc',0,u32(0)),full('stsz',0,u32(0,0)),full('stco',0,u32(0)));
++  const dinf=box('dinf',full('dref',0,u32(1),full('url ',1)));
++  const mdia=box('mdia',full('mdhd',0,u32(0,0,rate,0),u16(0x55c4,0)),full('hdlr',0,u32(0),text('soun'),zeros(12),text('F50 Audio\0')),box('minf',full('smhd',0,u16(0,0)),dinf,stbl));
++  const trak=box('trak',full('tkhd',7,u32(0,0,1,0,0),zeros(8),u16(0,0,0x100,0),matrix,u32(0,0)),mdia);
++  const mvhd=full('mvhd',0,u32(0,0,rate,0,0x10000),u16(0x100,0),zeros(8),matrix,zeros(24),u32(2));
++  return join(box('ftyp',text('isom'),u32(0x200),text('isomiso6mp41')),box('moov',mvhd,trak,box('mvex',full('trex',0,u32(1,1,1024,0,0)))));
++}
++export function aacFragment(sequence:number,sampleTime:number,frames:Uint8Array[]):Uint8Array {
++  const make=(offset:number)=>box('moof',full('mfhd',0,u32(sequence)),box('traf',full('tfhd',0x020000,u32(1)),full('tfdt',0x01000000,u32(Math.floor(sampleTime/4294967296),sampleTime>>>0)),full('trun',0x301,u32(frames.length,offset),...frames.map(f=>u32(1024,f.length)))));
++  const preliminary=make(0),moof=make(preliminary.length+8);
++  return join(moof,box('mdat',...frames));
++}
+diff --git a/web/src/audio.ts b/web/src/audio.ts
+index 3b41f7d..6034ed7 100644
+--- a/web/src/audio.ts
++++ b/web/src/audio.ts
+@@ -1,3 +1,4 @@
++import { MusicOutput } from './music-output';
+ import { audioStartTime } from './audio-timing';
+ import { AudioCodec, type AudioConfigMessage, type AudioPacketMessage } from './protocol';
+
+@@ -6,6 +7,7 @@ interface StreamState {
+   sampleRate: number;
+   channels: number;
+   name: string;
++  music: MusicOutput | null;
+   decoder: AudioDecoder | null;
+   nextPlayTime: number;
+   gain: GainNode;
+@@ -18,7 +20,16 @@ export class AudioEngine {
+   private readonly gain: GainNode;
+   private readonly streams = new Map<number, StreamState>();
+   private readonly streamGains = new Map<string, number>();
++  private retainedMusic: MusicOutput | null = null;
++  private retainedConfig = "";
+   private unlocked = false;
++  private masterVolume = 1;
++  private lastAudioAt = -Infinity;
++
++  get isPlaying(): boolean {
++    return Array.from(this.streams.values()).some(s => s.music?.playing) ||
++      (this.context.state === 'running' && performance.now() - this.lastAudioAt < 1800);
++  }
+
+   constructor(private readonly onError: (message: string) => void) {
+     this.context = new AudioContext({ latencyHint: 'interactive' });
+@@ -27,17 +38,19 @@ export class AudioEngine {
+   }
+
+   get isUnlocked(): boolean {
+-    return this.unlocked;
++    return this.unlocked && this.context.state === 'running' && Array.from(this.streams.values()).every(s => !s.music || s.music.unlocked);
+   }
+
+   /** Must run inside a user gesture so the browser allows audio playback. */
+   async unlock(): Promise<void> {
+-    await this.context.resume();
+-    this.unlocked = true;
++    await Promise.all([this.context.resume(), ...Array.from(this.streams.values()).flatMap(s => s.music ? [s.music.unlock()] : [])]);
++    this.unlocked = this.context.state === 'running';
+   }
+
+   setVolume(volume: number): void {
+-    this.gain.gain.value = Math.min(1, Math.max(0, volume));
++    this.masterVolume = Math.min(1, Math.max(0, volume));
++    this.gain.gain.value = this.masterVolume;
++    for (const state of this.streams.values()) state.music?.volume(this.masterVolume * (this.streamGains.get(state.name) ?? 1));
+   }
+
+   setStreamGain(name: string, value: number): void {
+@@ -62,10 +75,22 @@ export class AudioEngine {
+       sampleRate: message.sampleRate,
+       channels: message.channels,
+       name: message.name,
++      music: null,
+       decoder: null,
+       nextPlayTime: 0,
+       gain: streamGain,
+     };
++    if (message.codec === AudioCodec.AacLc && message.name === 'media' && MusicOutput.supported()) {
++      try {
++        state.music = (this.retainedMusic && this.retainedConfig === JSON.stringify([message.sampleRate,message.channels,Array.from(message.description)]) ? this.retainedMusic : new MusicOutput(message, this.onError));
++        if (this.retainedMusic && this.retainedMusic !== state.music) this.retainedMusic.close();
++        this.retainedMusic = null;
++        state.music.volume(this.masterVolume * (this.streamGains.get(state.name) ?? 1));
++        this.streams.set(message.streamType, state);
++        void state.music.unlock().catch(() => {});
++        return;
++      } catch (error) { this.onError(`Music output configuration: ${describeError(error)}`); }
++    }
+     if (message.codec === AudioCodec.AacLc || message.codec === AudioCodec.Opus) {
+       if (typeof AudioDecoder === 'undefined') {
+         this.onError(
+@@ -111,6 +136,7 @@ export class AudioEngine {
+   handlePacket(message: AudioPacketMessage): void {
+     const state = this.streams.get(message.streamType);
+     if (!state) return;
++    if (state.music) { state.music.packet(message.data); return; }
+     if (state.decoder) {
+       try {
+         state.decoder.decode(
+@@ -131,17 +157,32 @@ export class AudioEngine {
+   }
+
+   stopStream(streamType: number): void {
++    const state = this.streams.get(streamType);
++    if (state?.music) {
++      this.retainedMusic?.close();
++      this.retainedMusic = state.music;
++      this.retainedConfig = state.music.configKey;
++      state.music.pause();
++      state.music = null;
++    }
+     this.closeStream(streamType);
+   }
+
++  pauseMusic(): void {
++    for (const state of this.streams.values()) state.music?.pause();
++  }
++
+   stopAll(): void {
+     for (const streamType of this.streams.keys()) this.closeStream(streamType);
++    this.retainedMusic?.close(); this.retainedMusic = null;
++    this.lastAudioAt = -Infinity;
+   }
+
+   private closeStream(streamType: number): void {
+     const state = this.streams.get(streamType);
+     if (!state) return;
+     this.streams.delete(streamType);
++    state.music?.close();
+     runCatchingDisconnect(state.gain);
+     if (state.decoder) {
+       try {
+@@ -192,6 +233,7 @@ export class AudioEngine {
+     source.connect(state.gain);
+     source.onended = () => source.disconnect();
+     source.start(state.nextPlayTime);
++    this.lastAudioAt = performance.now();
+     state.nextPlayTime += buffer.duration;
+   }
+ }
+diff --git a/web/src/display-fit.ts b/web/src/display-fit.ts
+new file mode 100644
+index 0000000..4e7cd14
+--- /dev/null
++++ b/web/src/display-fit.ts
+@@ -0,0 +1,18 @@
++/** Keep the full CarPlay picture visible. Never stretch or crop input coordinates. */
++export function fittedSize(width: number, height: number, viewWidth: number, viewHeight: number) {
++  const scale = Math.min(viewWidth / Math.max(1, width), viewHeight / Math.max(1, height));
++  return { width: Math.max(0, width * scale), height: Math.max(0, height * scale) };
++}
++/** Match aspect rather than blindly multiplying by DPR (a 4K car panel need not decode 4K). */
++export function suggestedResolution(width: number, height: number) {
++  const ratio = Math.min(4, Math.max(0.25, width / Math.max(1, height)));
++  const long = Math.max(1280, Math.min(1920, Math.max(width, height)));
++  let w = ratio >= 1 ? long : long * ratio;
++  let h = ratio >= 1 ? long / ratio : long;
++  const grow = Math.max(1, 480 / Math.min(w, h));
++  w *= grow; h *= grow;
++  return { width: Math.round(w / 2) * 2, height: Math.round(h / 2) * 2 };
++}
++export function aspectChanged(a: {width: number; height: number}, b: {width: number; height: number}) {
++  return Math.abs((a.width / a.height) / (b.width / b.height) - 1) > 0.025;
++}
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+new file mode 100644
+index 0000000..ca86fdd
+--- /dev/null
++++ b/web/src/i18n.ts
+@@ -0,0 +1,37 @@
++const messages = {
++  settings: ['设置', 'Settings'], close: ['关闭', 'Close'], language: ['语言', 'Language'],
++  waiting: ['正在等待 iPhone', 'Waiting for iPhone'], waitingHint: ['手机开启蓝牙并连接盒子 Wi-Fi，已配对手机会自动重连。', 'Enable Bluetooth and join the receiver Wi-Fi. Paired phones reconnect automatically.'],
++  connecting: ['正在连接盒子…', 'Connecting to receiver…'], reconnecting: ['连接中断，正在自动重连…', 'Disconnected. Reconnecting automatically…'],
++  starting: ['已连接，正在等待画面…', 'Connected. Waiting for video…'], live: ['已连接', 'Connected'],
++  access: ['需要首次登录链接', 'First-time access link required'], accessHint: ['请使用私有访问资料中的完整链接打开一次，此浏览器会记住登录。', 'Open the complete link from your private access file once. This browser will remember it.'],
++  sound: ['轻点启用声音', 'Tap to enable sound'], volume: ['音量', 'Volume'],
++  display: ['画面', 'Display'], fullscreen: ['全屏', 'Fullscreen'], fullscreenFail: ['此浏览器不允许全屏，画面仍会自动适配窗口。', 'Fullscreen unavailable. The picture still fits this window.'],
++  auto: ['自动匹配屏幕比例', 'Match screen aspect ratio automatically'], autoHint: ['仅此显示端启用。比例变化时重新协商画面，最多 1920 像素长边；可能短暂重连。', 'Enable on one display only. Aspect changes renegotiate video, up to 1920 pixels on the long edge, and may briefly reconnect.'],
++  width: ['宽度', 'Width'], height: ['高度', 'Height'], apply: ['应用并重连', 'Apply and reconnect'],
++  ui: ['界面大小', 'UI size'], fps: ['帧率', 'Frame rate'], standard: ['标准', 'Standard'], large: ['大', 'Large'], small: ['小', 'Small'],
++  loading: ['正在读取…', 'Loading…'], applying: ['正在应用…', 'Applying…'], applied: ['已保存，正在重新连接 CarPlay。', 'Saved. Reconnecting CarPlay.'],
++  loadFail: ['读取失败，请检查盒子连接后重试。', 'Could not load settings. Check the receiver connection and retry.'],
++  applyFail: ['应用失败，请检查连接和分辨率范围。', 'Could not apply. Check connection and resolution range.'],
++  range: ['宽高需为 480–3840 之间的偶数。', 'Width and height must be even numbers between 480 and 3840.'],
++  autoFail: ['暂未完成自动匹配，可在设置中重试。', 'Automatic matching did not complete. Retry in Settings.'],
++  diagnostics: ['连接与兼容性', 'Connection and compatibility'], advanced: ['备用控制', 'Fallback controls'],
++  home: ['主屏幕', 'Home'], back: ['返回', 'Back'], previous: ['上一曲', 'Previous track'], play: ['播放 / 暂停', 'Play / pause'], next: ['下一曲', 'Next track'], refresh: ['刷新画面', 'Refresh video'],
++  mic: ['麦克风', 'Microphone'], micHint: ['网页通话与 Siri 需要浏览器允许麦克风；勾选了「通话与 Siri 走车机蓝牙」时不用网页麦克风。', 'Calls and Siri through this page require browser microphone permission; not used when calls and Siri go over the car’s Bluetooth.'],
++  compatible: ['基础解码能力可用', 'Basic decoding APIs available'], unsupported: ['此浏览器缺少视频或音频解码能力，请使用支持 WebCodecs 的浏览器。', 'This browser lacks video or audio decoding APIs. Use a browser with WebCodecs support.'],
++  insecure: ['当前页面不是安全上下文，请使用已受信任的 HTTPS 地址。', 'This page is not a secure context. Use a trusted HTTPS address.'],
++  mediaYes: ['系统媒体控制接口可用（用于车机媒体卡片与方向盘切歌）。', 'System media API available (for the car media card and steering-wheel keys).'],
++  mediaNo: ['浏览器不提供系统媒体控制接口。', 'This browser does not expose system media controls.'],
++  noStream: ['尚无音视频流', 'No media stream yet'], playing: ['音频正在播放', 'Audio playing'], paused: ['等待音频', 'Waiting for audio'],
++  error: ['播放遇到问题', 'Playback problem'], technical: ['详细信息', 'Details'],
++  savedHere: ['语言、音量与自动匹配偏好保存在此浏览器。CarPlay 内部语言跟随 iPhone。', 'Language, volume and auto-fit preferences are saved in this browser. CarPlay itself follows the iPhone language.'],
++  privacy: ['首次登录后无需再次进入设置；自动播放被浏览器拦截时，只需轻点画面一次。', 'No need to reopen settings after setup. If autoplay is blocked, tap the screen once.'],
++} as const;
++export type Key = keyof typeof messages;
++export let language: 'zh' | 'en' = localStorage.getItem('f50-language') === 'en' ? 'en' : 'zh';
++export function t(key: Key): string { return messages[key][language === 'zh' ? 0 : 1]; }
++export function setLanguage(value: string): void {
++  language = value === 'en' ? 'en' : 'zh';
++  localStorage.setItem('f50-language', language);
++  document.documentElement.lang = language === 'zh' ? 'zh-CN' : 'en';
++  document.querySelectorAll<HTMLElement>('[data-i18n]').forEach(e => { e.textContent = t(e.dataset.i18n as Key); });
++}
+diff --git a/web/src/input.ts b/web/src/input.ts
+index 947ed10..4a32a05 100644
+--- a/web/src/input.ts
++++ b/web/src/input.ts
+@@ -37,7 +37,7 @@ export class InputController {
+     surface.addEventListener('pointermove', this.onPointerMove, { passive: false });
+     surface.addEventListener('pointerup', this.onPointerUp, { passive: false });
+     surface.addEventListener('pointercancel', this.onPointerUp, { passive: false });
+-    surface.addEventListener('pointerleave', this.onPointerUp, { passive: false });
++    surface.addEventListener('lostpointercapture', this.onPointerUp, { passive: false });
+     window.addEventListener('keydown', this.onKeyDown);
+   }
+
+@@ -47,13 +47,14 @@ export class InputController {
+     surface.removeEventListener('pointermove', this.onPointerMove);
+     surface.removeEventListener('pointerup', this.onPointerUp);
+     surface.removeEventListener('pointercancel', this.onPointerUp);
+-    surface.removeEventListener('pointerleave', this.onPointerUp);
++    surface.removeEventListener('lostpointercapture', this.onPointerUp);
++    this.reset();
+     window.removeEventListener('keydown', this.onKeyDown);
+   }
+
+   private readonly onPointerDown = (event: PointerEvent): void => {
+     event.preventDefault();
+-    if (this.pointers.size >= MAX_CONTACTS) return;
++    if (this.surface.inert || (event.button !== undefined && event.button !== 0) || this.pointers.size >= MAX_CONTACTS) return;
+     this.surface.focus({ preventScroll: true });
+     this.surface.setPointerCapture(event.pointerId);
+     this.pointers.set(event.pointerId, {
+@@ -62,7 +63,7 @@ export class InputController {
+       y: this.normalizeY(event.clientY),
+       down: true,
+     });
+-    this.scheduleFlush();
++    this.flush();
+   };
+
+   private readonly onPointerMove = (event: PointerEvent): void => {
+@@ -78,8 +79,15 @@ export class InputController {
+     const pointer = this.pointers.get(event.pointerId);
+     if (!pointer) return;
+     event.preventDefault();
++    // Release at the last real position; (0,0) can cancel an iPhone button tap.
++    if (event.type === 'pointerup') {
++      pointer.x = this.normalizeX(event.clientX);
++      pointer.y = this.normalizeY(event.clientY);
++    }
++    pointer.down = false;
++    this.flush();
+     this.pointers.delete(event.pointerId);
+-    this.scheduleFlush();
++    if (this.surface.hasPointerCapture?.(event.pointerId)) this.surface.releasePointerCapture(event.pointerId);
+   };
+
+   private readonly onKeyDown = (event: KeyboardEvent): void => {
+@@ -146,17 +154,31 @@ export class InputController {
+     return 0;
+   }
+
++  reset(): void {
++    if (this.pendingFlush) window.cancelAnimationFrame(this.pendingFlush);
++    this.pendingFlush = 0;
++    this.pointers.clear();
++  }
++
++  private flush(): void {
++    if (this.pendingFlush) window.cancelAnimationFrame(this.pendingFlush);
++    this.pendingFlush = 0;
++    // The receiver's HID report uses list position as contact slot. Keep holes.
++    const contacts: TouchContact[] = [];
++    for (const pointer of this.pointers.values()) {
++      while (contacts.length <= pointer.slot) {
++        contacts.push({ id: contacts.length, x: 0, y: 0, down: false });
++      }
++      contacts[pointer.slot] = { id: pointer.slot, x: pointer.x, y: pointer.y, down: pointer.down };
++    }
++    this.send({ type: 'touch', contacts });
++  }
++
+   private scheduleFlush(): void {
+     if (this.pendingFlush !== 0) return;
+     this.pendingFlush = window.requestAnimationFrame(() => {
+       this.pendingFlush = 0;
+-      const contacts: TouchContact[] = Array.from(this.pointers.values()).map((pointer) => ({
+-        id: pointer.slot,
+-        x: pointer.x,
+-        y: pointer.y,
+-        down: pointer.down,
+-      }));
+-      this.send({ type: 'touch', contacts });
++      this.flush();
+     });
+   }
+
+diff --git a/web/src/main.ts b/web/src/main.ts
+index fd5cedd..2697f00 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -1,641 +1,177 @@
+ import { AudioEngine } from './audio';
+ import { InputController } from './input';
+ import { MicrophoneUplink } from './mic';
+-import type { ServerMessage, WireMessage } from './protocol';
+ import { VideoPlayer } from './video';
+-import { Connection, type ConnectionState } from './ws';
+-
+-function requiredElement<T extends HTMLElement>(id: string): T {
+-  const element = document.getElementById(id);
+-  if (!element) throw new Error(`Missing #${id} element`);
+-  return element as T;
+-}
+-
+-function resolveToken(): string {
+-  const url = new URL(location.href);
+-  const fromUrl = url.searchParams.get('token');
+-  if (fromUrl) {
+-    localStorage.setItem('playport-token', fromUrl);
+-    url.searchParams.delete('token');
+-    history.replaceState(null, '', url.toString());
+-    return fromUrl;
+-  }
+-  return localStorage.getItem('playport-token') ?? '';
+-}
+-
+-const canvas = requiredElement<HTMLCanvasElement>('screen');
+-const surface = requiredElement<HTMLDivElement>('surface');
+-const statusDot = requiredElement<HTMLSpanElement>('status-dot');
+-const statusText = requiredElement<HTMLSpanElement>('status-text');
+-const overlay = requiredElement<HTMLDivElement>('overlay');
+-const overlayText = requiredElement<HTMLParagraphElement>('overlay-text');
+-const errorBanner = requiredElement<HTMLDivElement>('error-banner');
+-const streamInfo = requiredElement<HTMLSpanElement>('stream-info');
+-const micStatus = requiredElement<HTMLSpanElement>('mic-status');
+-const muteButton = requiredElement<HTMLButtonElement>('btn-mute');
+-const app = requiredElement<HTMLDivElement>('app');
+-const screenContainer = requiredElement<HTMLDivElement>('screen-container');
+-const viewerState = requiredElement<HTMLSpanElement>('viewer-state');
+-const overlayTitle = requiredElement<HTMLHeadingElement>('overlay-title');
+-const overlayEyebrow = requiredElement<HTMLParagraphElement>('overlay-eyebrow');
+-const audioMaster = requiredElement<HTMLInputElement>('audio-master');
+-const quickVolume = requiredElement<HTMLInputElement>('volume-quick');
+-let sessionActive = false;
+-let muted = false;
+-
+-function fitScreen(): void {
+-  const scale = Math.min(screenContainer.clientWidth / canvas.width, screenContainer.clientHeight / canvas.height);
+-  surface.style.width = `${canvas.width * scale}px`;
+-  surface.style.height = `${canvas.height * scale}px`;
+-}
+-
+-new ResizeObserver(fitScreen).observe(screenContainer);
+-
+-let audioUnlocked = false;
+-let framesPainted = 0;
+-let framesReceived = 0;
+-let bytesReceived = 0;
+-let lastFrameArrival = 0;
+-let latencySampleMs = 0;
+-let streamWidth = 0;
+-let streamHeight = 0;
+-
+-const video = new VideoPlayer(
+-  canvas,
+-  (message) => showError(message),
+-  () => {
+-    if (!video.isConfigured || !sessionActive) return;
+-    framesPainted += 1;
+-    const now = performance.now();
+-    if (lastFrameArrival > 0) latencySampleMs = Math.max(0, now - lastFrameArrival);
+-    overlay.classList.add('hidden');
+-    app.dataset.session = 'live';
+-    viewerState.textContent = 'LIVE';
+-  },
+-  () => connection.send({ type: 'keyframe' }),
+-  (width, height) => {
+-    streamWidth = width;
+-    streamHeight = height;
+-    fitScreen();
+-  },
+-);
+-
+-const microphone = new MicrophoneUplink(
+-  (payload, opus) => {
+-    const frame = new Uint8Array(payload.length + 1);
+-    frame[0] = opus ? 0x11 : 0x10;
+-    frame.set(payload, 1);
+-    connection.sendBinary(frame);
+-  },
+-  (message) => {
+-    micStatus.textContent = message;
+-  },
+-);
+-
+-const audio = new AudioEngine((message) => showError(message));
+-
+-const token = resolveToken();
++import { Connection } from './ws';
++import { SystemMedia } from './media-session';
++import { fittedSize, suggestedResolution, aspectChanged } from './display-fit';
++import { t, language, setLanguage, type Key } from './i18n';
++import type { ServerMessage, ClientMessage } from './protocol';
++
++function el<T extends HTMLElement = HTMLElement>(id: string): T { return document.getElementById(id) as T; }
++const canvas = el<HTMLCanvasElement>('screen');
++const surface = el('surface');
++const screen = el('screen-container');
++const panel = el<HTMLDialogElement>('settings');
++const url = new URL(location.href);
++const fromUrl = url.searchParams.get('token');
++if (fromUrl) { localStorage.setItem('playport-token', fromUrl); url.searchParams.delete('token'); history.replaceState(null, '', url); }
++const token = fromUrl || localStorage.getItem('playport-token') || '';
++let active = false, painted = false, frames = 0, lastStats = performance.now();
++let state: Key = token ? 'connecting' : 'access';
++let hint: Key = token ? 'waitingHint' : 'accessHint';
++let lastAutoTarget = '', autoTimer = 0, displayBusy = false;
++interface Display { width: number; height: number; fps: number; uiScale: number; hevc: boolean; }
++let display: Display | null = null;
++const autoFit = el<HTMLInputElement>('auto-fit');
++autoFit.checked = localStorage.getItem('f50-auto-fit') !== 'false';
++const volume = el<HTMLInputElement>('volume');
++volume.value = String(Math.min(100, Math.max(0, Number(localStorage.getItem('playport-master') ?? 100) || 0)));
++
++function render() {
++  setLanguage(language);
++  el<HTMLSelectElement>('language').value = language;
++  el('btn-settings').setAttribute('aria-label', t('settings'));
++  volume.setAttribute('aria-label', t('volume'));
++  el('connection-text').textContent = t(state);
++  el('connection-hint').textContent = t(hint);
++  el('overlay').hidden = painted;
++  el('app').dataset.live = String(painted);
++  el('capabilities').textContent = !isSecureContext ? t('insecure') : typeof VideoDecoder === 'undefined' || typeof AudioDecoder === 'undefined' ? t('unsupported') : t('compatible');
++  el('media-support').textContent = t(media.supported ? 'mediaYes' : 'mediaNo');
++  el<HTMLInputElement>('width').disabled = autoFit.checked;
++  el<HTMLInputElement>('height').disabled = autoFit.checked;
++  document.querySelectorAll<HTMLButtonElement>('[data-command]').forEach(b => { b.disabled = !active; });
++}
++function fit() {
++  const size = fittedSize(canvas.width, canvas.height, screen.clientWidth, screen.clientHeight);
++  surface.style.width = `${size.width}px`; surface.style.height = `${size.height}px`;
++}
++function error(message: string) { el('error-text').textContent = message; el('error-banner').hidden = !message; }
++function send(message: ClientMessage) { if (active) connection.send(message); }
++const video = new VideoPlayer(canvas, error, () => {
++  if (!active) return;
++  frames++; painted = true; el('overlay').hidden = true; el('app').dataset.live = 'true';
++}, () => send({ type:'keyframe' }), fit);
++const audio = new AudioEngine(error);
++const media = new SystemMedia(send, () => { void audio.unlock().catch(error); }, () => audio.pauseMusic());
++const microphone = new MicrophoneUplink((payload, opus) => {
++  const frame = new Uint8Array(payload.length + 1); frame[0] = opus ? 0x11 : 0x10; frame.set(payload, 1); connection.sendBinary(frame);
++}, message => { el('mic-status').textContent = message; });
+ const connection = new Connection(token, {
+-  onWire: (message: WireMessage) => {
++  onWire(message) {
+     switch (message.kind) {
+-      case 'video-config':
+-        video.configure(message);
+-        break;
+-      case 'video-frame':
+-        framesReceived += 1;
+-        lastFrameArrival = performance.now();
+-        video.pushFrame(message);
+-        break;
+-      case 'audio-config':
+-        audio.handleConfig(message);
+-        break;
+-      case 'audio-packet':
+-        audio.handlePacket(message);
+-        break;
+-      case 'audio-stopped':
+-        audio.stopStream(message.streamType);
+-        break;
+-      case 'screen-active':
+-        break;
++      case 'video-config': video.configure(message); break;
++      case 'video-frame': video.pushFrame(message); break;
++      case 'audio-config': audio.handleConfig(message); break;
++      case 'audio-packet': audio.handlePacket(message); break;
++      case 'audio-stopped': audio.stopStream(message.streamType); break;
+     }
+   },
+-  onServer: (message: ServerMessage) => applyServerState(message),
+-  onState: (state: ConnectionState) => applyConnectionState(state),
+-  onBytes: (count) => {
+-    bytesReceived += count;
++  onServer: server,
++  onState(value) {
++    if (value === 'closed') { reset(); state = 'reconnecting'; }
++    else if (value === 'connecting') state = 'connecting';
++    else { state = 'waiting'; void loadDisplay(); void unlock(); }
++    render();
+   },
+ });
+-
+-const input = new InputController(canvas, (message) => connection.send(message));
+-input.attach();
+-
+-function resetSession(): void {
+-  sessionActive = false;
+-  app.dataset.session = 'idle';
+-  canvas.inert = true;
+-  for (const button of document.querySelectorAll<HTMLButtonElement>('[data-remote]')) button.disabled = true;
+-  video.close();
+-  audio.stopAll();
+-  void microphone.stop();
+-  micStatus.textContent = '';
+-  streamWidth = streamHeight = framesReceived = framesPainted = bytesReceived = lastFrameArrival = latencySampleMs = 0;
+-  streamInfo.textContent = 'Waiting for a video stream';
+-  canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
+-  overlay.classList.remove('hidden');
+-}
+-
+-function applyServerState(message: ServerMessage): void {
+-  switch (message.type) {
+-    case 'mic': {
+-      if (message.micActive === true) {
+-        void microphone.start({
+-          sampleRate: message.micRate ?? 16_000,
+-          channels: message.micChannels ?? 1,
+-          codec: message.micCodec ?? 'lpcm',
+-          samplesPerPacket: message.micSamplesPerPacket ?? 320,
+-          bitrate: message.micBitrate ?? null,
+-        });
+-      } else {
+-        void microphone.stop();
+-        micStatus.textContent = '';
+-      }
+-      break;
+-    }
+-    case 'hello':
+-    case 'session': {
+-      const device = message.deviceName ?? 'PlayPort';
+-      const phone = message.message ?? null;
+-      const active = message.sessionActive === true;
+-      setStatus(active ? 'live' : 'idle', active ? `${phone ?? 'iPhone'} connected` : `${device} ready`);
+-      requiredElement('device-name').textContent = active ? (phone ?? 'iPhone') : device;
+-      if (!active) {
+-        resetSession();
+-        viewerState.textContent = 'STANDBY';
+-        setOverlay('Your next drive starts here.', 'Connect your iPhone to PlayPort to bring CarPlay to this screen.');
+-      } else {
+-        if (!sessionActive) {
+-          viewerState.textContent = 'STARTING';
+-          app.dataset.session = 'connected';
+-          setOverlay('You’re connected.', 'Getting the first picture from your iPhone. CarPlay will appear in a moment.', 'ALMOST THERE');
+-        }
+-        sessionActive = true;
+-        canvas.inert = false;
+-        for (const button of document.querySelectorAll<HTMLButtonElement>('[data-remote]')) button.disabled = false;
+-      }
+-      break;
+-    }
+-    default:
+-      break;
++const input = new InputController(canvas, send); input.attach();
++function reset() {
++  active = painted = false; input.reset(); canvas.inert = true;
++  video.close(); audio.stopAll(); media.setActive(false); void microphone.stop();
++  canvas.getContext('2d')?.clearRect(0,0,canvas.width,canvas.height);
++}
++function server(message: ServerMessage) {
++  if(message.type === 'artwork' && message.artwork) { media.setArtwork(message.revision ?? 0,message.artwork); return; }
++  if (message.type === 'now-playing' && message.nowPlaying) { media.setMetadata(message.nowPlaying); return; }
++  if (message.type === 'host-ui' && active) {
++    panel.showModal(); void loadDisplay(); return;
+   }
+-}
+-
+-function applyConnectionState(state: ConnectionState): void {
+-  switch (state) {
+-    case 'connecting':
+-      setStatus('idle', 'Connecting…');
+-      viewerState.textContent = 'CONNECTING';
+-      setOverlay('Finding your PlayPort.', 'Connecting to the server. Your screen will be ready in a moment.', 'CONNECTING');
+-      break;
+-    case 'open':
+-      setStatus('idle', 'Server connected');
+-      break;
+-    case 'closed':
+-      resetSession();
+-      setStatus('idle', 'Reconnecting…');
+-      viewerState.textContent = 'RECONNECTING';
+-      setOverlay('Let’s get you back.', 'The server connection was interrupted. We’ll reconnect automatically.', 'RECONNECTING');
+-      break;
++  if (message.type === 'mic') {
++    if (message.micActive) void microphone.start({ sampleRate:message.micRate ?? 16000, channels:message.micChannels ?? 1, codec:message.micCodec ?? 'lpcm', samplesPerPacket:message.micSamplesPerPacket ?? 320, bitrate:message.micBitrate ?? null });
++    else void microphone.stop();
+   }
+-}
+-
+-function setStatus(kind: 'live' | 'idle', text: string): void {
+-  statusDot.dataset.state = kind;
+-  statusText.textContent = text;
+-}
+-
+-function setOverlay(title: string, text: string, eyebrow = 'READY WHEN YOU ARE'): void {
+-  overlayTitle.textContent = title;
+-  overlayText.textContent = text;
+-  overlayEyebrow.textContent = eyebrow;
+-}
+-
+-function showError(message: string): void {
+-  if (!message) {
+-    errorBanner.classList.add('hidden');
+-    requiredElement('error-text').textContent = '';
+-    return;
+-  }
+-  requiredElement('error-text').textContent = message;
+-  errorBanner.classList.remove('hidden');
+-}
+-
+-function sendMedia(index: number): void {
+-  connection.send({ type: 'media', media: index });
+-}
+-
+-function clickButton(id: string, handler: () => void): void {
+-  requiredElement<HTMLButtonElement>(id).addEventListener('click', (event) => {
+-    event.preventDefault();
+-    handler();
+-  });
+-}
+-
+-clickButton('btn-home', () => connection.send({ type: 'knob', knob: { select: false, home: true, back: false, x: 0, y: 0, wheel: 0 } }));
+-clickButton('btn-back', () => connection.send({ type: 'knob', knob: { select: false, home: false, back: true, x: 0, y: 0, wheel: 0 } }));
+-clickButton('btn-select', () => connection.send({ type: 'knob', knob: { select: true, home: false, back: false, x: 0, y: 0, wheel: 0 } }));
+-clickButton('btn-siri', () => connection.send({ type: 'siri' }));
+-clickButton('btn-prev', () => sendMedia(5));
+-clickButton('btn-play', () => sendMedia(3));
+-clickButton('btn-next', () => sendMedia(4));
+-clickButton('btn-keyframe', () => {
+-  connection.send({ type: 'keyframe' });
+-  toast('Requested a fresh video frame');
++  if (message.type !== 'session' && message.type !== 'hello') return;
++  if (!message.sessionActive) { reset(); state = 'waiting'; }
++  else { active = true; canvas.inert = false; state = 'starting'; media.setActive(true); if(message.nowPlaying) media.setMetadata(message.nowPlaying); if(message.artwork) media.setArtwork(message.revision ?? 0,message.artwork); }
++  render();
++}
++async function unlock() {
++  if (audio.isUnlocked) return;
++  try { await audio.unlock(); } catch { /* Keep a truthful gesture hint; retry on next gesture. */ }
++}
++window.addEventListener('pointerdown', () => { void unlock(); });
++window.addEventListener('click', () => { void unlock(); });
++window.addEventListener('keydown', () => { void unlock(); });
++el('audio-unlock').onclick = () => { void unlock(); };
++function setVolume() { audio.setVolume(Number(volume.value) / 100); el('volume-value').textContent = `${volume.value}%`; localStorage.setItem('playport-master',volume.value); }
++volume.oninput = setVolume; setVolume();
++el('btn-settings').onclick = () => { panel.showModal(); void loadDisplay(); };
++el('btn-close').onclick = () => panel.close();
++el('dismiss-error').onclick = () => error('');
++el<HTMLSelectElement>('language').onchange = event => { setLanguage((event.target as HTMLSelectElement).value); render(); };
++panel.addEventListener('click', event => { if (event.target !== panel) return; const r=panel.getBoundingClientRect(); if(event.clientX<r.left || event.clientX>r.right) panel.close(); });
++el('fullscreen').onclick = async () => {
++  try { if (document.fullscreenElement) await document.exitFullscreen(); else await document.documentElement.requestFullscreen(); }
++  catch { error(t('fullscreenFail')); }
++};
++document.querySelectorAll<HTMLButtonElement>('[data-command]').forEach(button => button.onclick = () => {
++  const cmd = button.dataset.command;
++  if (cmd === 'home' || cmd === 'back') send({ type:'knob', knob:{ select:false, home:cmd==='home', back:cmd==='back', x:0,y:0,wheel:0 } });
++  else if (cmd === 'refresh') send({ type:'keyframe' });
++  else send({ type:'media', media:cmd==='previous'?5:cmd==='next'?4:3 });
+ });
+-clickButton('btn-fullscreen', () => void toggleFullscreen());
+-
+-async function toggleFullscreen(): Promise<void> {
++async function loadDisplay() {
++  if (displayBusy || !token) return;
++  el('display-status').textContent = t('loading');
+   try {
+-    if (document.fullscreenElement) await document.exitFullscreen();
+-    else if (document.documentElement.requestFullscreen) await document.documentElement.requestFullscreen();
+-    else toast('Fullscreen is unavailable in this browser. Try focus mode.');
+-  } catch {
+-    toast('Could not enter fullscreen. Try focus mode.');
+-  }
+-}
+-
+-document.addEventListener('fullscreenchange', () => {
+-  requiredElement('btn-fullscreen').setAttribute('aria-label', document.fullscreenElement ? 'Exit fullscreen' : 'Enter fullscreen');
+-});
+-
+-let toastTimer = 0;
+-function toast(message: string): void {
+-  const element = requiredElement('toast');
+-  element.textContent = message;
+-  element.hidden = false;
+-  window.clearTimeout(toastTimer);
+-  toastTimer = window.setTimeout(() => { element.hidden = true; }, 2800);
+-}
+-
+-function toggleFocus(): void {
+-  const focused = app.classList.toggle('focus-mode');
+-  requiredElement('btn-focus').setAttribute('aria-pressed', String(focused));
+-  requiredElement('btn-exit-focus').hidden = !focused;
+-  requiredElement<HTMLButtonElement>(focused ? 'btn-exit-focus' : 'btn-focus').focus();
+-}
+-clickButton('btn-focus', toggleFocus);
+-clickButton('btn-exit-focus', toggleFocus);
+-clickButton('btn-error-close', () => showError(''));
+-clickButton('btn-viewer', () => canvas.focus());
+-
+-muteButton.addEventListener('click', () => {
+-  muted = !muted;
+-  updateMasterVolume();
+-});
+-
+-async function unlockAudio(): Promise<void> {
+-  if (audioUnlocked) return;
++    const r = await fetch('/api/display'); if (!r.ok) throw new Error();
++    display = await r.json() as Display;
++    el<HTMLInputElement>('width').value = String(display.width); el<HTMLInputElement>('height').value = String(display.height);
++    el<HTMLSelectElement>('fps').value = String(display.fps); el<HTMLSelectElement>('ui-scale').value = String(display.uiScale);
++    el('display-status').textContent = `${display.width} × ${display.height} / ${display.fps} fps`;
++    scheduleAuto();
++  } catch { el('display-status').textContent = t('loadFail'); }
++}
++async function saveDisplay(target: Display): Promise<boolean> {
++  if (displayBusy || !token) return false;
++  displayBusy = true; el<HTMLButtonElement>('apply').disabled = true; el<HTMLFieldSetElement>('display-fields').disabled = true;
++  el('display-status').textContent = t('applying');
+   try {
+-    await audio.unlock();
+-    audioUnlocked = true;
+-    requiredElement('audio-unlock-hint').hidden = true;
+-  } catch {
+-    // The next gesture retries.
+-  }
+-}
+-
+-window.addEventListener('pointerdown', () => void unlockAudio(), { once: false });
+-window.addEventListener('keydown', () => void unlockAudio(), { once: false });
+-
+-if (!token) {
+-  setStatus('idle', 'Access link needed');
+-  viewerState.textContent = 'SETUP';
+-  setOverlay('Your personal link is the key.', 'Open the viewer link printed by the PlayPort server. It includes the access token needed to connect.', 'ONE MORE STEP');
+-}
+-
+-if (typeof VideoDecoder === 'undefined') {
+-  showError(
+-    'Video decoding needs WebCodecs, which browsers only expose in a secure context. ' +
+-      'Open the https:// URL printed by the server (accept the self-signed certificate warning once), ' +
+-      'not the plain http:// LAN address.',
+-  );
+-}
+-
+-if (token) connection.connect();
+-
+-// --- Display panel: resolution, orientation and CarPlay UI size ---
+-
+-interface DisplayPreset {
+-  label: string;
+-  width: number;
+-  height: number;
+-  orientation: string;
+-}
+-
+-interface DisplayInfo {
+-  width: number;
+-  height: number;
+-  fps: number;
+-  uiScale: number;
+-  hevc: boolean;
+-  orientation: string;
+-  presets: DisplayPreset[];
+-}
+-
+-const displayPanel = requiredElement<HTMLDialogElement>('display-panel');
+-const displayPresets = requiredElement<HTMLDivElement>('display-presets');
+-const displayWidthInput = requiredElement<HTMLInputElement>('display-width');
+-const displayHeightInput = requiredElement<HTMLInputElement>('display-height');
+-const displayUiScale = requiredElement<HTMLSelectElement>('display-uiscale');
+-const displayCodec = requiredElement<HTMLSelectElement>('display-codec');
+-const displayFps = requiredElement<HTMLSelectElement>('display-fps');
+-const displayStatus = requiredElement<HTMLParagraphElement>('display-status');
+-const displayApply = requiredElement<HTMLButtonElement>('btn-display-apply');
+-const displayForm = requiredElement<HTMLFormElement>('display-form');
+-const displayFields = requiredElement<HTMLFieldSetElement>('display-fields');
+-
+-let hevcSupported = false;
+-
+-async function probeHevcSupport(): Promise<boolean> {
+-  if (typeof VideoDecoder === 'undefined') return false;
+-  const probes = ['hvc1.1.6.L120.B0', 'hvc1.1.6.L93.B0', 'hvc1.1.6.L120.90', 'hvc1.2.4.L120.B0'];
+-  for (const codec of probes) {
+-    try {
+-      const support = await VideoDecoder.isConfigSupported({ codec });
+-      if (support.supported) return true;
+-    } catch {
+-      // Try the next probe.
+-    }
+-  }
+-  return false;
+-}
+-
+-function renderPresets(presets: DisplayPreset[]): void {
+-  displayPresets.replaceChildren();
+-  for (const preset of presets) {
+-    const button = document.createElement('button');
+-    button.type = 'button';
+-    button.dataset.width = String(preset.width);
+-    button.dataset.height = String(preset.height);
+-    button.setAttribute('aria-pressed', 'false');
+-    const shape = document.createElement('span');
+-    shape.className = `preset-screen ${preset.height > preset.width ? 'portrait' : preset.width / preset.height > 2 ? 'ultrawide' : ''}`;
+-    shape.setAttribute('aria-hidden', 'true');
+-    const copy = document.createElement('span');
+-    copy.className = 'preset-copy';
+-    copy.textContent = `${preset.width} × ${preset.height}`;
+-    const orientation = document.createElement('small');
+-    orientation.textContent = preset.height > preset.width ? 'Portrait' : preset.width / preset.height > 2 ? 'Ultrawide' : 'Landscape';
+-    copy.append(orientation);
+-    button.append(shape, copy);
+-    button.addEventListener('click', () => {
+-      displayWidthInput.value = String(preset.width);
+-      displayHeightInput.value = String(preset.height);
+-      selectMatchingPreset();
+-    });
+-    displayPresets.append(button);
+-  }
+-}
+-
+-function selectMatchingPreset(): void {
+-  for (const button of displayPresets.querySelectorAll('button')) {
+-    const selected = button.dataset.width === displayWidthInput.value && button.dataset.height === displayHeightInput.value;
+-    button.classList.toggle('selected', selected);
+-    button.setAttribute('aria-pressed', String(selected));
+-  }
+-}
+-displayWidthInput.addEventListener('input', selectMatchingPreset);
+-displayHeightInput.addEventListener('input', selectMatchingPreset);
+-
+-async function refreshDisplayInfo(): Promise<void> {
+-  displayFields.disabled = true;
+-  displayApply.disabled = true;
+-  displayStatus.dataset.error = 'false';
+-  displayStatus.textContent = 'Loading your display settings…';
+-  try {
+-    const response = await fetch('/api/display');
+-    if (!response.ok) throw new Error(`Request failed (${response.status})`);
+-    const info = (await response.json()) as DisplayInfo;
+-    renderPresets(info.presets);
+-    displayUiScale.value = String(info.uiScale);
+-    displayWidthInput.value = String(info.width);
+-    displayHeightInput.value = String(info.height);
+-    displayFps.value = String(info.fps);
+-    displayCodec.value = info.hevc ? 'h265' : 'h264';
+-    selectMatchingPreset();
+-    hevcSupported = await probeHevcSupport();
+-    const hevcOption = displayCodec.querySelector('option[value="h265"]') as HTMLOptionElement | null;
+-    if (hevcOption) {
+-      hevcOption.disabled = !hevcSupported;
+-      hevcOption.textContent = hevcSupported
+-        ? 'H.265 / HEVC (sharper)'
+-        : 'H.265 / HEVC (unavailable in this browser)';
+-    }
+-    if (!hevcSupported && info.hevc) displayCodec.value = 'h264';
+-    displayFields.disabled = false;
+-    displayApply.disabled = !token;
+-    displayStatus.textContent =
+-      `Current: ${info.width}×${info.height} @ ${info.fps} fps (${info.orientation}), ` +
+-      `${info.hevc ? 'HEVC' : 'H.264'}, UI size ${info.uiScale}%`;
+-  } catch {
+-    displayStatus.dataset.error = 'true';
+-    displayStatus.textContent = 'Could not load settings. Check the server connection, then reopen Display.';
+-  }
+-}
+-
+-async function applyDisplay(): Promise<void> {
+-  const width = Number(displayWidthInput.value);
+-  const height = Number(displayHeightInput.value);
+-  const uiScale = Number(displayUiScale.value);
+-  const fps = Number(displayFps.value);
+-  const hevc = displayCodec.value === 'h265';
+-  if (!token || displayApply.disabled || !displayForm.reportValidity()) return;
+-  displayApply.disabled = true;
+-  displayFields.disabled = true;
+-  displayStatus.dataset.error = 'false';
+-  displayStatus.textContent = 'Applying…';
+-  try {
+-    const response = await fetch(`/api/display?token=${encodeURIComponent(token)}`, {
+-      method: 'POST',
+-      headers: { 'Content-Type': 'application/json' },
+-      body: JSON.stringify({ width, height, fps, uiScale, hevc }),
+-    });
+-    const body = (await response.json()) as { ok?: boolean; error?: string };
+-    displayStatus.dataset.error = String(!response.ok || !body.ok);
+-    displayStatus.textContent =
+-      response.ok && body.ok
+-        ? 'Applied. CarPlay is restarting — video returns in a few seconds.'
+-        : (body.error ?? `Request failed (${response.status})`);
+-  } catch (error) {
+-    displayStatus.dataset.error = 'true';
+-    displayStatus.textContent = `Request failed: ${String(error)}`;
+-  } finally {
+-    displayApply.disabled = false;
+-    displayFields.disabled = false;
+-  }
+-}
+-
+-clickButton('btn-display', () => {
+-  displayPanel.showModal();
+-  void refreshDisplayInfo();
+-});
+-clickButton('btn-display-close', () => displayPanel.close());
+-clickButton('btn-display-match', () => {
+-  const ratio = window.devicePixelRatio || 1;
+-  const even = (value: number) => Math.max(480, Math.min(3840, Math.round((value * ratio) / 2) * 2));
+-  displayWidthInput.value = String(even(window.innerWidth));
+-  displayHeightInput.value = String(even(window.innerHeight));
+-  displayStatus.textContent =
+-    `Window physical pixels: ${displayWidthInput.value}×${displayHeightInput.value} (devicePixelRatio ${ratio}). ` +
+-    'Put the browser in fullscreen first for a 1:1 mapping.';
+-  selectMatchingPreset();
+-});
+-displayForm.addEventListener('submit', (event) => {
++    const r = await fetch(`/api/display?token=${encodeURIComponent(token)}`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(target) });
++    const body = await r.json() as {ok?:boolean}; if (!r.ok || !body.ok) throw new Error();
++    display = target; el('display-status').textContent = t('applied'); return true;
++  } catch { el('display-status').textContent = t('applyFail'); return false; }
++  finally { displayBusy=false; el<HTMLButtonElement>('apply').disabled=false; el<HTMLFieldSetElement>('display-fields').disabled=false; render(); }
++}
++function scheduleAuto() {
++  window.clearTimeout(autoTimer);
++  if (!autoFit.checked || !display || displayBusy || document.hidden || typeof VideoDecoder === 'undefined') return;
++  autoTimer=window.setTimeout(() => { void adapt(); },1500);
++}
++async function adapt() {
++  if (!display || !autoFit.checked || displayBusy) return;
++  const target=suggestedResolution(screen.clientWidth,screen.clientHeight);
++  const key=`${target.width}x${target.height}`;
++  if (!aspectChanged(display,target) || key===lastAutoTarget) return;
++  // Avoid a reconnect loop even when another viewer has a different screen shape.
++  lastAutoTarget=key;
++  if (!(await saveDisplay({...display,...target,hevc:false}))) error(t('autoFail'));
++}
++autoFit.onchange=() => { localStorage.setItem('f50-auto-fit',String(autoFit.checked)); lastAutoTarget=''; render(); scheduleAuto(); };
++el<HTMLFormElement>('display-form').onsubmit=event => {
+   event.preventDefault();
+-  void applyDisplay();
+-});
+-
+-// --- Stream statistics HUD ---
+-
+-let statsTick = performance.now();
+-
+-function updateStats(): void {
+-  const now = performance.now();
+-  const elapsedSeconds = Math.max(0.001, (now - statsTick) / 1000);
+-  statsTick = now;
+-  const fps = framesPainted / elapsedSeconds;
+-  const mbps = (bytesReceived * 8) / 1_000_000 / elapsedSeconds;
+-  const dropped = Math.max(0, framesReceived - framesPainted);
+-  const queue = video.decodeQueueSize;
+-  const latency = latencySampleMs;
+-  framesPainted = 0;
+-  framesReceived = 0;
+-  bytesReceived = 0;
+-  if (streamWidth === 0) {
+-    streamInfo.textContent = 'Waiting for a video stream';
+-    return;
+-  }
+-  const parts = [`${streamWidth} × ${streamHeight}`];
+-  parts.push(`${fps.toFixed(0)} fps`);
+-  parts.push(`${mbps.toFixed(1)} Mbps`);
+-  if (dropped > 0) parts.push(`${dropped} dropped`);
+-  if (queue > 2) parts.push(`queue ${queue}`);
+-  if (latency > 0 && latency < 1000) parts.push(`decode ~${latency.toFixed(0)} ms`);
+-  streamInfo.textContent = parts.join(' · ');
+-}
+-
+-window.setInterval(updateStats, 500);
+-
+-// --- Call / night controls ---
+-
+-clickButton('btn-answer', () => connection.send({ type: 'telephony', telephony: 1 }));
+-clickButton('btn-call-mute', () => connection.send({ type: 'telephony', telephony: 2 }));
+-
+-let nightMode = false;
+-clickButton('btn-night', () => {
+-  nightMode = !nightMode;
+-  connection.send({ type: 'night', night: nightMode });
+-  requiredElement<HTMLButtonElement>('btn-night').dataset.active = nightMode ? 'true' : 'false';
+-  requiredElement('btn-night').setAttribute('aria-pressed', String(nightMode));
+-  toast(`CarPlay ${nightMode ? 'night' : 'day'} mode requested`);
+-});
+-
+-// --- Audio mixer ---
+-
+-const audioPanel = requiredElement<HTMLDialogElement>('audio-panel');
+-const audioStreams = requiredElement<HTMLDivElement>('audio-streams');
+-const audioStatus = requiredElement<HTMLParagraphElement>('audio-status');
+-
+-const savedMaster = Number(localStorage.getItem('playport-master') ?? '100');
+-audioMaster.value = String(Number.isFinite(savedMaster) ? savedMaster : 100);
+-updateMasterVolume();
+-
+-function updateMasterVolume(): void {
+-  audio.setVolume(muted ? 0 : Number(audioMaster.value) / 100);
+-  quickVolume.value = audioMaster.value;
+-  requiredElement('volume-value').textContent = muted ? 'Muted' : `${audioMaster.value}%`;
+-  requiredElement('audio-master-value').textContent = muted ? `${audioMaster.value}% · Muted` : `${audioMaster.value}%`;
+-  muteButton.setAttribute('aria-pressed', String(muted));
+-  muteButton.setAttribute('aria-label', muted ? 'Unmute audio' : 'Mute audio');
+-  muteButton.title = muted ? 'Unmute audio' : 'Mute audio';
+-  document.getElementById('mute-icon')?.setAttribute('href', muted ? '#i-mute' : '#i-audio');
+-}
+-
+-audioMaster.addEventListener('input', () => {
+-  muted = false;
+-  updateMasterVolume();
+-  localStorage.setItem('playport-master', String(audioMaster.value));
+-});
+-quickVolume.addEventListener('input', () => {
+-  audioMaster.value = quickVolume.value;
+-  audioMaster.dispatchEvent(new Event('input'));
+-});
+-
+-function streamGainKey(name: string): string {
+-  return `playport-gain-${name}`;
+-}
+-
+-function ensureStreamSliders(): void {
+-  const names = audio.activeStreamNames();
+-  const existing = new Set(
+-    Array.from(audioStreams.querySelectorAll<HTMLElement>('[data-stream]'), (element) => element.dataset.stream ?? ''),
+-  );
+-  if (names.length === 0) {
+-    audioStatus.textContent = 'No audio playing yet. Start music, navigation, or a call on your iPhone to mix its volume here.';
+-  } else {
+-    audioStatus.textContent = '';
+-  }
+-  if (names.length === existing.size && names.every((name) => existing.has(name))) return;
+-  audioStreams.replaceChildren();
+-  for (const name of names) {
+-    const row = document.createElement('div');
+-    row.className = 'audio-stream-row';
+-    row.dataset.stream = name;
+-    const label = document.createElement('label');
+-    label.textContent = name;
+-    const slider = document.createElement('input');
+-    slider.type = 'range';
+-    slider.min = '0';
+-    slider.max = '100';
+-    slider.id = `audio-stream-${audioStreams.childElementCount}`;
+-    label.htmlFor = slider.id;
+-    const output = document.createElement('output');
+-    output.htmlFor = slider.id;
+-    const stored = Number(localStorage.getItem(streamGainKey(name)) ?? '100');
+-    slider.value = String(Number.isFinite(stored) ? stored : 100);
+-    output.textContent = `${slider.value}%`;
+-    audio.setStreamGain(name, Number(slider.value) / 100);
+-    slider.addEventListener('input', () => {
+-      audio.setStreamGain(name, Number(slider.value) / 100);
+-      localStorage.setItem(streamGainKey(name), slider.value);
+-      output.textContent = `${slider.value}%`;
+-    });
+-    row.append(label, output, slider);
+-    audioStreams.append(row);
+-  }
+-}
+-
+-window.setInterval(ensureStreamSliders, 1000);
+-
+-clickButton('btn-audio', () => {
+-  audioPanel.showModal();
+-  ensureStreamSliders();
+-});
+-clickButton('btn-audio-close', () => audioPanel.close());
+-
+-const helpPanel = requiredElement<HTMLDialogElement>('help-panel');
+-clickButton('btn-help', () => helpPanel.showModal());
+-clickButton('btn-setup', () => helpPanel.showModal());
+-clickButton('btn-help-close', () => helpPanel.close());
+-
+-for (const [panel, trigger] of [[displayPanel, 'btn-display'], [audioPanel, 'btn-audio'], [helpPanel, 'btn-help']] as const) {
+-  panel.addEventListener('click', (event) => {
+-    const rect = panel.getBoundingClientRect();
+-    if (event.target === panel && (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom)) panel.close();
+-  });
+-  panel.addEventListener('close', () => requiredElement(trigger).classList.remove('active'));
+-  requiredElement(trigger).addEventListener('click', () => requiredElement(trigger).classList.add('active'));
+-}
+-
+-if (!('mediaDevices' in navigator)) {
+-  micStatus.textContent = '';
+-}
++  const size=autoFit.checked?suggestedResolution(screen.clientWidth,screen.clientHeight):{width:Number(el<HTMLInputElement>('width').value),height:Number(el<HTMLInputElement>('height').value)};
++  if (![size.width,size.height].every(v=>Number.isInteger(v)&&v>=480&&v<=3840&&v%2===0)) { error(t('range')); return; }
++  void saveDisplay({...size,fps:Number(el<HTMLSelectElement>('fps').value),uiScale:Number(el<HTMLSelectElement>('ui-scale').value),hevc:false});
++};
++new ResizeObserver(()=>{ fit(); scheduleAuto(); }).observe(screen);
++document.addEventListener('visibilitychange',()=>{if(!document.hidden){fit();scheduleAuto();void unlock();}});
++window.setInterval(()=>{
++  const now=performance.now(),fps=frames*1000/Math.max(1,now-lastStats);frames=0;lastStats=now;
++  el('stats').textContent=painted?`${canvas.width} × ${canvas.height} / ${fps.toFixed(0)} fps`:t('noStream');
++  el('audio-unlock').hidden=!active||audio.isUnlocked;
++  el('audio-status').textContent=t(audio.isPlaying?'playing':'paused');media.setPlaying(audio.isPlaying);
++},750);
++render();fit();if(token) connection.connect();
+diff --git a/web/src/media-session.ts b/web/src/media-session.ts
+new file mode 100644
+index 0000000..a47e29c
+--- /dev/null
++++ b/web/src/media-session.ts
+@@ -0,0 +1,66 @@
++import type { ClientMessage, NowPlaying } from './protocol';
++/** Real receiver audio owns the media element. No silent loop or invented song metadata. */
++export class SystemMedia {
++  private active = false;
++  private playing = false;
++  private info: MediaMetadataInit = { title: "CarPlay" };
++  private revision = 0;
++  private duration = 0;
++  private position = 0;
++  private speed = 1;
++  private at = 0;
++  private positionNow() { return Math.min(this.duration, this.position + (this.playing ? (performance.now()-this.at)/1000*this.speed : 0)); }
++  setMetadata(value: NowPlaying) {
++    const revision = value.revision ?? 0;
++    const changed = revision !== this.revision || value.title !== this.info.title || value.artist !== this.info.artist || value.album !== this.info.album;
++    this.info = { title: value.title, artist: value.artist, album: value.album, artwork: revision === this.revision ? this.info.artwork : [] };
++    this.revision = revision;
++    this.duration = Math.max(0,(value.durationMs ?? 0)/1000);
++    this.position = Math.max(0,Math.min(this.duration,(value.positionMs ?? 0)/1000));
++    this.speed = (value.speed ?? 1) > 0 ? value.speed! : 1;
++    if (!Number.isFinite(this.speed)) this.speed = 1;
++    this.at = performance.now();
++    if(changed) this.refreshMetadata();
++    this.updatePosition();
++  }
++  setArtwork(revision: number, src: string) {
++    if(revision !== this.revision || !src.startsWith('data:image/jpeg;base64,')) return;
++    this.info = {...this.info, artwork:[{src,type:'image/jpeg'}]};this.refreshMetadata();
++  }
++  private updatePosition() {
++    if(!this.supported || !navigator.mediaSession.setPositionState) return;
++    try { navigator.mediaSession.setPositionState(this.active && this.duration > 0 ? { duration:this.duration, position:this.positionNow(), playbackRate:this.speed } : undefined); } catch { /* Older browsers may not support a position state. */ }
++  }
++  private refreshMetadata() {
++    if (this.supported) navigator.mediaSession.metadata = this.active && typeof MediaMetadata !== "undefined" ? new MediaMetadata(this.info) : null;
++  }
++  readonly supported = 'mediaSession' in navigator;
++  constructor(private readonly send: (message: ClientMessage) => void, unlock: () => void, pause: () => void = () => {}) {
++    if (!this.supported) return;
++    const handlers: Partial<Record<MediaSessionAction, () => void>> = {
++      play: () => { unlock(); this.command(1); },
++      pause: () => { pause(); this.setPlaying(false); this.command(2); },
++      previoustrack: () => this.command(5),
++      nexttrack: () => this.command(4),
++    };
++    for (const [name, handler] of Object.entries(handlers)) {
++      try { navigator.mediaSession.setActionHandler(name as MediaSessionAction, handler); } catch { /* Partial browser support. */ }
++    }
++  }
++  private command(index: number) { if (this.active) this.send({ type: 'media', media: index }); }
++  setActive(active: boolean) {
++    this.active = active;
++    if (!this.supported) return;
++    if (!active) { this.info = { title: "CarPlay" }; this.duration=0; this.revision=0; }
++    this.refreshMetadata();
++    if (!active) this.playing = false;
++    this.update(); this.updatePosition();
++  }
++  setPlaying(playing: boolean) {
++    if(playing === this.playing) return;
++    this.position=this.positionNow();this.at=performance.now();this.playing=playing;this.update();this.updatePosition();
++  }
++  private update() {
++    if (this.supported) navigator.mediaSession.playbackState = this.active ? (this.playing ? 'playing' : 'paused') : 'none';
++  }
++}
+diff --git a/web/src/music-output.ts b/web/src/music-output.ts
+new file mode 100644
+index 0000000..7c43721
+--- /dev/null
++++ b/web/src/music-output.ts
+@@ -0,0 +1,64 @@
++import { aacInit, aacFragment } from './aac-mp4';
++import type { AudioConfigMessage } from './protocol';
++const mime='audio/mp4; codecs="mp4a.40.2"';
++/** A real HTML media timeline makes received music eligible for OS media controls. */
++export class MusicOutput {
++  static supported() { return typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(mime); }
++  readonly element=document.createElement('audio');
++  private readonly source=new MediaSource();
++  private readonly url=URL.createObjectURL(this.source);
++  private buffer:SourceBuffer|null=null;
++  private pending:Uint8Array[]=[];
++  private frames:Uint8Array[]=[];
++  private sequence=1;
++  private samples=0;
++  private closed=false;
++  private lastPacket=-Infinity;
++  private running=false;
++  readonly configKey: string;
++  constructor(config:AudioConfigMessage,private readonly onError:(message:string)=>void) {
++    this.configKey=JSON.stringify([config.sampleRate,config.channels,Array.from(config.description)]);
++    this.element.id='carplay-music';this.element.hidden=true;this.element.setAttribute('playsinline','');this.element.src=this.url;
++    document.body.append(this.element);
++    this.element.addEventListener('playing',()=>{this.running=true;});
++    this.element.addEventListener('waiting',()=>{this.running=false;});
++    this.element.addEventListener('pause',()=>{this.running=false;});
++    this.element.addEventListener('error',()=>{if(!this.closed)this.onError('Music playback: '+(this.element.error?.message||'media error'));});
++    this.pending.push(aacInit(config.sampleRate,config.channels,config.description));
++    this.source.addEventListener('sourceopen',()=>{
++      if(this.closed)return;
++      try { this.buffer=this.source.addSourceBuffer(mime);this.buffer.addEventListener('updateend',()=>this.pump());this.buffer.addEventListener('error',()=>this.onError('Music buffer decode error'));this.pump(); }
++      catch(error){this.onError(String(error));}
++    },{once:true});
++  }
++  get unlocked(){return !this.element.paused;}
++  get playing(){return this.running&&!this.element.paused&&performance.now()-this.lastPacket<1800;}
++  pause(){this.element.pause();this.running=false;this.frames=[];}
++  unlock(){
++    if(this.element.paused && this.buffer?.buffered.length) this.element.currentTime=this.buffer.buffered.end(this.buffer.buffered.length-1);
++    return this.element.play();
++  }
++  volume(value:number){this.element.volume=Math.max(0,Math.min(1,value));}
++  packet(data:Uint8Array){
++    if(this.closed)return;
++    this.lastPacket=performance.now();this.frames.push(data.slice());
++    if(this.frames.length<20)return;
++    this.pending.push(aacFragment(this.sequence++,this.samples,this.frames));this.samples+=1024*this.frames.length;this.frames=[];
++    if(this.pending.length>12){this.onError('Music buffer is not advancing');this.close();return;}
++    this.pump();
++  }
++  private pump(){
++    const b=this.buffer;if(this.closed||!b||b.updating||this.source.readyState!=='open')return;
++    try {
++      if(b.buffered.length){
++        const end=b.buffered.end(b.buffered.length-1),now=this.element.currentTime;
++        if(end-now>2)this.element.currentTime=Math.max(b.buffered.start(0),end-.65);
++        if(now-b.buffered.start(0)>15){b.remove(0,now-10);return;}
++      }
++      const next=this.pending.shift();if(next)b.appendBuffer(next as Uint8Array<ArrayBuffer>);
++    }catch(error){this.onError(String(error));}
++  }
++  close(){
++    if(this.closed)return;this.closed=true;this.element.pause();this.element.removeAttribute('src');this.element.load();this.element.remove();URL.revokeObjectURL(this.url);this.pending=[];this.frames=[];
++  }
++}
+diff --git a/web/src/protocol.ts b/web/src/protocol.ts
+index 31bf541..937d79c 100644
+--- a/web/src/protocol.ts
++++ b/web/src/protocol.ts
+@@ -90,7 +90,12 @@ export type ClientMessage =
+   | { type: 'keyframe' }
+   | { type: 'ping' };
+
++export interface NowPlaying { title: string; artist: string; album: string; durationMs?: number; positionMs?: number; speed?: number; revision?: number; }
++
+ export interface ServerMessage {
++  nowPlaying?: NowPlaying;
++  artwork?: string;
++  revision?: number;
+   type: string;
+   deviceName?: string;
+   sessionActive?: boolean;
+diff --git a/web/src/style.css b/web/src/style.css
+index a7b7e40..0e7353c 100644
+--- a/web/src/style.css
++++ b/web/src/style.css
+@@ -1,317 +1,37 @@
+-:root {
+-  color-scheme: dark;
+-  font-family: "Avenir Next", Avenir, "Trebuchet MS", sans-serif;
+-  font-synthesis: none;
+-  --bg: #111310;
+-  --panel: #1a1d18;
+-  --edge: #30342c;
+-  --text: #f2f3ed;
+-  --muted: #a1a699;
+-  --accent: #d4f68a;
+-  --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+-}
+-
++:root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; color: #f4f6f8; background: #000; --panel:#191c22; --line:#424750; --blue:#327cf6; }
+ * { box-sizing: border-box; }
+-body { margin: 0; background: var(--bg); color: var(--text); }
+-button, input, select { font: inherit; }
+-button { cursor: pointer; color: inherit; border: 0; background: none; -webkit-tap-highlight-color: transparent; }
+-button, a, input, select { outline-offset: 4px; }
+-:focus-visible { outline: 2px solid var(--accent); }
+-button:disabled { cursor: default; opacity: .38; }
+-button:not(:disabled), a { transition: background .18s, color .18s, border-color .18s, transform .18s; }
+-button:not(:disabled):active { transform: translateY(1px); }
+-[hidden], .hidden, .icon-library { display: none !important; }
+-.icon { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+-#app { height: 100dvh; min-height: 660px; display: flex; flex-direction: column; }
+-#header { height: 84px; flex: none; display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 0 32px; border-bottom: 1px solid var(--edge); }
+-.brand { display: inline-flex; gap: 12px; align-items: center; text-decoration: none; color: var(--text); font-size: 23px; font-weight: 650; letter-spacing: -.8px; }
+-.brand-mark { display: grid; place-items: center; position: relative; width: 39px; height: 39px; border-radius: 12px; background: var(--accent); color: var(--bg); font-size: 39px; font-weight: 800; line-height: 1; padding-bottom: 12px; }
+-.brand-mark > span { position: absolute; right: 7px; bottom: 8px; width: 5px; height: 5px; background: var(--bg); border-radius: 50%; }
+-.brand-subtitle { display: block; font-family: var(--mono); font-size: 8px; line-height: 1; letter-spacing: 1.6px; color: var(--muted); margin-top: 5px; font-weight: 400; }
+-.header-right { display: flex; align-items: center; gap: 16px; }
+-#status { display: flex; align-items: center; gap: 9px; font-size: 12px; color: var(--muted); }
+-#status-dot { width: 6px; height: 6px; flex: none; border-radius: 50%; background: #bba971; }
+-#status-dot[data-state="live"] { background: var(--accent); box-shadow: 0 0 0 4px #d4f68a0c; }
+-.quiet-button { display: inline-flex; gap: 8px; align-items: center; justify-content: center; min-height: 40px; padding: 0 13px; border: 1px solid var(--edge); border-radius: 9px; font-size: 12px; }
+-.quiet-button .icon { width: 17px; height: 17px; }
+-.quiet-button:hover { background: var(--panel); border-color: #565e49; }
+-.icon-button { display: inline-flex; justify-content: center; align-items: center; width: 44px; height: 44px; border-radius: 10px; flex: none; color: var(--muted); }
+-.icon-button:not(:disabled):hover { background: #ffffff0a; color: var(--text); }
+-.icon-button.small { width: 34px; height: 34px; }
+-.icon-button.small .icon { width: 17px; height: 17px; }
+-.app-body { flex: 1; min-height: 0; display: flex; }
+-.rail { width: 92px; flex: none; border-right: 1px solid var(--edge); padding: 25px 12px 24px; display: flex; flex-direction: column; justify-content: space-between; gap: 24px; }
+-.rail-top, .rail-bottom { display: flex; flex-direction: column; gap: 10px; }
+-.rail-button { position: relative; width: 100%; min-height: 68px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--muted); border-radius: 12px; font-size: 10px; }
+-.rail-button .icon { width: 23px; height: 23px; }
+-.rail-button:not(:disabled):hover { color: var(--text); background: #ffffff05; }
+-.rail-button.active, .rail-button[aria-pressed="true"] { color: var(--accent); background: #d4f68a0c; }
+-.rail-button.active::after { content: ""; width: 3px; height: 16px; background: var(--accent); position: absolute; left: -12px; border-radius: 0 3px 3px 0; }
+-.workspace { flex: 1; width: 100%; min-width: 0; min-height: 0; max-width: 1560px; margin: 0 auto; padding: 30px 44px 20px; display: flex; flex-direction: column; gap: 18px; }
+-.workspace-heading { display: flex; align-items: center; justify-content: space-between; gap: 24px; flex: none; }
+-.eyebrow { font-family: var(--mono); font-size: 9px; letter-spacing: 1.8px; color: var(--muted); margin: 0 0 9px; line-height: 1.6; }
+-h1 { font-size: 32px; font-weight: 500; line-height: 1.15; letter-spacing: -1.3px; margin: 0; }
+-.heading-dot { color: var(--accent); }
+-.connection-note { display: flex; align-items: center; gap: 13px; font-size: 11px; line-height: 1.7; color: #808876; }
+-.connection-note .icon { width: 27px; height: 27px; color: #858e77; }
+-.connection-note strong { font-weight: 400; color: var(--muted); }
+-.viewer { flex: 1; min-height: 200px; overflow: hidden; display: flex; flex-direction: column; border: 1px solid var(--edge); border-radius: 18px; background: #080a08; box-shadow: 0 12px 40px #00000016; }
+-.viewer-bar, .viewer-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 20px; background: #171a15; flex: none; }
+-.viewer-bar { min-height: 48px; border-bottom: 1px solid #282d22; }
+-.viewer-label { display: flex; align-items: center; gap: 10px; font-size: 11px; min-width: 0; }
+-#viewer-state { font-family: var(--mono); font-size: 9px; letter-spacing: 1.3px; color: var(--muted); }
+-#viewer-indicator { height: 5px; width: 5px; flex: none; border-radius: 50%; background: #79816c; }
+-[data-session="live"] #viewer-indicator { background: var(--accent); }
+-[data-session="live"] #viewer-state { color: var(--accent); }
+-.viewer-divider { width: 1px; height: 12px; background: var(--edge); margin: 0 4px; }
+-#device-name { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #bbc1b1; }
+-.viewer-tools { display: flex; align-items: center; gap: 12px; }
+-.touch-label { font-family: var(--mono); font-size: 9px; color: #979f8c; }
+-#screen-container { position: relative; flex: 1; min-height: 0; contain: size; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+-#surface { line-height: 0; flex: none; max-width: 100%; max-height: 100%; }
+-#screen { display: block; width: 100%; height: 100%; background: #080a08; touch-action: none; user-select: none; -webkit-user-select: none; }
+-#overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 20px; text-align: center; background: radial-gradient(ellipse at 50% 36%, #29301b45, transparent 62%), #10130e; }
+-#overlay::before { content: ""; position: absolute; inset: 0; background-image: radial-gradient(#a1b3831c .65px, transparent .65px); background-size: 18px 18px; mask-image: radial-gradient(ellipse at center, #000, transparent 74%); pointer-events: none; }
+-#overlay > * { z-index: 1; }
+-#overlay .eyebrow { color: #a2b088; margin: 0; font-size: 8px; }
+-#overlay h2 { margin: -6px 0 0; font-size: clamp(23px, 2.4vw, 35px); font-weight: 500; letter-spacing: -1px; }
+-#overlay-text { max-width: 410px; margin: -5px 0 3px; font-size: 12px; line-height: 1.8; color: var(--muted); }
+-.connection-art { width: 140px; height: 140px; position: relative; display: grid; place-items: center; margin-bottom: 2px; }
+-.orbit { position: absolute; border: 1px solid #83956321; border-radius: 50%; }
+-.orbit-one { width: 106px; height: 106px; }
+-.orbit-two { width: 140px; height: 140px; border-style: dashed; border-color: #83956320; }
+-.phone-outline { width: 47px; height: 76px; border: 1.5px solid #d4f68a80; border-radius: 11px; display: grid; place-items: center; background: linear-gradient(150deg, #d4f68a13, #d4f68a02); transform: rotate(-9deg); color: var(--accent); box-shadow: 0 0 40px #d4f68a0a; }
+-.phone-outline > span { position: absolute; top: 6px; width: 14px; height: 3px; background: #d4f68a60; border-radius: 4px; }
+-.phone-outline .icon { width: 21px; height: 21px; }
+-.orbit-spark { position: absolute; right: 6px; top: 38px; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 5px #d4f68a0d; }
+-.primary-button { display: inline-flex; align-items: center; justify-content: center; gap: 20px; min-height: 43px; padding: 0 18px; border-radius: 8px; background: var(--accent); color: #243212; font-size: 12px; font-weight: 650; }
+-.primary-button .icon { width: 17px; height: 17px; }
+-.primary-button:not(:disabled):hover { background: #e2ffa8; }
+-.setup-note { display: flex; align-items: center; gap: 18px; margin-top: 13px; font-family: var(--mono); font-size: 8px; color: #8fa16c; }
+-.setup-note b { color: #8d9580; margin-left: 5px; font-family: "Avenir Next", Avenir, "Trebuchet MS", sans-serif; font-weight: 400; font-size: 10px; }
+-.setup-line { width: 30px; height: 1px; background: #444f32; }
+-.viewer-footer { min-height: 35px; border-top: 1px solid #282d22; font-family: var(--mono); font-size: 9px; color: #949e87; }
+-#stream-info { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+-.stream-caption { font-size: 8px; letter-spacing: 1px; white-space: nowrap; color: #69725e; }
+-#mic-status { color: var(--accent); overflow: hidden; text-overflow: ellipsis; }
+-#mic-status:empty { display: none; }
+-.control-dock { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 83px; padding: 12px 20px; border: 1px solid var(--edge); border-radius: 14px; background: #1a1d17; flex: none; }
+-.control-group { display: flex; align-items: center; gap: 5px; }
+-.control-button { display: inline-flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; min-width: 64px; min-height: 56px; border-radius: 9px; font-size: 10px; color: #b4bbaa; }
+-.control-button .icon { width: 20px; height: 20px; }
+-.control-button:not(:disabled):hover { background: #ffffff07; color: var(--text); }
+-.siri-button:not(:disabled) { color: var(--accent); }
+-.media-controls { gap: 17px; border-left: 1px solid var(--edge); border-right: 1px solid var(--edge); padding: 0 32px; }
+-.play-button { display: grid; place-items: center; width: 50px; height: 50px; background: var(--accent); color: #253414; border-radius: 50%; }
+-.play-button:not(:disabled):hover { background: #e2ffa8; transform: scale(1.04); }
+-.play-button .icon { width: 22px; height: 22px; }
+-.workspace-footer { display: flex; justify-content: space-between; align-items: center; gap: 16px; min-height: 26px; flex: none; }
+-.keyboard-hint { display: flex; align-items: center; gap: 5px; color: #9ba48f; font-size: 10px; }
+-kbd { font-family: var(--mono); font-size: 9px; font-weight: 400; min-width: 20px; min-height: 21px; padding: 3px 5px; display: inline-grid; place-items: center; background: #1d2119; border: 1px solid #39412f; border-bottom-width: 2px; border-radius: 4px; color: #adb79f; }
+-.keyboard-hint > span { margin-left: 4px; }
+-.footer-dot { margin: 0 5px; }
+-.quick-volume { display: flex; align-items: center; gap: 10px; }
+-input[type="range"] { accent-color: var(--accent); cursor: pointer; height: 24px; padding: 0; margin: 0; }
+-.quick-volume input { width: 85px; }
+-.quick-volume output { font-family: var(--mono); font-size: 9px; color: #a5af98; min-width: 34px; }
+-#audio-unlock-hint { font-size: 10px; color: #a5af98; }
+-#btn-mute[aria-pressed="true"] { color: var(--accent); background: #d4f68a0a; }
+-#error-banner { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 15px; max-width: 620px; width: calc(100% - 40px); padding: 12px 14px 12px 20px; border: 1px solid #9e715450; border-radius: 12px; background: #33271ff5; color: #f3c6a6; font-size: 12px; line-height: 1.7; box-shadow: 0 8px 40px #0004; z-index: 20; }
+-#error-banner button { margin-left: auto; color: inherit; }
+-#toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--accent); color: #243212; font-size: 12px; padding: 10px 18px; border-radius: 9px; box-shadow: 0 5px 30px #0005; z-index: 15; }
+-
+-/* Native dialogs handle focus, Escape, and the inert background. */
+-dialog { color: var(--text); border: 1px solid var(--edge); padding: 28px; background: #1a1d18; box-shadow: -20px 0 100px #0005; }
+-dialog::backdrop { background: #080b0870; backdrop-filter: blur(5px); }
+-dialog[open] { animation: panel-in .2s ease-out; }
+-.drawer { position: fixed; inset: 12px 12px 12px auto; margin: 0; width: min(450px, calc(100% - 24px)); height: calc(100dvh - 24px); max-height: none; max-width: none; overflow-y: auto; border-radius: 18px; }
+-.guide-dialog { width: min(610px, calc(100% - 28px)); max-height: calc(100dvh - 28px); border-radius: 18px; }
+-.panel-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+-.panel-heading .eyebrow { font-size: 8px; }
+-.panel-heading h2 { margin: 0; font-weight: 500; font-size: 26px; letter-spacing: -.8px; }
+-.panel-heading .icon-button { align-self: flex-start; background: #24291f; }
+-.panel-intro { color: var(--muted); font-size: 12px; line-height: 1.8; margin: 18px 0 24px; }
+-.panel-section { padding: 24px 0; border-top: 1px solid var(--edge); }
+-.section-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 18px; }
+-.panel-section h3 { font-size: 13px; font-weight: 600; margin: 0; }
+-.section-heading output { font-family: var(--mono); font-size: 12px; color: var(--accent); }
+-.section-tag { font-family: var(--mono); font-size: 9px; letter-spacing: 1px; color: #94a77a; }
+-.panel-hint { font-size: 11px; line-height: 1.8; color: var(--muted); margin: 12px 0 0; }
+-.preset-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+-.preset-grid button { display: flex; gap: 10px; align-items: center; text-align: left; min-height: 57px; border: 1px solid var(--edge); border-radius: 8px; padding: 9px 11px; color: #adb79f; }
+-.preset-grid button:not(:disabled):hover { border-color: #6c7b55; background: #d4f68a04; }
+-.preset-grid button.selected { border-color: #a4bf6c; color: var(--accent); background: #d4f68a07; }
+-.preset-screen { width: 27px; height: 17px; border: 1px solid currentColor; border-radius: 3px; flex: none; opacity: .65; }
+-.preset-screen.portrait { width: 13px; height: 23px; margin: 0 7px; }
+-.preset-screen.ultrawide { height: 12px; }
+-.preset-copy { display: flex; flex-direction: column; gap: 4px; font-size: 10px; }
+-.preset-copy small { font-size: 8px; color: var(--muted); }
+-.dimension-fields { display: flex; align-items: end; gap: 10px; margin-top: 20px; }
+-.dimension-fields label { width: 100%; font-size: 10px; color: #bec5b2; }
+-.dimension-fields label > span { float: right; font-family: var(--mono); font-size: 9px; color: var(--muted); }
+-.dimension-times { color: #768466; font-size: 13px; padding-bottom: 12px; }
+-input[type="number"], select { width: 100%; min-height: 43px; margin-top: 9px; padding: 8px 12px; border: 1px solid #3d4535; border-radius: 7px; background: #12160f; color: var(--text); font-size: 11px; }
+-input[type="number"] { font-family: var(--mono); font-size: 12px; }
+-.text-button { display: inline-flex; align-items: center; gap: 8px; color: var(--accent); font-size: 10px; padding: 12px 0 0; min-height: 36px; }
+-.text-button .icon { width: 14px; height: 14px; }
+-.text-button:hover { color: #e4ffb4; }
+-.field { margin-top: 17px; min-width: 0; }
+-.field:first-child { margin-top: 0; }
+-.field label { font-size: 10px; color: #bec5b2; }
+-.field-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 17px; }
+-.field-pair .field { margin: 0; }
+-fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+-.apply-area { border-top: 1px solid var(--edge); padding-top: 20px; }
+-.restart-note { display: flex; align-items: flex-start; gap: 10px; color: #aab599; font-size: 10px; line-height: 1.7; margin: 0 0 16px; }
+-.restart-note .icon { width: 15px; height: 15px; margin-top: 2px; }
+-.apply-area .primary-button { width: 100%; justify-content: space-between; }
+-#display-status[data-error="true"] { color: #f3b98e; }
+-.master-slider { display: flex; align-items: center; gap: 15px; color: var(--accent); }
+-.master-slider input { flex: 1; min-width: 0; }
+-.audio-stream-row { display: grid; grid-template-columns: 1fr auto; gap: 12px; margin: 20px 0; }
+-.audio-stream-row label { text-transform: capitalize; font-size: 12px; color: #bfc6b4; }
+-.audio-stream-row output { font-family: var(--mono); font-size: 10px; color: var(--accent); }
+-.audio-stream-row input { grid-column: 1 / -1; width: 100%; }
+-.empty-streams { padding: 28px 20px; text-align: center; border: 1px dashed #3c4433; border-radius: 10px; font-size: 12px; line-height: 1.8; color: var(--muted); }
+-.empty-streams:empty { display: none; }
+-.panel-tip { display: flex; gap: 15px; padding: 17px; background: #d4f68a05; border: 1px solid #d4f68a17; border-radius: 10px; color: #a4b48b; }
+-.panel-tip p { margin: 0; font-size: 11px; line-height: 1.8; }
+-.panel-tip .icon { margin-top: 4px; }
+-.guide-dialog .panel-section { margin-top: 24px; padding-bottom: 0; }
+-.connection-steps { list-style: none; padding: 0; margin: 22px 0 0; display: flex; flex-direction: column; gap: 20px; }
+-.connection-steps li { display: flex; gap: 16px; }
+-.connection-steps li > span { color: var(--accent); font-family: var(--mono); font-size: 10px; padding-top: 3px; }
+-.connection-steps strong { font-size: 12px; font-weight: 600; }
+-.connection-steps p { margin: 6px 0 0; font-size: 11px; line-height: 1.8; color: var(--muted); }
+-.shortcut-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 28px; margin-top: 22px; }
+-.shortcut-grid > div { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 11px; color: #b4bea6; }
+-.shortcut-grid > div > span:last-child { display: flex; gap: 3px; }
+-
+-#app.focus-mode { min-height: 0; }
+-.focus-mode #header, .focus-mode .rail, .focus-mode .workspace-heading, .focus-mode .workspace-footer { display: none; }
+-.focus-mode .workspace { max-width: none; padding: 12px; gap: 10px; }
+-.focus-mode .viewer-bar { padding-right: 136px; }
+-.focus-mode .control-dock { min-height: 64px; padding: 6px 20px; }
+-.focus-mode .control-button { min-height: 44px; flex-direction: row; gap: 9px; }
+-#btn-exit-focus { position: fixed; right: 25px; top: 17px; background: #20251a; z-index: 5; color: var(--accent); }
+-
+-@keyframes panel-in { from { opacity: 0; transform: translateX(10px); } to { opacity: 1; transform: translateX(0); } }
+-@media (min-width: 1700px) { .workspace { padding-top: 40px; padding-bottom: 30px; gap: 22px; } }
+-@media (max-width: 1100px) {
+-  .workspace { padding: 26px 24px 18px; }
+-  .rail { width: 78px; padding-inline: 8px; }
+-  .media-controls { padding: 0 20px; gap: 8px; }
+-  .control-dock { padding-inline: 12px; gap: 10px; }
+-  .control-button { min-width: 52px; }
+-  #audio-unlock-hint { display: none; }
+-}
+-@media (max-width: 800px) {
+-  #header { height: 70px; padding-inline: 20px; }
+-  .header-right { gap: 8px; }
+-  #status { font-size: 10px; max-width: 220px; }
+-  #btn-focus span, .connection-note, .stream-caption { display: none; }
+-  #btn-focus { width: 40px; padding: 0; }
+-  .workspace { padding: 24px 18px 14px; gap: 14px; }
+-  h1 { font-size: 27px; }
+-  .eyebrow { font-size: 8px; }
+-  .control-button { min-width: 44px; font-size: 9px; }
+-  .control-group { gap: 2px; }
+-  .media-controls { padding: 0 10px; gap: 2px; }
+-  .media-controls .icon-button { width: 35px; }
+-  .play-button { width: 43px; height: 43px; }
+-  .viewer-footer { padding-inline: 14px; font-size: 8px; }
+-  .keyboard-hint { font-size: 9px; }
+-  .quick-volume { gap: 5px; }
+-  .quick-volume input { width: 60px; }
+-  #mic-status { font-size: 8px; }
+-}
+-@media (max-width: 600px) {
+-  #app { min-height: 700px; }
+-  #app[data-session="idle"] { min-height: 830px; }
+-  #header { padding: 0 16px; height: 66px; gap: 10px; }
+-  .brand { font-size: 20px; gap: 9px; }
+-  .brand-mark { width: 33px; height: 33px; font-size: 33px; border-radius: 10px; }
+-  .brand-subtitle { font-size: 6px; letter-spacing: 1.1px; }
+-  #status { max-width: 120px; font-size: 9px; gap: 6px; }
+-  .header-right { gap: 2px; }
+-  #btn-focus { width: 34px; border: 0; display: inline-flex; }
+-  #btn-fullscreen { width: 34px; height: 40px; }
+-  .app-body { flex-direction: column; }
+-  .rail { flex-direction: row; width: 100%; padding: 8px 12px; gap: 8px; border-right: 0; border-bottom: 1px solid var(--edge); }
+-  .rail-top, .rail-bottom { flex-direction: row; gap: 4px; }
+-  .rail-button { width: clamp(48px, 14.9vw, 58px); min-height: 51px; gap: 5px; font-size: 9px; border-radius: 8px; }
+-  .rail-button .icon { width: 19px; height: 19px; }
+-  .rail-button.active::after { display: none; }
+-  .workspace { padding: 20px 12px 12px; gap: 12px; }
+-  h1 { font-size: 24px; }
+-  .workspace-heading .eyebrow { font-size: 7px; letter-spacing: 1.4px; }
+-  .viewer { border-radius: 12px; }
+-  .viewer-bar { min-height: 42px; padding-inline: 12px; }
+-  .touch-label { display: none; }
+-  .viewer-label { gap: 7px; font-size: 10px; }
+-  #viewer-state { font-size: 8px; }
+-  #overlay { gap: 13px; padding: 18px; }
+-  .connection-art { transform: scale(.7); width: 90px; height: 90px; margin: 0 0 10px; flex: none; }
+-  #overlay h2 { font-size: 23px; }
+-  #overlay-text { font-size: 11px; max-width: 310px; }
+-  .setup-note { display: none; }
+-  .viewer-footer { min-height: 30px; font-size: 7px; gap: 8px; padding-inline: 10px; }
+-  .control-dock { flex-wrap: wrap; padding: 8px; gap: 4px; border-radius: 12px; }
+-  .navigation-controls { justify-content: flex-start; }
+-  .control-button { min-width: 45px; min-height: 48px; }
+-  .media-controls { padding: 0 3px; border: 0; margin-left: auto; gap: 3px; }
+-  .voice-controls { width: 100%; justify-content: center; border-top: 1px solid var(--edge); padding-top: 5px; margin-top: 4px; gap: 10px; }
+-  .voice-controls .control-button { flex-direction: row; min-height: 36px; padding: 0 14px; gap: 8px; }
+-  .voice-controls .icon { width: 17px; height: 17px; }
+-  .workspace-footer { justify-content: center; }
+-  .keyboard-hint { display: none; }
+-  .quick-volume input { width: 115px; }
+-  #audio-unlock-hint { display: inline; font-size: 9px; }
+-  .drawer, .guide-dialog { padding: 24px 20px; }
+-  .shortcut-grid { gap: 14px; }
+-  .shortcut-grid > div { font-size: 10px; }
+-  .panel-heading h2 { font-size: 23px; }
+-  .focus-mode .workspace { padding: 5px; }
+-  .focus-mode .viewer-bar { padding-right: 125px; }
+-  .focus-mode .control-dock { padding: 5px; min-height: 0; }
+-  .focus-mode .control-button { flex-direction: column; gap: 4px; }
+-  .focus-mode .voice-controls { display: none; }
+-  #btn-exit-focus { top: 9px; right: 10px; min-height: 34px; }
+-}
+-@media (max-width: 350px) {
+-  .brand { font-size: 18px; }
+-  #status { max-width: 80px; }
+-  #overlay { gap: 10px; }
+-  #overlay h2 { font-size: 21px; }
+-  .connection-art { width: 70px; height: 70px; margin-bottom: 0; transform: scale(.6); }
+-  .voice-controls { gap: 0; }
+-  .voice-controls .control-button { padding-inline: 12px; }
+-}
+-@media (max-height: 750px) and (min-width: 601px) {
+-  #app { min-height: 480px; }
+-  #header { height: 62px; }
+-  .workspace { padding-top: 18px; padding-bottom: 12px; gap: 12px; }
+-  h1 { font-size: 26px; }
+-  .workspace-heading .eyebrow { margin-bottom: 5px; }
+-  .control-dock { min-height: 65px; padding-block: 6px; }
+-  .control-button { min-height: 48px; }
+-  .connection-art { width: 70px; height: 70px; transform: scale(.6); margin: -12px 0; }
+-  #overlay { gap: 12px; }
+-  #overlay h2 { font-size: 24px; }
+-  .setup-note { display: none; }
+-}
+-@media (max-height: 500px) and (min-width: 601px) {
+-  #app { min-height: 340px; }
+-  .workspace-heading, .workspace-footer { display: none; }
+-  .workspace { padding: 10px 14px; }
+-  .rail { padding-block: 8px; }
+-  .rail-button { min-height: 48px; gap: 5px; }
+-  .rail-top, .rail-bottom { gap: 0; }
+-  .viewer-footer { min-height: 26px; }
+-  #overlay .connection-art, #overlay .eyebrow { display: none; }
+-  #overlay { gap: 10px; }
+-  .control-button { flex-direction: row; gap: 7px; }
+-}
+-@media (prefers-reduced-motion: reduce) {
+-  *, *::before, *::after { animation: none !important; transition: none !important; }
+-}
++body { margin:0; overflow:hidden; }
++button, input, select { font:inherit; }
++button, select, input[type=number] { color:inherit; background:#30353d; border:1px solid var(--line); border-radius:10px; min-height:48px; padding:10px 16px; }
++button { cursor:pointer; touch-action:manipulation; }
++button:hover { background:#414955; } button:disabled { opacity:.45; cursor:default; }
++:focus-visible { outline:3px solid #91b8ff; outline-offset:3px; }
++[hidden] { display:none !important; }
++#app { width:100vw; height:100vh; height:100dvh; position:relative; background:#000; }
++#screen-container { position:absolute; inset:0; display:flex; justify-content:center; align-items:center; }
++#surface { flex:none; }
++#screen { display:block; width:100%; height:100%; touch-action:none; user-select:none; -webkit-user-select:none; }
++#overlay { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:28px; text-align:center; background:#000; pointer-events:none; }
++h1 { font-size:clamp(30px,5vw,56px); margin:0 0 18px; font-weight:600; letter-spacing:-.025em; }
++#connection-text { font-size:22px; margin:8px 0; } #connection-hint { max-width:36em; color:#b9c0cb; line-height:1.65; }
++#btn-settings { position:absolute; top:max(12px,env(safe-area-inset-top)); right:max(12px,env(safe-area-inset-right)); min-width:48px; padding:10px 12px; background:#252b33d9; border-color:#5a616b; display:flex; align-items:center; gap:8px; }
++#btn-settings span[aria-hidden] { font-size:24px; line-height:1; }
++#app[data-live=true] #btn-settings { display:none; }
++#audio-unlock { position:absolute; bottom:max(16px,env(safe-area-inset-bottom)); left:50%; transform:translateX(-50%); background:#2256a4; white-space:nowrap; }
++#error-banner { position:absolute; bottom:12px; left:12px; right:12px; max-width:650px; margin:auto; padding:14px; background:#542a28; border-radius:12px; max-height:40vh; overflow:auto; }
++#error-text { overflow-wrap:anywhere; } #error-banner button { float:right; }
++dialog { margin:0 0 0 auto; height:100%; max-height:100%; width:min(560px,100vw); max-width:100%; border:0; padding:0; background:var(--panel); color:inherit; }
++dialog::backdrop { background:#0009; }
++header { position:sticky; top:0; z-index:1; display:flex; align-items:center; justify-content:space-between; gap:20px; padding:18px 24px; background:var(--panel); border-bottom:1px solid var(--line); }
++h2 { font-size:25px; margin:0; } h3 { font-size:19px; margin:0; }
++.settings-body { padding:8px 24px 24px; }
++.row,.section-title { display:flex; align-items:center; justify-content:space-between; gap:16px; margin:16px 0; }
++.volume { display:grid; grid-template-columns:1fr auto; gap:12px; margin:24px 0 8px; } input[type=range] { width:100%; grid-column:1/-1; min-height:40px; accent-color:var(--blue); }
++section,details { border-top:1px solid var(--line); padding:18px 0; }
++summary { min-height:44px; cursor:pointer; padding:10px 0; font-size:18px; }
++.hint { color:#b9c0cb; font-size:14px; line-height:1.65; }
++.check { display:flex; align-items:center; gap:12px; min-height:48px; } input[type=checkbox] { width:24px; height:24px; accent-color:var(--blue); }
++fieldset { border:0; padding:0; margin:0; min-width:0; } .pair { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:16px 0; } .pair label { display:flex; flex-direction:column; gap:8px; } .pair input,.pair select { min-width:0; width:100%; }
++.primary { width:100%; background:var(--blue); border:0; } #fallback-controls { display:flex; flex-wrap:wrap; gap:10px; }
++@media (max-width:480px) { header { padding:14px 18px; } .settings-body { padding:8px 18px 20px; } }
++@media (prefers-reduced-motion:reduce) { * { scroll-behavior:auto !important; } }

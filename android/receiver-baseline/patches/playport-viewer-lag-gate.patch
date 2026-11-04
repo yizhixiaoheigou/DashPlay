@@ -1,0 +1,298 @@
+Box: a slow viewer gets fewer pictures instead of an ever-growing lag (2026-10-12).
+
+On the road some wired sessions lagged for ten-odd seconds until a replug. At home, a page reading at
+4 Mbit/s against about 9 Mbit/s of picture fell 11 s behind in 20 s and stayed there; nothing was ever
+dropped, as the backlog sat below the per-viewer send queue (Ktor, Netty, TLS, kernel). The box now marks
+the stream every 200 ms with the bytes queued so far, the page answers each mark at once, and LagGate lets
+a picture frame out only while what is still on its way would reach the page within 300 ms at the rate it
+has been taking in; otherwise the frame is dropped and the picture restarts at a keyframe. Sound and control
+messages always go out, and a page that never answers is never held back. The viewer socket's send buffer
+is fixed at 128 KiB. Same test afterwards: mostly under 0.5 s, peaks 0.8 s, 1 s for a moment when the
+rate first drops; back to a few ms as soon as the link recovers.
+
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -20,6 +20,7 @@
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.channels.Channel
++import kotlinx.coroutines.delay
+ import kotlinx.coroutines.launch
+ import kotlinx.serialization.Serializable
+ import kotlinx.serialization.json.Json
+@@ -51,6 +52,8 @@
+     val telephony: Int? = null,
+     /** "stats": the viewer's own playback counters (frames drawn, decode delay, ...), numbers only. */
+     val stats: Map<String, Double>? = null,
++    /** "ack": the page answering the box's "mark" of the same number at once (see LagGate). */
++    val mark: Long? = null,
+ )
+ 
+ @Serializable
+@@ -66,6 +69,7 @@
+ @Serializable
+ data class ServerMessage(
+     val type: String,
++    val mark: Long? = null,
+     val nowPlaying: NowPlaying? = null,
+     val artwork: String? = null,
+     val revision: Long? = null,
+@@ -87,6 +91,14 @@
+     val channel: Channel<Frame>,
+ ) {
+     val imageReady = java.util.concurrent.atomic.AtomicBoolean(false)
++    /** Picture at most 300 ms behind; 192 kB always fits (a fresh session's first keyframe). */
++    val lag = LagGate(300_000_000L, 192_000L)
++    val nextMark = AtomicLong(0)
++    /** Every byte offered to [channel], what [LagGate] counts against what the page confirmed. */
++    val queuedBytes = AtomicLong(0)
++    fun offer(frame: Frame) = channel.trySend(frame).also {
++        if (it.isSuccess) queuedBytes.addAndGet(frame.data.size.toLong())
++    }
+     val keyframeRequested = AtomicLong(0)
+     val id = nextClientId.incrementAndGet()
+     val videoSent = AtomicLong(0)
+@@ -196,6 +208,12 @@
+     fun broadcastVideoFrame(type: Int, keyframe: Boolean, naluBytes: ByteArray) {
+         val frame = Wire.videoFrame(type, keyframe, naluBytes)
+         for (client in clients) {
++            if (!client.lag.open(System.nanoTime(), client.queuedBytes.get())) {
++                // The page is behind: no picture until it catches up, then a fresh keyframe (below).
++                client.imageReady.set(false)
++                client.videoDropped.incrementAndGet()
++                continue
++            }
+             if (keyframe) {
+                 client.imageReady.set(true)
+             } else if (!client.imageReady.get()) {
+@@ -203,7 +221,7 @@
+                 maybeRequestKeyframe(client, type)
+                 continue
+             }
+-            if (client.channel.trySend(Frame.Binary(true, frame)).isSuccess) {
++            if (client.offer(Frame.Binary(true, frame)).isSuccess) {
+                 client.videoSent.incrementAndGet()
+                 client.bytesSent.addAndGet(frame.size.toLong())
+             } else {
+@@ -232,14 +250,14 @@
+ 
+     private fun broadcastBinary(bytes: ByteArray) {
+         for (client in clients) {
+-            client.channel.trySend(Frame.Binary(true, bytes))
++            client.offer(Frame.Binary(true, bytes))
+         }
+     }
+ 
+     private fun broadcastJson(message: ServerMessage) {
+         val text = json.encodeToString(ServerMessage.serializer(), message)
+         for (client in clients) {
+-            client.channel.trySend(Frame.Text(text))
++            client.offer(Frame.Text(text))
+         }
+     }
+ 
+@@ -318,6 +336,16 @@
+                         // The reader loop below handles disconnects.
+                     }
+                 }
++                val marker = launch {
++                    while (true) {
++                        delay(MARK_INTERVAL_MS)
++                        val id = client.nextMark.incrementAndGet()
++                        val frame = Frame.Text("""{"type":"mark","mark":$id}""")
++                        // Counted with the mark itself, so its answer confirms everything up to here.
++                        client.lag.marked(id, System.nanoTime(), client.queuedBytes.get() + frame.data.size)
++                        client.offer(frame)
++                    }
++                }
+                 try {
+                     wsSession.send(
+                         Frame.Text(
+@@ -340,12 +368,12 @@
+                     )
+                     // Replay codec/audio setup so a viewer that joins late can decode.
+                     configByStream.forEach { (type, value) ->
+-                        client.channel.trySend(
++                        client.offer(
+                             Frame.Binary(true, Wire.videoConfig(type, value.first, display.width, display.height, value.second)),
+                         )
+                     }
+                     audioFormatByStream.forEach { (type, format) ->
+-                        client.channel.trySend(Frame.Binary(true, Wire.audioConfig(type, format)))
++                        client.offer(Frame.Binary(true, Wire.audioConfig(type, format)))
+                     }
+                     configByStream.keys.forEach { streamType -> onViewerJoined?.invoke(streamType) }
+                     for (frame in incoming) {
+@@ -367,13 +395,15 @@
+                         } catch (_: Exception) {
+                             continue
+                         }
+-                        if (message.type == "keyframe") {
++                        if (message.type == "ack") {
++                            message.mark?.let { client.lag.acked(it, System.nanoTime()) }
++                        } else if (message.type == "keyframe") {
+                             configByStream.keys.forEach { streamType -> onViewerJoined?.invoke(streamType) }
+                         } else if (message.type == "stats") {
+                             log.info(statsLine(client.id, client.videoSent.get(), client.videoDropped.get(),
+                                 client.bytesSent.get(), message.stats.orEmpty()))
+                         } else if (message.type == "ping") {
+-                            client.channel.trySend(Frame.Text("""{"type":"pong"}"""))
++                            client.offer(Frame.Text("""{"type":"pong"}"""))
+                         } else {
+                             inputHandler?.invoke(message)
+                         }
+@@ -382,6 +412,7 @@
+                     clients.remove(client)
+                     client.channel.close()
+                     writer.cancel()
++                    marker.cancel()
+                 }
+             }
+             get("/{path...}") {
+@@ -473,5 +504,6 @@
+         const val MIC_FRAME_OPUS = 0x11
+         private const val SEND_QUEUE_CAPACITY = 1024
+         private const val KEYFRAME_REQUEST_INTERVAL_NS = 1_000_000_000L
++        private const val MARK_INTERVAL_MS = 200L
+     }
+ }
+--- a/server/src/main/kotlin/com/playport/server/Main.kt
++++ b/server/src/main/kotlin/com/playport/server/Main.kt
+@@ -55,6 +55,9 @@
+                     host = webHost
+                     port = config.httpPort
+                 }
++                // The kernel grows a socket's send buffer to megabytes, seconds of picture on a slow car Wi-Fi
++                // that WebHub's age check cannot see; a fixed 128 KiB (Linux doubles it) keeps that part short.
++                configureBootstrap = { childOption(io.netty.channel.ChannelOption.SO_SNDBUF, 128 * 1024) }
+             },
+         ) {
+             server.hub.install(this, webRoot)
+--- /dev/null
++++ b/server/src/main/kotlin/com/playport/server/LagGate.kt
+@@ -0,0 +1,49 @@
++package com.playport.server
++
++/**
++ * Keeps a viewer's picture at most [targetNs] behind. The box marks the stream every 200 ms with the bytes
++ * queued so far and the page answers each mark at once, so the box knows what reached the page and how fast
++ * the page takes it in, through every buffer on the way (send queue, Ktor, Netty, TLS, kernel, Wi-Fi). A
++ * picture frame goes out only while what is still on its way would arrive within [targetNs]; otherwise it is
++ * dropped and the picture restarts at a keyframe. Sound and control messages always go out.
++ *
++ * Measured at home on 2026-10-12 with a page reading at 4 Mbit/s against about 9 Mbit/s of picture: without
++ * this it fell 11 s behind in 20 s and stayed there (nothing was dropped, the backlog sat below the send queue);
++ * pausing only once a mark came back late still let it reach 2.7 s. A page that never answers (an older one)
++ * is never held back.
++ */
++internal class LagGate(private val targetNs: Long, private val floorBytes: Long) {
++    private class Mark(val id: Long, val atNs: Long, val queuedBytes: Long)
++    private val pending = ArrayDeque<Mark>()
++    private var deliveredBytes = -1L
++    private var deliveredAtNs = 0L
++    /** Recent intake samples (at, bytes per ns); the best of the last two seconds, as a page that is sent
++     *  little (picture paused) takes in little without being slow. */
++    private val rates = ArrayDeque<Pair<Long, Double>>()
++
++    @Synchronized fun marked(id: Long, nowNs: Long, queuedBytes: Long) {
++        pending.addLast(Mark(id, nowNs, queuedBytes))
++        if (pending.size > 64) pending.removeFirst()
++    }
++
++    @Synchronized fun acked(id: Long, nowNs: Long) {
++        while (pending.isNotEmpty() && pending.first().id <= id) {
++            val mark = pending.removeFirst()
++            if (mark.id != id) continue
++            if (deliveredBytes >= 0 && nowNs > deliveredAtNs) {
++                rates.addLast(nowNs to (mark.queuedBytes - deliveredBytes).toDouble() / (nowNs - deliveredAtNs))
++            }
++            deliveredBytes = mark.queuedBytes
++            deliveredAtNs = nowNs
++        }
++        while (rates.isNotEmpty() && nowNs - rates.first().first > 2_000_000_000L) rates.removeFirst()
++    }
++
++    /** Whether a picture frame may join [queuedBytes] already queued for this page. */
++    @Synchronized fun open(nowNs: Long, queuedBytes: Long): Boolean {
++        if (deliveredBytes < 0) return true
++        val rate = rates.maxOfOrNull { it.second } ?: 0.0
++        val window = maxOf(floorBytes, (rate * targetNs).toLong())
++        return queuedBytes - deliveredBytes < window
++    }
++}
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/LagGateTest.kt
+@@ -0,0 +1,44 @@
++package com.playport.server
++
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class LagGateTest {
++    private val ms = 1_000_000L
++
++    @Test fun aPageThatNeverAnswersIsNeverHeldBack() {
++        val gate = LagGate(300 * ms, 192_000)
++        gate.marked(1, 0, 0)
++        assertTrue(gate.open(10_000 * ms, 50_000_000))
++    }
++
++    @Test fun picturePausesOnceMoreIsOnTheWayThanThePageTakesIn300Ms() {
++        val gate = LagGate(300 * ms, 64_000)
++        // The page took 100 kB in 400 ms: 250 kB/s, so 300 ms is 75 kB.
++        gate.marked(1, 0, 0); gate.acked(1, 0)
++        gate.marked(2, 0, 100_000); gate.acked(2, 400 * ms)
++        assertTrue(gate.open(400 * ms, 100_000 + 70_000))
++        assertFalse(gate.open(400 * ms, 100_000 + 80_000))
++    }
++
++    @Test fun aFastPageGetsAWideWindowAndASmallWindowStillPassesAKeyframe() {
++        val gate = LagGate(300 * ms, 192_000)
++        gate.marked(1, 0, 0); gate.acked(1, 0)
++        gate.marked(2, 0, 2_000_000); gate.acked(2, 1_000 * ms)   // 2 MB/s
++        assertTrue(gate.open(1_000 * ms, 2_000_000 + 590_000))
++        assertFalse(gate.open(1_000 * ms, 2_000_000 + 610_000))
++        // Nothing measured yet: the floor still lets a keyframe of a fresh session through.
++        val fresh = LagGate(300 * ms, 192_000)
++        fresh.marked(1, 0, 0); fresh.acked(1, 5 * ms)
++        assertTrue(fresh.open(5 * ms, 150_000))
++    }
++
++    @Test fun anAnswerClearsEveryEarlierMark() {
++        val gate = LagGate(300 * ms, 64_000)
++        gate.marked(1, 0, 0); gate.marked(2, 100 * ms, 10_000); gate.marked(3, 200 * ms, 20_000)
++        gate.acked(3, 250 * ms)
++        // Delivered up to mark 3: 5 kB on the way is within the floor.
++        assertTrue(gate.open(250 * ms, 25_000))
++    }
++}
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -125,6 +125,8 @@
+ }
+ function server(message: ServerMessage) {
+   if (message.type === 'pong') { lag.pong(performance.now()); return; }
++  // Straight back, also before CarPlay starts: the box pauses the picture while this page lags behind.
++  if (message.type === 'mark') { connection.send({ type: 'ack', mark: message.mark ?? 0 }); return; }
+   if(message.type === 'artwork' && message.artwork) { media.setArtwork(message.revision ?? 0,message.artwork); return; }
+   if (message.type === 'now-playing' && message.nowPlaying) { media.setMetadata(message.nowPlaying); return; }
+   if (message.type === 'host-ui' && active) {
+--- a/web/src/protocol.ts
++++ b/web/src/protocol.ts
+@@ -89,11 +89,14 @@
+   | { type: 'telephony'; telephony: number }
+   | { type: 'keyframe' }
+   | { type: 'stats'; stats: Record<string, number> }
+-  | { type: 'ping' };
++  | { type: 'ping' }
++  | { type: 'ack'; mark: number };
+ 
+ export interface NowPlaying { title: string; artist: string; album: string; durationMs?: number; positionMs?: number; speed?: number; playing?: boolean | null; revision?: number; }
+ 
+ export interface ServerMessage {
++  /** "mark": answered at once with an "ack", so the box knows how far behind this page is (LagGate). */
++  mark?: number;
+   nowPlaying?: NowPlaying;
+   artwork?: string;
+   revision?: number;

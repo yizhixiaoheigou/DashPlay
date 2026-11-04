@@ -20,15 +20,18 @@ val prepareReceiver = tasks.register<Exec>("prepareReceiver") {
 android {
     namespace = "com.dashplay.android"
     compileSdk = 35
+    buildFeatures { resValues = true }
 
     defaultConfig {
         applicationId = "com.dashplay.android"
         minSdk = 21
+        ndk { abiFilters += listOf("armeabi-v7a", "arm64-v8a") }
         targetSdk = 35
         // The app has its own version line (0.3.0-beta.1); box releases use date versions (2026.10.31.3) and the two
         // must never be compared. A release sets both properties; see scripts/android-release.sh.
         versionCode = providers.gradleProperty("dashplayVersionCode").orElse("3").get().toInt().also { require(it > 0) }
         versionName = providers.gradleProperty("dashplayVersionName").orElse("0.3.0-beta.1").get()
+        resValue("bool", "usb_phone_diagnostics", "false")
         testInstrumentationRunner = "com.dashplay.android.CertificateNetworkProbe"
     }
 
@@ -49,6 +52,10 @@ android {
     }
 
     buildTypes {
+        debug {
+            resValue("bool", "usb_phone_diagnostics",
+                providers.gradleProperty("dashplayUsbPhoneDiagnostics").orElse("false").get().toBoolean().toString())
+        }
         release {
             // R8 stays off until a release has been run through it: Kotlin reflection and the BouncyCastle provider are
             // easy to strip by accident, and a stripped update path is only noticed by users in the field.
@@ -83,6 +90,16 @@ android {
 
     sourceSets.getByName("main").resources.srcDir(playport.resolve("server/src/main/resources"))
 
+    /** The RTC bridge: prebuilt libdatachannel per ABI + rtc_bridge.c (see src/main/cpp/CMakeLists.txt). */
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
+    ndkVersion = "27.0.12077973"
+
     lint {
         abortOnError = false
         checkDependencies = false
@@ -98,8 +115,15 @@ val receiverServer = tasks.register<Sync>("receiverServer") {
 tasks.matching { it.name.startsWith("compile") && it.name.endsWith("Kotlin") }.configureEach { dependsOn(receiverServer) }
 tasks.matching { it.name.startsWith("process") && it.name.endsWith("JavaRes") }.configureEach { dependsOn(prepareReceiver) }
 
+// Fault injection is opt-in for a diagnostic debug APK, never a release variant.
+val rtcFaultTest = providers.gradleProperty("dashplayRtcFaultTest").orElse("false").map { it.toBooleanStrict() }
+tasks.matching { it.name == "preReleaseBuild" }.configureEach {
+    doFirst { check(!rtcFaultTest.get()) { "RTC fault injection cannot be packaged in release" } }
+}
 // The browser page (web/dist) ships as assets/web.
 val buildWeb = tasks.register<Exec>("buildWeb") {
+    inputs.property("rtcFaultTest", rtcFaultTest)
+    environment("VITE_RTC_FAULT_TEST", if (rtcFaultTest.get()) "1" else "0")
     dependsOn(prepareReceiver)
     inputs.dir(playport.resolve("web/src"))
     inputs.file(playport.resolve("web/package-lock.json"))
@@ -113,6 +137,11 @@ val webAssets = tasks.register<Sync>("webAssets") {
     from(playport.resolve("web/dist"))
     into(layout.buildDirectory.dir("generated/webAssets/web"))
 }
+val checkPhoneConnection = tasks.register<Exec>("checkPhoneConnection") {
+    dependsOn(buildWeb)
+    commandLine("node", rootProject.file("scripts/check-phone-connection.mjs").path)
+}
+tasks.matching { it.name == "testDebugUnitTest" }.configureEach { dependsOn(checkPhoneConnection) }
 extensions.configure<ApplicationAndroidComponentsExtension> {
     onVariants { variant ->
         variant.sources.kotlin?.addStaticSourceDirectory(playport.resolve("protocol/src/main/java").path)

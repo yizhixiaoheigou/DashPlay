@@ -49,17 +49,22 @@ object LocalNetwork {
                 names to kinds
             }.getOrNull()
         }
-        val preferHotspot = context == null || Settings(context).network == Network.THIS_HOTSPOT
-        return choose(all, observation?.first, preferHotspot, observation?.second)
+        val requireHotspot = context != null && Settings(context).network == Network.THIS_HOTSPOT
+        return choose(all, observation?.first, context == null || requireHotspot, observation?.second,
+            requireHotspot = requireHotspot)
     }
 
     internal fun choose(all: List<Pair<String, InetAddress>>, upstream: Set<String>?, preferHotspot: Boolean = true,
-        clientKinds: Map<String, Kind>? = null): Choice? {
+        clientKinds: Map<String, Kind>? = null, requireHotspot: Boolean = false): Choice? {
+        // An explicitly selected system hotspot must not fall back to the uplink. If Android's
+        // network observation failed, interface names and a .1 address alone cannot establish its role.
+        if (requireHotspot && upstream == null) return null
         val hotspots = all.filter { (name, address) ->
             name !in upstream.orEmpty() && (HOTSPOT.matches(name) || upstream != null && WIFI.matches(name)) ||
                 upstream == null && WIFI.matches(name) && address.hostAddress.orEmpty().endsWith(".1")
         }
-        if (preferHotspot) hotspots.firstOrNull()?.let { return Choice(it.first, it.second, Kind.HOTSPOT) }
+        if (preferHotspot || requireHotspot) hotspots.firstOrNull()?.let { return Choice(it.first, it.second, Kind.HOTSPOT) }
+        if (requireHotspot) return null
         val clients = all.filterNot { it in hotspots }.mapNotNull { (name, address) ->
             val kind = clientKinds?.get(name) ?: when {
                 ETHERNET.matches(name) && (clientKinds == null || name !in upstream.orEmpty()) -> Kind.ETHERNET

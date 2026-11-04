@@ -1,0 +1,182 @@
+Media card: song position runs on from the iPhone's last report (2026-10-12).
+
+The iPhone sends the elapsed time only when playback jumps (start, pause, seek). Every other NowPlaying
+update re-sent that old position as the current one, and a page that (re)connected got it too, so the
+car's media card jumped back. The box now keeps the time of the report and the iPhone's playing state,
+and sends the position as of the moment it sends; the page runs the clock on the iPhone's playing state
+instead of whether the browser hears sound (navigation prompts, locked sound).
+
+--- a/server/src/main/kotlin/com/playport/server/NowPlaying.kt
++++ b/server/src/main/kotlin/com/playport/server/NowPlaying.kt
+@@ -3,12 +3,26 @@
+ import com.shilapi.xcertplay.iap2.body.Iap2BodyReader
+ import com.shilapi.xcertplay.iap2.wire.Iap2Frame
+ import kotlinx.serialization.Serializable
++import kotlinx.serialization.Transient
+ 
++/**
++ * [positionMs] is where the song was at [positionAtMs] (the box's monotonic clock). The iPhone reports the
++ * elapsed time only when playback jumps (start, pause, seek), so whoever sends it on calls [at] first.
++ */
+ @Serializable
+-data class NowPlaying(val title: String = "", val artist: String = "", val album: String = "", val durationMs: Long? = null, val positionMs: Long? = null, val speed: Double = 1.0, val revision: Long = 0)
++data class NowPlaying(val title: String = "", val artist: String = "", val album: String = "", val durationMs: Long? = null, val positionMs: Long? = null, val speed: Double = 1.0, val playing: Boolean? = null, val revision: Long = 0,
++                      @Transient val positionAtMs: Long = 0) {
++    /** The position as of [nowMs]: running on while the iPhone says it plays, never past the song's end. */
++    fun at(nowMs: Long): NowPlaying {
++        val position = positionMs ?: return this
++        val ran = if (playing == true && speed > 0) ((nowMs - positionAtMs).coerceAtLeast(0) * speed).toLong() else 0L
++        val moved = (position + ran).let { end -> durationMs?.let { minOf(end, it) } ?: end }
++        return copy(positionMs = moved, positionAtMs = nowMs)
++    }
++}
+ 
+ /** Merge partial iPhone updates; clear stale song fields only at a confirmed item boundary. */
+-class NowPlayingState {
++class NowPlayingState(private val clock: () -> Long = { System.nanoTime() / 1_000_000 }) {
+     @Volatile var value = NowPlaying(); private set
+     @Volatile var artworkId: Int? = null; private set
+     private var persistentId: Long? = null
+@@ -28,18 +42,24 @@
+         val album = item?.optionalString(6)?.take(1024)
+         val duration = item?.optionalU32(4)
+         val position = playback?.optionalU32(1)
++        val status = playback?.optionalU8(0)   // 0 stopped, 1 playing, 2 paused, 3/4 seeking
+         val speed = playback?.optionalU16(12)?.div(100.0)
+         val artwork = item?.optionalU8(26)?.also { require(it >= 128) }
+         val changed = (app != null && player != null && app != player) ||
+             (if (id != null && persistentId != null) id != persistentId else queue != null && queueIndex != null && queue != queueIndex)
+-        if (changed) { value = NowPlaying(revision = value.revision + 1); persistentId = null; queueIndex = null; artworkId = null }
++        // Bring the running position up to now under the old state, so a pause or a speed change keeps it.
++        val now = clock()
++        val current = value.at(now)
++        if (changed) { value = NowPlaying(playing = value.playing, revision = value.revision + 1, positionAtMs = now); persistentId = null; queueIndex = null; artworkId = null }
++        else value = current
+         persistentId = id ?: persistentId
+         queueIndex = queue ?: queueIndex
+         player = app ?: player
+         if (artwork != null && artworkId != null && artwork != artworkId && !changed) value = value.copy(revision = value.revision + 1)
+         artworkId = artwork ?: artworkId
+         value = value.copy(title = title ?: value.title, artist = artist ?: value.artist, album = album ?: value.album,
+-            durationMs = duration ?: value.durationMs, positionMs = position ?: value.positionMs, speed = speed ?: value.speed)
++            durationMs = duration ?: value.durationMs, positionMs = position ?: value.positionMs, speed = speed ?: value.speed,
++            playing = status?.let { it == 1 } ?: value.playing)
+         return value
+     }
+ }
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -156,7 +156,7 @@
+         if (!sessionActive || value == nowPlaying) return
+         if (value.revision != nowPlaying.revision) artwork = null
+         nowPlaying = value
+-        broadcastJson(ServerMessage(type = "now-playing", nowPlaying = value))
++        broadcastJson(ServerMessage(type = "now-playing", nowPlaying = value.at(System.nanoTime() / 1_000_000)))
+     }
+ 
+     @Volatile private var phoneName: String? = null
+@@ -325,7 +325,7 @@
+                                 ServerMessage.serializer(),
+                                 ServerMessage(
+                                     type = "hello",
+-                                    nowPlaying = nowPlaying,
++                                    nowPlaying = nowPlaying.at(System.nanoTime() / 1_000_000),   // not where it was when reported
+                                     artwork = artwork,
+                                     revision = nowPlaying.revision,
+                                     deviceName = config.deviceName,
+--- a/server/src/test/kotlin/com/playport/server/NowPlayingTest.kt
++++ b/server/src/test/kotlin/com/playport/server/NowPlayingTest.kt
+@@ -16,14 +16,33 @@
+         assertNull(state.value.durationMs); assertNull(state.value.positionMs); assertNull(state.artworkId)
+     }
+ 
++    @Test fun positionRunsOnFromTheLastReportWhilePlaying() {
++        var now = 0L
++        val state = NowPlayingState { now }
++        state.accept(Iap2Messages.buildRaw(0x5001) { group(0) { u64(0,1); u32(4,200000) }; group(1) { u8(0,1); u32(1,50000); u16(12,100) } })
++        now = 10_000
++        // An update without the elapsed time (here: a new title) keeps the clock running, not the old position.
++        state.accept(Iap2Messages.buildRaw(0x5001) { group(0) { string(1,"Song") } })
++        assertEquals(60000L, state.value.at(now).positionMs)
++        assertEquals(true, state.value.playing)
++        state.accept(Iap2Messages.buildRaw(0x5001) { group(1) { u8(0,2) } })   // paused, no elapsed time
++        now = 20_000
++        assertEquals(60000L, state.value.at(now).positionMs)
++        state.accept(Iap2Messages.buildRaw(0x5001) { group(1) { u8(0,1) } })   // playing again
++        now = 25_000
++        assertEquals(65000L, state.value.at(now).positionMs)
++        now = 500_000
++        assertEquals(200000L, state.value.at(now).positionMs)   // never past the end of the song
++    }
++
+     @Test fun partialUpdatesAndTrackChanges() {
+-        val state = NowPlayingState()
++        val state = NowPlayingState { 0L }
+         state.accept(Iap2Messages.buildRaw(0x5001) { group(0) { u64(0,1); string(1,"Song"); string(12,"Artist"); string(6,"Album") } })
+         state.accept(Iap2Messages.buildRaw(0x5001) { group(1) { u8(0,2) } })
+-        assertEquals(NowPlaying("Song","Artist","Album"),state.value)
++        assertEquals(NowPlaying("Song","Artist","Album",playing = false),state.value)
+         state.accept(Iap2Messages.buildRaw(0x5001) { group(0) { string(1,"Updated title") } })
+         assertEquals("Artist",state.value.artist)
+         state.accept(Iap2Messages.buildRaw(0x5001) { group(0) { u64(0,2); string(1,"Next") } })
+-        assertEquals(NowPlaying("Next",revision = 1),state.value)
++        assertEquals(NowPlaying("Next",playing = false,revision = 1),state.value)   // the player state outlives the song
+     }
+ }
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -38,6 +38,13 @@
+ media.setArtwork(1,'data:image/jpeg;base64,/9j/');assert.equal(navigator.mediaSession.metadata.artwork.length,1);
+ media.setMetadata({title:'Another',artist:'',album:'',revision:2});assert.equal(navigator.mediaSession.metadata.artwork.length,0,'Clear old cover on track change');
+ assert.equal(positions.at(-1),undefined,'Missing duration must clear old timeline');
++{ let clock=0;const realNow=performance.now;Object.defineProperty(performance,'now',{value:()=>clock,configurable:true,writable:true});
++  media.setPlaying(false);   // the browser hears nothing yet, e.g. sound not unlocked
++  media.setMetadata({title:'Run',artist:'',album:'',durationMs:200000,positionMs:50000,playing:true,revision:3});
++  clock=10000;media.setPlaying(true);assert.equal(positions.at(-1).position,60,"The iPhone's playing state moves the clock, not what the browser hears");
++  clock=12000;media.setMetadata({title:'Run',artist:'',album:'',durationMs:200000,positionMs:62000,playing:false,revision:3});
++  clock=20000;media.setPlaying(false);assert.equal(positions.at(-1).position,62,'Paused on the iPhone: the clock stands');
++  Object.defineProperty(performance,'now',{value:realNow,configurable:true,writable:true}); }
+ media.setActive(false);assert.equal(navigator.mediaSession.playbackState,'none');assert.equal(navigator.mediaSession.metadata,null);
+ // Music must take exactly one route; voice/navigation keep the existing Web Audio path.
+ const edges=[];let music;let packets=0;
+--- a/web/src/media-session.ts
++++ b/web/src/media-session.ts
+@@ -9,7 +9,9 @@
+   private position = 0;
+   private speed = 1;
+   private at = 0;
+-  private positionNow() { return Math.min(this.duration, this.position + (this.playing ? (performance.now()-this.at)/1000*this.speed : 0)); }
++  /** The iPhone's own playing state; what the browser hears (navigation prompts, locked sound) only stands in when it is unknown. */
++  private phonePlaying: boolean | undefined;
++  private positionNow() { return Math.min(this.duration, this.position + ((this.phonePlaying ?? this.playing) ? (performance.now()-this.at)/1000*this.speed : 0)); }
+   setMetadata(value: NowPlaying) {
+     const revision = value.revision ?? 0;
+     const changed = revision !== this.revision || value.title !== this.info.title || value.artist !== this.info.artist || value.album !== this.info.album;
+@@ -18,6 +20,7 @@
+     this.duration = Math.max(0,(value.durationMs ?? 0)/1000);
+     this.position = Math.max(0,Math.min(this.duration,(value.positionMs ?? 0)/1000));
+     this.speed = (value.speed ?? 1) > 0 ? value.speed! : 1;
++    this.phonePlaying = value.playing ?? undefined;
+     if (!Number.isFinite(this.speed)) this.speed = 1;
+     this.at = performance.now();
+     if(changed) this.refreshMetadata();
+@@ -51,7 +54,7 @@
+   setActive(active: boolean) {
+     this.active = active;
+     if (!this.supported) return;
+-    if (!active) { this.info = { title: "CarPlay" }; this.duration=0; this.revision=0; }
++    if (!active) { this.info = { title: "CarPlay" }; this.duration=0; this.revision=0; this.phonePlaying=undefined; }
+     this.refreshMetadata();
+     if (!active) this.playing = false;
+     this.update(); this.updatePosition();
+--- a/web/src/protocol.ts
++++ b/web/src/protocol.ts
+@@ -91,7 +91,7 @@
+   | { type: 'stats'; stats: Record<string, number> }
+   | { type: 'ping' };
+ 
+-export interface NowPlaying { title: string; artist: string; album: string; durationMs?: number; positionMs?: number; speed?: number; revision?: number; }
++export interface NowPlaying { title: string; artist: string; album: string; durationMs?: number; positionMs?: number; speed?: number; playing?: boolean | null; revision?: number; }
+ 
+ export interface ServerMessage {
+   nowPlaying?: NowPlaying;

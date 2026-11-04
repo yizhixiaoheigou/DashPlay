@@ -1,0 +1,80 @@
+Viewer: every window size renegotiates at its sharpest resolution (2026-10-23).
+
+Sharing one stream between window shapes made a small window soft and, in portrait, cramped. Each window
+size is now its own CarPlay session at suggestedResolution's size (CSS size times the pixels used, long
+side 1280 to 1920/2560), so the 2/3 window is 1280x848 again and the 1/3 1082x1280. Every size change
+reconnects once; automatic display no longer uses view areas. The view-area code and its tests stay for
+now.
+
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -6,7 +6,7 @@
+ import { Connection } from './ws';
+ import { SystemMedia } from './media-session';
+ import { LagProbe } from './lag';
+-import { suggestedResolution, windowShape, areaPlan, areaSize, areaFor, sameStream, showsShape, frameRateCheck, type Area } from './display-fit';
++import { suggestedResolution, areaSize, sameStream, frameRateCheck, type Area } from './display-fit';
+ import { t, language, setLanguage, type Key } from './i18n';
+ import { isNight, parseNightMode } from './night';
+ import { reachable, TESLA_HOPS } from './tesla-fullscreen';
+@@ -420,46 +420,33 @@
+   if (current && !expectRestart && !holding) { display = current; showDisplay(); }
+   if (busy() || !display) return;
+   const urgent = urgentChange; urgentChange = '';
+-  const target=autoTarget(), plan=areaPlan(display,target,wantHevc(),storedShapes(),fastDecoder()?2560:1920);
+-  if (!plan) return;
+-  const next=plan.display,key=`${next.width}x${next.height}${next.hevc?'-h265':''}/${(next.areas??[]).map(a=>`${a.width}x${a.height}`).join(',')}/${next.area??0}`;
++  const target=autoTarget();
++  const next={...display,width:target.width,height:target.height,areas:[],area:0,hevc:wantHevc()};
++  const key=`${next.width}x${next.height}${next.hevc?'-h265':''}`;
+   if (key===lastAutoTarget) return;
+   // Avoid a reconnect loop even when another viewer has a different screen shape.
+   lastAutoTarget=key;
+-  // A shape the phone has (only sharper, or another codec as this browser proved fast or slow) waits for the session to
+-  // end; a new shape, the other orientation, a codec that failed or a change by hand renegotiates now.
+-  const waits = !urgent && showsShape(display, target);
+-  const reason = urgent || (waits ? 'quality' : 'shape');
+-  // What waits is for the next session; the window's shape is shown now, by switching to its declared area.
+-  const now = waits ? areaFor(display, target) : -1;
+-  if (now >= 0 && now !== (display.area ?? 0) && !(await saveDisplay({ ...display, area: now }, { reason: 'area' }))) { error(t('autoFail')); return; }
+-  if (!(await saveDisplay(next, { defer: waits, reason }))) { error(t('autoFail')); return; }
+-  saveFlag(SHAPES_KEY, JSON.stringify(plan.shapes));
++  if (sameStream(display,next)) return;
++  // Every window size (and a codec this browser proved it can or cannot handle) renegotiates now: each size is its
++  // own CarPlay session at its sharpest resolution (2026-10-23).
++  if (!(await saveDisplay(next, { reason: urgent || 'shape' }))) { error(t('autoFail')); return; }
+   fit();
+ }
+-/** The window shapes this browser has shown, kept as CarPlay view areas (areaPlan, display-fit.ts): switching
+- *  between them (fullscreen in and out, the car's dock, a Tesla's own fullscreen) moves CarPlay to another area
+- *  without reconnecting; only a shape seen the first time reconnects, once (2026-10-14, replacing the earlier
+- *  "renegotiate a close shape in fullscreen only, once per browser"). */
+-/** Shapes as windowShape gives them since 2026-10-22; the earlier key held each shape fitted on its own, learned anew. */
+-const SHAPES_KEY = 'f50-window-shapes';
+-function storedShapes(): Area[] {
+-  try { const value = JSON.parse(readFlag(SHAPES_KEY) || '[]'); return Array.isArray(value) ? value.filter(a => Number.isInteger(a?.width) && Number.isInteger(a?.height)) : []; }
+-  catch { return []; }
+-}
+-/** This window's shape (windowShape, display-fit.ts): areaPlan fits it, with the others remembered, to the stream. */
++/** The window's own size, at the sharpest the box offers: the CSS size times the pixels used (the device pixel ratio
++ *  with a fast decoder), long side 1280 to 1920 (2560 with a fast decoder). Each window size is its own CarPlay
++ *  session (2026-10-23: one stream shared by several window shapes made small windows soft and cramped). */
+ function autoTarget() {
+   const pixels=fastDecoder()?Math.min(2,Math.max(1,window.devicePixelRatio||1)):1;
+-  return windowShape(screen.clientWidth,screen.clientHeight,pixels);
++  return suggestedResolution(screen.clientWidth*pixels,screen.clientHeight*pixels,fastDecoder()?2560:1920);
+ }
+ el<HTMLSelectElement>('codec').value = readFlag('f50-codec') || 'auto';
+ el<HTMLSelectElement>('codec').onchange=() => { saveFlag('f50-codec', el<HTMLSelectElement>('codec').value); lastAutoTarget=''; urgentChange='manual'; scheduleAuto(); };
+ customSize.onchange=() => { localStorage.setItem('f50-auto-fit',String(!customSize.checked)); lastAutoTarget=''; urgentChange='manual'; render(); scheduleAuto(); };
+ el<HTMLFormElement>('display-form').onsubmit=event => {
+   event.preventDefault();
+-  // Automatic display keeps the box's stream and its areas, changing only frame rate, size or codec: sent without the
+-  // areas, the largest window then showed less (2026-10-22).
+-  const size:Pick<Display,'width'|'height'|'areas'|'area'>=autoFitOn()?(display?{width:display.width,height:display.height,areas:display.areas,area:display.area}:suggestedResolution(autoTarget().width,autoTarget().height,fastDecoder()?2560:1920))
++  // Automatic display keeps the box's current stream and changes only frame rate, size or codec; the areas are empty
++  // now that each window size is its own stream (2026-10-23).
++  const size:Pick<Display,'width'|'height'|'areas'|'area'>=autoFitOn()?(display?{width:display.width,height:display.height,areas:[],area:0}:{...autoTarget(),areas:[],area:0})
+     :{width:Number(el<HTMLInputElement>('width').value),height:Number(el<HTMLInputElement>('height').value)};
+   if (![size.width,size.height].every(v=>Number.isInteger(v)&&v>=480&&v<=3840&&v%2===0)) { error(t('range')); return; }
+   void saveDisplay({...size,fps:Number(el<HTMLSelectElement>('fps').value),uiScale:Number(el<HTMLSelectElement>('ui-scale').value),hevc:wantHevc()},{reason:'manual'});

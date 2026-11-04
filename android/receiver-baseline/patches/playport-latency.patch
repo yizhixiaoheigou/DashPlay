@@ -1,0 +1,125 @@
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+index 8c10e36..b480b57 100644
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -501,12 +501,32 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+         )
+         val wasActive = activeSession != null
+         closingForDisplay.set(wasActive)
++        val keepLink = displayKeepLinkMs()
++        if (wasActive && keepLink > 0 && wireless?.running == true) {
++            // Keep the Bluetooth iAP2 link: the iPhone, still on the Wi-Fi, may reopen AirPlay by itself
++            // and learn the new display without paging, authenticating and handing off again (~4 s).
++            // If it has not come back in time, invite it the usual way.
++            val generation = wirelessGeneration
++            activeSession?.close()
++            Thread({
++                Thread.sleep(keepLink)
++                synchronized(this@CarPlayServer) {
++                    if (closed.get() || activeSession != null || generation != wirelessGeneration) return@Thread
++                    log.info("phone did not reopen CarPlay within {} ms after the display change; inviting it", keepLink)
++                    restartWireless(confirmedPresent = true)
++                }
++            }, "display-keep-link").apply { isDaemon = true; start() }
++            return null
++        }
+         activeSession?.close()
+         // The phone was just using CarPlay, so skip the ~2.4 s presence re-check before re-inviting it.
+         restartWireless(confirmedPresent = wasActive)
+         return null
+     }
+ 
++    private fun displayKeepLinkMs(): Long =
++        System.getenv("CARPLAY_DISPLAY_KEEP_LINK_MS")?.toLongOrNull()?.coerceIn(0, 20_000) ?: 0L
++
+     /** confirmedPresent: the caller has just seen the selected phone on the network (skips a ~2.4 s re-check). */
+     @Synchronized
+     private fun restartWireless(confirmedPresent: Boolean = false) {
+diff --git a/web/src/input.ts b/web/src/input.ts
+index 4a32a05..124b789 100644
+--- a/web/src/input.ts
++++ b/web/src/input.ts
+@@ -24,6 +24,8 @@ const emptyKnob = (overrides: Partial<KnobState> = {}): KnobState => ({
+ export class InputController {
+   private readonly pointers = new Map<number, ActivePointer>();
+   private pendingFlush = 0;
++  /** performance.now() of the latest finger down, for the touch-to-picture measurement. */
++  lastDownAt = 0;
+ 
+   constructor(
+     private readonly surface: HTMLElement,
+@@ -64,6 +66,7 @@ export class InputController {
+       down: true,
+     });
+     this.flush();
++    this.lastDownAt = performance.now();
+   };
+ 
+   private readonly onPointerMove = (event: PointerEvent): void => {
+diff --git a/web/src/main.ts b/web/src/main.ts
+index 8c98bb1..cbf5510 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -21,6 +21,12 @@ const token = fromUrl || localStorage.getItem('playport-token') || '';
+ let active = false, painted = false, frames = 0, lastStats = performance.now();
+ // Reported to the box every 10 s for its persistent drive diagnostics (no personal data).
+ let reportFrames = 0, reportBytes = 0, reportStart = performance.now();
++// Touch-to-picture: from a finger down on a still picture to the next painted frame (network both ways,
++// the iPhone's render and encode, our decode). An animating screen would answer with a frame it was
++// sending anyway, so only taps after at least 150 ms without a frame count.
++let lastPaintAt = 0, handledDownAt = 0, touchSum = 0, touchCount = 0;
++// Music as the iPhone sends it (stream 102, AAC): its bitrate is the iPhone's choice.
++let musicBytes = 0;
+ let state: Key = token ? 'connecting' : 'access';
+ let hint: Key = token ? 'waitingHint' : 'accessHint';
+ let lastAutoTarget = '', autoTimer = 0, displayBusy = false;
+@@ -70,6 +76,12 @@ function send(message: ClientMessage) { if (active) connection.send(message); }
+ const video = new VideoPlayer(canvas, error, () => {
+   if (!active) return;
+   frames++; reportFrames++; painted = true; el('overlay').hidden = true; el('app').dataset.live = 'true';
++  const now = performance.now();
++  if (input.lastDownAt > handledDownAt) {
++    handledDownAt = input.lastDownAt;
++    if (input.lastDownAt - lastPaintAt >= 150) { touchSum += now - input.lastDownAt; touchCount++; }
++  }
++  lastPaintAt = now;
+ }, () => send({ type:'keyframe' }), fit);
+ const audio = new AudioEngine(error);
+ const media = new SystemMedia(send, () => { void audio.unlock().catch(error); }, () => audio.pauseMusic());
+@@ -82,7 +94,7 @@ const connection = new Connection(token, {
+       case 'video-config': video.configure(message); break;
+       case 'video-frame': video.pushFrame(message); break;
+       case 'audio-config': audio.handleConfig(message); break;
+-      case 'audio-packet': audio.handlePacket(message); break;
++      case 'audio-packet': if (message.streamType === 102) musicBytes += message.data.length; audio.handlePacket(message); break;
+       case 'audio-stopped': audio.stopStream(message.streamType); break;
+     }
+   },
+@@ -250,8 +262,8 @@ window.setInterval(()=>{
+   const now=performance.now(),seconds=Math.max(1,(now-reportStart)/1000);
+   send({type:'stats',stats:{fps:reportFrames/seconds,decodeMs:video.decodeLatencyMs,queue:video.decodeQueueSize,
+     kbps:reportBytes*8/1000/seconds,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,
+-    width:canvas.width,height:canvas.height}});
+-  reportFrames=0;reportBytes=0;reportStart=now;
++    width:canvas.width,height:canvas.height,...(touchCount?{touchMs:touchSum/touchCount,touches:touchCount}:{}),...(musicBytes?{musicKbps:musicBytes*8/1000/seconds}:{})}});
++  reportFrames=0;reportBytes=0;reportStart=now;touchSum=0;touchCount=0;musicBytes=0;
+ },10000);
+ render();fit();if(token) connection.connect();
+ 
+diff --git a/web/src/video.ts b/web/src/video.ts
+index 3d6b990..63f73ea 100644
+--- a/web/src/video.ts
++++ b/web/src/video.ts
+@@ -33,7 +33,11 @@ export class VideoPlayer {
+     private readonly onFrame: () => void,
+     private readonly onRequestKeyframe: () => void,
+     private readonly onResolutionChange: (width: number, height: number) => void = () => {},
+-  ) {}
++  ) {
++    // Low-latency canvas: frames reach the screen without waiting for the page compositor (about one
++    // frame sooner where supported). Created first, so every later getContext('2d') returns this one.
++    this.canvas.getContext('2d', { desynchronized: true });
++  }
+ 
+   get isConfigured(): boolean {
+     return this.state !== null;

@@ -24,11 +24,21 @@ class AndroidPhones private constructor(context: Context) {
         check(prefs.edit().putString("phone_policy", json.encodeToString(state)).commit()) { "手机设置保存失败，请重试。" }
     }
     private val iap2 = UUID.fromString("00000000-deca-fade-deca-deafdecacafe")
+    private var lowEnergyOnly = emptySet<String>()
 
     private fun bonded(): Map<String, String> = runCatching {
-        BluetoothAdapter.getDefaultAdapter()?.bondedDevices.orEmpty().filter { device ->
-            device.address == settings.iphoneAddress || policy.state.phones.any { it.address == device.address } ||
-                device.name?.contains("iPhone", true) == true || device.uuids.orEmpty().any { it.uuid == iap2 }
+        val devices = BluetoothAdapter.getDefaultAdapter()?.bondedDevices.orEmpty()
+        lowEnergyOnly = devices.filter { it.type == android.bluetooth.BluetoothDevice.DEVICE_TYPE_LE }
+            .map { it.address.uppercase() }.toSet()
+        devices.filter { device ->
+            val address = device.address.uppercase()
+            PhoneIdentity.eligible(
+                lowEnergyOnly = device.type == android.bluetooth.BluetoothDevice.DEVICE_TYPE_LE,
+                name = device.name,
+                hasIap2 = device.uuids.orEmpty().any { it.uuid == iap2 },
+                phone = policy.state.phones.firstOrNull { it.address == address },
+                selected = address.equals(settings.iphoneAddress, ignoreCase = true) || address == policy.state.preferred,
+            )
         }.associate { it.address.uppercase() to (it.name ?: "iPhone").take(64) }
     }.getOrDefault(emptyMap())
 
@@ -44,11 +54,16 @@ class AndroidPhones private constructor(context: Context) {
         require(address.matches(MAC))
         policy.add(address.uppercase(), name)
     }
+    @Synchronized fun record(address: String): SavedPhone? = policy.state.phones.firstOrNull { it.address.equals(address, ignoreCase = true) }
     @Synchronized fun candidate(): String? = runCatching { policy.select(current(), android.os.SystemClock.elapsedRealtime()) }.getOrNull()
     @Synchronized fun canInvite(address: String): Boolean = runCatching { policy.allowed(address.uppercase(), current()) }.getOrDefault(false)
     @Synchronized fun pause(address: String, remove: Boolean = false): Boolean {
         check(loaded.isSuccess) { "手机记录无法读取，未覆盖原记录。" }
-        return policy.pause(address.uppercase(), remove)
+        val removed = policy.pause(address.uppercase(), remove)
+        if (removed && remove && settings.iphoneAddress.equals(address, ignoreCase = true)) {
+            check(prefs.edit().remove("iphone_address").remove("iphone_name").commit()) { "手机设置保存失败，请重试。" }
+        }
+        return removed
     }
     @Synchronized fun authorize(controller: String?, selected: String?, allowNew: Boolean): Boolean =
         policy.authorize(controller, selected, allowNew, current())
@@ -57,10 +72,13 @@ class AndroidPhones private constructor(context: Context) {
         val bonded = current()
         val receiver = DashPlayService.activeReceiver()
         val wiredLive = receiver?.wiredSessionActive() == true
+        val livePhone = receiver?.wirelessSessionPhone()
         val rows = JSONArray()
-        policy.state.phones.filter { !it.removed }.sortedBy { it.name }.forEach {
+        policy.state.phones.filter { PhoneIdentity.visible(it, it.address in lowEnergyOnly, it.address in bonded,
+            it.address.equals(settings.iphoneAddress, ignoreCase = true) || it.address == policy.state.preferred)
+        }.sortedBy { it.name }.forEach {
             rows.put(JSONObject().put("address", it.address).put("name", it.name).put("paused", it.paused)
-                .put("bonded", it.address in bonded).put("active", !wiredLive && it.address == policy.active)
+                .put("bonded", it.address in bonded).put("active", !wiredLive && it.address == livePhone)
                 .put("last", it.address == policy.state.last))
         }
         return JSONObject().put("phones", rows).put("wiredLive", wiredLive)
@@ -71,6 +89,7 @@ class AndroidPhones private constructor(context: Context) {
     @Synchronized fun command(command: String, args: List<String>): String? {
         val bonded = current()
         val now = android.os.SystemClock.elapsedRealtime()
+        val livePhone = DashPlayService.activeReceiver()?.wirelessSessionPhone()
         fun ok(value: Boolean): String? = if (value) "ok" else null
         return when (command) {
             "boot" -> { policy.boot(); policy.select(bonded, now) }
@@ -79,14 +98,14 @@ class AndroidPhones private constructor(context: Context) {
             "switch" -> args.firstOrNull()?.let { ok(policy.choose(it, bonded)) }
             "idle" -> { policy.idle(); "ok" }
             "decline" -> args.firstOrNull()?.let { policy.decline(it, now); "ok" }
-            "disconnect-request" -> policy.active?.takeIf { !policy.allowed(it, bonded) } ?: policy.disconnect
+            "disconnect-request" -> livePhone?.takeIf { !policy.allowed(it, bonded) } ?: policy.disconnect
             "admit" -> null // IP is not a phone identity; the verified controller gate decides ownership.
-            "remember" -> ok(args.size == 3 && args[2].isNotBlank() && policy.active == args[1])
+            "remember" -> ok(args.size == 3 && args[2].isNotBlank() && livePhone == args[1])
             "devices" -> {
                 val rows = JSONArray()
                 policy.state.phones.filter { !it.removed && it.address in bonded }.forEach {
                     rows.put(JSONObject().put("address", it.address).put("name", it.name)
-                        .put("active", it.address == policy.active).put("last", it.address == policy.state.last))
+                        .put("active", it.address == livePhone).put("last", it.address == policy.state.last))
                 }
                 rows.toString()
             }

@@ -1,0 +1,127 @@
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -18,6 +18,7 @@
+ import { VideoCodec, type ServerMessage, type ClientMessage, type VideoConfigMessage } from './protocol';
+ import { StillPlayer } from './stills';
+ import { RtcPlayer } from './rtc';
++import { RtcFaultProbe } from './rtc-fault-probe';
+ 
+ function el<T extends HTMLElement = HTMLElement>(id: string): T { return document.getElementById(id) as T; }
+ const canvas = el<HTMLCanvasElement>('screen');
+@@ -393,6 +394,16 @@
+ 
+ // RTC: preferred on the compatibility entry, but only after a decoded frame; ICE connected alone is not enough (rtc.ts).
+ const rtcVideo = el<HTMLVideoElement>('rtc-video');
++const rtcFaultProbe = new RtcFaultProbe(
++  (import.meta as ImportMeta & { env: Record<string, string> }).env.VITE_RTC_FAULT_TEST === '1' && url.searchParams.get('rtcFault') === 'disconnect',
++  () => active && rtc.running && transport === 'rtc',
++  () => {
++    connection.send({type:'stats', stats:{ev:23, rtc:1, rtcFault:1, build:BUILD}});
++    connection.send({type:'rtc-stop'});
++  }, state => {
++    connection.send({type:'stats', stats:{ev:24, probeState:state, active:active?1:0, running:rtc.running?1:0, rtc:transport==='rtc'?1:0, build:BUILD}});
++    if (state === 1) toast('回退测试：15 秒后断开 RTC');
++  });
+ const rtc = new RtcPlayer((message) => connection.send(message as ClientMessage), {
+   onConnected: () => { /* negotiation done; the picture is still unproven until the first frame */ },
+   onFirstFrame: (width, height) => {
+@@ -407,6 +418,7 @@
+     if (holding) { holding = false; el('toast').hidden = true; }
+     stillsResolution(width, height);
+     connection.send({type:'stats',stats:{ev:21,rtc:1,width,height,build:BUILD}});
++    rtcFaultProbe.arm();
+     scheduleAuto(); render();
+   },
+   onFrame: () => { if (active) { frames++; reportFrames++; hudFrames++; lastPaintAt = performance.now(); } },
+@@ -424,6 +436,7 @@
+ }
+ /** RTC is not the picture: keep (or return to) stills without touching CarPlay, the session or the audio. */
+ function fallBackToStills(): void {
++  rtcFaultProbe.cancel();
+   if (rtcGaveUp) return;
+   rtcGaveUp = true;
+   if (transport === 'rtc') transport = 'stills';
+@@ -658,6 +671,7 @@
+ const DISPLAY_HOLD_MS = 20000;
+ let holding = false, holdAwakeMs = 0, holdForDisplay = false, shownOnce = false;
+ function reset(hold = false, forDisplay = false) {
++  rtcFaultProbe.cancel();
+   // RTC draws into <video>; retain its last image before detaching the stream.
+   if (hold && transport === 'rtc' && rtcVideo.readyState >= 2) {
+     try { canvas.getContext('2d')?.drawImage(rtcVideo, 0, 0, canvas.width, canvas.height); } catch { /* no drawable frame */ }
+@@ -957,7 +971,7 @@
+   connection.send({type:'stats',stats:{ev,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,width:screen.clientWidth,height:screen.clientHeight,want:wantFullscreen?1:0,...viewport()}});
+ }
+ /** Which page build runs (raised with each build tried in the car). */
+-const BUILD = 2026110417;
++const BUILD = 2026110419;
+ /** What the browser says of the space it gives the page, to find the car's bar over a fullscreen page (2026-10-13):
+  *  window, visual viewport (and its offset), screen, available screen, outer window, pixel ratio. */
+ function viewport(): Record<string, number> {
+--- /dev/null
++++ b/web/src/rtc-fault-probe.ts
+@@ -0,0 +1,23 @@
++/** Diagnostic probe: close only the server RTC peer; never invoke the browser fallback directly. */
++export class RtcFaultProbe {
++  private timer: ReturnType<typeof setTimeout> | null = null;
++  private used = false;
++  constructor(readonly enabled: boolean, private readonly running: () => boolean,
++    private readonly disconnect: () => void, private readonly report: (state: number) => void = () => {}) {}
++  arm(): void {
++    if (!this.enabled) { this.report(0); return; }
++    if (this.used || this.timer !== null) return;
++    this.timer = setTimeout(() => {
++      this.timer = null;
++      if (!this.running()) { this.report(3); return; }
++      this.used = true;
++      this.report(4);
++      this.disconnect();
++    }, 15000);
++    this.report(1);
++  }
++  cancel(): void {
++    if (this.timer !== null) { clearTimeout(this.timer); this.report(2); }
++    this.timer = null;
++  }
++}
+--- /dev/null
++++ b/web/check-rtc-fault-probe.mjs
+@@ -0,0 +1,17 @@
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import ts from 'typescript';
++const source=readFileSync(new URL('src/rtc-fault-probe.ts',import.meta.url),'utf8');
++const js=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS}}).outputText;
++let jobs=new Map(),seq=0,stops=0,running=true,states=[];
++const exports={};
++new Function('exports','setTimeout','clearTimeout',js)(exports,(fn,ms)=>{assert.equal(ms,15000);jobs.set(++seq,fn);return seq;},id=>jobs.delete(id));
++const {RtcFaultProbe}=exports;
++const fire=()=>{const callbacks=[...jobs.values()];jobs.clear();for(const f of callbacks)f();};
++new RtcFaultProbe(false,()=>running,()=>stops++,n=>states.push(n)).arm();assert.equal(jobs.size,0);assert.deepEqual(states,[0]);
++const once=new RtcFaultProbe(true,()=>running,()=>stops++,n=>states.push(n));once.arm();once.arm();assert.equal(jobs.size,1);fire();assert.equal(stops,1);once.arm();assert.equal(jobs.size,0);
++const cancelled=new RtcFaultProbe(true,()=>running,()=>stops++,n=>states.push(n));cancelled.arm();cancelled.cancel();fire();assert.equal(stops,1);
++cancelled.arm();assert.equal(jobs.size,1,'a cancelled startup may retry after the new RTC first frame');fire();assert.equal(stops,2);cancelled.arm();assert.equal(jobs.size,0,'actual injection remains once per page');
++const ended=new RtcFaultProbe(true,()=>running,()=>stops++,n=>states.push(n));ended.arm();running=false;fire();assert.equal(stops,2);running=true;ended.arm();fire();assert.equal(stops,3);
++assert.deepEqual(states,[0,1,4,1,2,1,4,1,3,1,4]);
++console.log('RTC fault probe: disabled, one actual injection, cancel/rearm, ended/rearm and state evidence passed.');
+--- a/web/package.json
++++ b/web/package.json
+@@ -5,7 +5,7 @@
+   "type": "module",
+   "scripts": {
+     "dev": "vite",
+-    "test": "node check.mjs && node check-audio.mjs && node check-audio-lifecycle.mjs && node check-pcm-resampler.mjs && node check-audio-mix.mjs && node check-car.mjs && node check-browser.mjs && node check-flac.mjs && node check-codec-startup.mjs && node check-stills.mjs && node check-rtc.mjs && node check-image.mjs",
++    "test": "node check.mjs && node check-audio.mjs && node check-audio-lifecycle.mjs && node check-pcm-resampler.mjs && node check-audio-mix.mjs && node check-car.mjs && node check-browser.mjs && node check-flac.mjs && node check-codec-startup.mjs && node check-stills.mjs && node check-rtc.mjs && node check-rtc-fault-probe.mjs && node check-image.mjs",
+     "test:audio-browser": "node check-pcm-browser.mjs",
+     "build": "tsc && vite build",
+     "preview": "vite preview"
+--- a/web/check-rtc.mjs
++++ b/web/check-rtc.mjs
+@@ -70,6 +70,7 @@
+ let compatEntry=true,stillsMode=true,jpegOnly=false,rtcGaveUp=false,rtcAttempted=true;
+ let transport='rtc',active=true,painted=true,holding=false,holdAwakeMs=0,holdForDisplay=false,shownOnce=true;
+ let sentNight=null,state='live',expectRestart=true,lastHeard=0,starts=0,copied=0;
++const rtcFaultProbe={cancel(){}};
+ const sent=[],steps=[],connection={send:m=>{sent.push(m);return true}},lag={reset(){},pong(){}};
+ const canvas={inert:false,width:1280,height:1070,style:{opacity:'0'},getContext:()=>({drawImage:()=>{copied++;steps.push('copy')},clearRect(){}})};
+ const rtcVideo={readyState:2,videoWidth:1280,videoHeight:1070,classList:{remove(){}},srcObject:{}};

@@ -1,0 +1,81 @@
+Tesla fullscreen only when the car can reach the video sites (2026-10-14). In Tesla mode the fullscreen button leaves
+the page for v.qq.com and 1905.com; a Tesla on the box hotspot without its own LTE has no internet and landed on an
+error page (simulated: Tesla-like proxy on the box, headless Chrome). The page now fetches both sites' favicons first
+(no-cors, 3 s) and, when either fails, stays and says fullscreen needs the car online; the picture keeps working.
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -8,6 +8,7 @@
+ import { suggestedResolution, areaPlan, areaSize, type Area } from './display-fit';
+ import { t, language, setLanguage, type Key } from './i18n';
+ import { isNight, parseNightMode } from './night';
++import { reachable, TESLA_HOPS } from './tesla-fullscreen';
+ import type { ServerMessage, ClientMessage } from './protocol';
+ 
+ function el<T extends HTMLElement = HTMLElement>(id: string): T { return document.getElementById(id) as T; }
+@@ -269,8 +270,17 @@
+   return 'https://v.qq.com/search_redirect.html?url=https://www.1905.com/api/redirec.html?redirect_url='
+     + `${location.origin}?www.1905.com`;
+ }
++let teslaChecking = false;
+ async function toggleFullscreen() {
+-  if (teslaMode && !teslaBorderless) { location.href = teslaFullscreenUrl(); return; }
++  if (teslaMode && !teslaBorderless) {
++    if (teslaChecking) return;
++    teslaChecking = true;
++    try {
++      if (await reachable(TESLA_HOPS)) location.href = teslaFullscreenUrl();
++      else toast(t('teslaFullscreenOffline'));
++    } finally { teslaChecking = false; }
++    return;
++  }
+   try {
+     if (document.fullscreenElement) { wantFullscreen = false; await document.exitFullscreen(); }
+     else await document.documentElement.requestFullscreen();
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -9,6 +9,7 @@
+   access: ['需要首次登录链接', 'First-time access link required'], accessHint: ['请使用私有访问资料中的完整链接打开一次，此浏览器会记住登录。', 'Open the complete link from your private access file once. This browser will remember it.'],
+   sound: ['轻点启用声音', 'Tap to enable sound'], volume: ['音量', 'Volume'],
+   display: ['画面', 'Display'], fullscreen: ['全屏', 'Fullscreen'], exitFullscreen: ['退出全屏', 'Exit fullscreen'], fullscreenHint: ['已全屏。退出全屏：点 CarPlay 主屏幕上的「盒子设置」图标，再点「退出全屏」。', 'Fullscreen on. To exit, tap the Box settings icon on the CarPlay home screen, then Exit fullscreen.'], fullscreenFail: ['此浏览器不允许全屏，画面仍会自动适配窗口。', 'Fullscreen unavailable. The picture still fits this window.'], tapFullscreen: ['轻点画面恢复全屏', 'Tap the picture to go back to fullscreen'],
++  teslaFullscreenOffline: ['全屏要经腾讯视频跳转，特斯拉现在上不了网。画面照常可用。', 'Fullscreen goes through a video site and the car is offline. The picture keeps working.'],
+   auto: ['自动匹配屏幕', 'Match the screen'], autoHint: ['自动匹配让画面铺满当前窗口，进入或退出全屏时 CarPlay 会重连一次。只在一个显示端开启。', 'Matching fills the current window; entering or leaving fullscreen reconnects CarPlay once. Turn it on for one display only.'],
+   width: ['宽度', 'Width'], height: ['高度', 'Height'], apply: ['应用并重连', 'Apply and reconnect'],
+   nightMode: ['夜间模式', 'Night mode'], nightSchedule: ['自动（18:30–06:30 为夜间）', 'Auto (night 18:30–06:30)'], nightSystem: ['跟随车机浏览器深色模式', 'Follow car browser dark mode'], nightDay: ['始终白天', 'Always day'], nightNight: ['始终夜间', 'Always night'],
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -202,3 +202,17 @@
+   assert.equal(four.display.areas.length,4,'at most four areas');
+ }
+ console.log('View areas: shapes learned once, switched without reconnecting.');
++{ // Tesla fullscreen leaves the page only when its video sites answer (offline Tesla, simulated 2026-10-14).
++  const {reachable,TESLA_HOPS}=await load('tesla-fullscreen');
++  assert.ok(TESLA_HOPS.length===2&&TESLA_HOPS.every(u=>u.startsWith('https://')));
++  const seen=[];
++  assert.equal(await reachable(TESLA_HOPS,(u,init)=>{seen.push([u,init.mode]);return Promise.resolve({});}),true,'both answer');
++  assert.deepEqual(seen.map(s=>s[1]),['no-cors','no-cors'],'any answer counts, no CORS needed');
++  assert.equal(await reachable(TESLA_HOPS,u=>u.includes('1905')?Promise.reject(new TypeError('Failed to fetch')):Promise.resolve({})),false,'one unreachable');
++  const hang=(u,init)=>new Promise((_,reject)=>init.signal.addEventListener('abort',()=>reject(init.signal.reason)));
++  const started=Date.now(), alive=setTimeout(()=>{},5000);   // AbortSignal.timeout alone does not keep Node running
++  assert.equal(await reachable(TESLA_HOPS,hang,50),false,'no answer within the timeout');
++  clearTimeout(alive);
++  assert.ok(Date.now()-started<1000,'gives up at the timeout');
++}
++console.log('Tesla fullscreen: only with its video sites reachable.');
+--- /dev/null
++++ b/web/src/tesla-fullscreen.ts
+@@ -0,0 +1,15 @@
++/** The Tesla way to fullscreen leaves this page for v.qq.com and 1905.com. A Tesla on the box hotspot without its
++ *  own LTE has no internet and would land on an error page instead (simulated 2026-10-14), so the page looks first. */
++export const TESLA_HOPS = ['https://v.qq.com/favicon.ico', 'https://www.1905.com/favicon.ico'];
++
++type Fetcher = (url: string, init: RequestInit) => Promise<unknown>;
++
++/** Every url answers within timeoutMs. no-cors: any HTTP answer counts; only DNS, connection or TLS failures fail. */
++export async function reachable(urls: string[], fetcher: Fetcher = fetch, timeoutMs = 3000): Promise<boolean> {
++  try {
++    await Promise.all(urls.map(url => fetcher(url, { mode: 'no-cors', cache: 'no-store', signal: AbortSignal.timeout(timeoutMs) })));
++    return true;
++  } catch {
++    return false;
++  }
++}

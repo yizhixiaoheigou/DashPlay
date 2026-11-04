@@ -4,7 +4,7 @@ import kotlinx.serialization.Serializable
 
 @Serializable
 data class SavedPhone(val address: String, val name: String, val controllers: Set<String> = emptySet(),
-    val paused: Boolean = false, val removed: Boolean = false)
+    val paused: Boolean = false, val removed: Boolean = false, val manuallyAdded: Boolean = false)
 
 @Serializable
 data class PhoneState(val phones: List<SavedPhone> = emptyList(), val preferred: String? = null, val last: String? = null)
@@ -12,7 +12,6 @@ data class PhoneState(val phones: List<SavedPhone> = emptyList(), val preferred:
 /** Durable invitation policy. Bonded means eligible for an attempt, never proof of Wi-Fi presence. */
 class PhonePolicy(initial: PhoneState = PhoneState(), private val persist: (PhoneState) -> Unit = {}) {
     var state: PhoneState = initial; private set
-    var active: String? = null; private set
     var disconnect: String? = null; private set
     private val declinedUntil = mutableMapOf<String, Long>()
 
@@ -25,7 +24,7 @@ class PhonePolicy(initial: PhoneState = PhoneState(), private val persist: (Phon
     }
     fun add(address: String, name: String) {
         val old = state.phones.firstOrNull { it.address == address }
-        val phone = (old ?: SavedPhone(address, name)).copy(name = name.take(64), paused = false, removed = false)
+        val phone = (old ?: SavedPhone(address, name)).copy(name = name.take(64), paused = false, removed = false, manuallyAdded = true)
         save(state.copy(phones = state.phones.filterNot { it.address == address } + phone, preferred = address))
         declinedUntil.remove(address)
         if (disconnect == address) disconnect = null
@@ -49,12 +48,13 @@ class PhonePolicy(initial: PhoneState = PhoneState(), private val persist: (Phon
         if (state.phones.none { it.address == address && !it.removed }) return false
         save(state.copy(phones = state.phones.map {
             if (it.address == address) it.copy(paused = true, removed = remove, name = if (remove) "" else it.name) else it
-        }))
+        }, preferred = state.preferred?.takeUnless { remove && it == address },
+            last = state.last?.takeUnless { remove && it == address }))
         disconnect = address
         return true
     }
     fun decline(address: String, now: Long) { declinedUntil[address] = now + 60_000 }
-    fun idle() { active = null; disconnect = null }
+    fun idle() { disconnect = null }
     fun boot() { idle(); declinedUntil.clear() }
 
     /** A cryptographically verified controller cannot be relabelled as the newly selected phone. */
@@ -69,7 +69,6 @@ class PhonePolicy(initial: PhoneState = PhoneState(), private val persist: (Phon
         save(state.copy(preferred = selected, last = selected, phones = state.phones.map {
             if (it.address == selected) it.copy(controllers = it.controllers + controller) else it
         }))
-        active = selected
         return true
     }
 }

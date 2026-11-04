@@ -4,7 +4,7 @@ import android.content.Context
 import android.net.wifi.WifiManager
 import com.playport.server.ServerConfig
 
-/** The car this is for. Tesla's browser refuses private addresses (192.168/16 and the like). */
+/** Car-specific access policy; the HTTP compatibility route is configured separately from HTTPS. */
 enum class Car { TESLA, OTHER }
 
 /** Which Wi-Fi the car and the iPhone meet on (the box's Q3). */
@@ -20,14 +20,45 @@ enum class Network {
 /** How the iPhone connects (the box's Q4): asked last, after the facts. */
 enum class IphoneLink { ANY, WIRELESS, WIRED }
 
-/** What this app is installed on. Changes layout/wording and boot UI; capabilities follow hardware/system support. */
+/** Selected product category: phones support wireless CarPlay only; boxes may also use USB. */
 enum class DeviceKind { PHONE, BOX }
+
+/**
+ * How the page receives the picture when the HTTPS/WebCodecs path is not available (2026-11-03).
+ *
+ * AUTO is the default for the HTTP compatibility entry: try a real-time channel first, fall back to stills, and say
+ * which one is running. LEGACY keeps the original HTTPS/WebCodecs behaviour for existing installations.
+ */
+enum class VideoTransport {
+    /** WebRTC first, JPEG stills if it does not produce a frame; only meaningful on the HTTP entry. */
+    AUTO,
+    /** Still the original path: H.264/HEVC over WebSocket, decoded with WebCodecs (needs https or localhost). */
+    WEBCODECS,
+    /** Still images only. */
+    JPEG,
+}
 
 /** What the user set in the app, kept across restarts. */
 class Settings(context: Context) {
     private val app = context.applicationContext
     private val prefs = context.applicationContext.getSharedPreferences("dashplay", Context.MODE_PRIVATE)
     private val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+
+    init {
+        // Persist the product-policy upgrade, without changing credentials, identity or pairing records.
+        // The effectiveLink read guard also covers another Settings instance changing the category.
+        synchronized(WRITE_LOCK) {
+            if (deviceKind == DeviceKind.PHONE) {
+                val oldLink = prefs.getString(KEY_IPHONE, null)
+                if (oldLink != IphoneLink.WIRELESS.name || !prefs.contains("phone_usb_internet")) {
+                    val edit = prefs.edit().putString(KEY_IPHONE, IphoneLink.WIRELESS.name)
+                    if (!prefs.contains("phone_usb_internet")) edit.putBoolean("phone_usb_internet", false)
+                    if (network == Network.CAR_HOTSPOT) edit.putBoolean(KEY_SETUP_DONE, false)
+                    check(edit.commit()) { "无法保存安卓手机无线连接设置" }
+                }
+            }
+        }
+    }
 
     /** The page token stays the same, so the car's bookmark keeps working. */
     val accessToken: String
@@ -51,7 +82,16 @@ class Settings(context: Context) {
     var deviceKind: DeviceKind
         get() = prefs.getString(KEY_DEVICE_KIND, null)?.let { name -> DeviceKind.values().firstOrNull { it.name == name } }
             ?: defaultDeviceKind()
-        set(value) { prefs.edit().putString(KEY_DEVICE_KIND, value.name).apply() }
+        set(value) {
+            val edit = prefs.edit().putString(KEY_DEVICE_KIND, value.name)
+            if (value == DeviceKind.PHONE) {
+                edit.putString(KEY_IPHONE, IphoneLink.WIRELESS.name)
+                if (network == Network.CAR_HOTSPOT) edit.putBoolean(KEY_SETUP_DONE, false)
+            }
+            check(edit.commit())
+        }
+
+    val wiredCarPlaySupported: Boolean get() = deviceKind == DeviceKind.BOX
 
     val deviceKindChosen: Boolean get() = prefs.getString(KEY_DEVICE_KIND, null) != null
 
@@ -63,8 +103,17 @@ class Settings(context: Context) {
     }
     val idleReleaseSeconds: Int get() = prefs.getInt("idle_release", 300)
     val wifiChannel: Int get() = prefs.getInt("wifi_channel", 0)
-    val wifiSecurity: WifiSecurity get() = enumOr("wifi_security",
-        if (hotspot()?.passphrase.isNullOrEmpty()) WifiSecurity.OPEN else WifiSecurity.WPA2)
+    val wifiSecurity: WifiSecurity get() = securityForNetwork(network)
+
+    /** Encryption belongs to the selected credentials, not to the last edited network. */
+    fun securityForNetwork(target: Network): WifiSecurity {
+        val local = target == Network.THIS_HOTSPOT
+        val password = if (local) hotspot()?.passphrase else uplink()?.passphrase
+        val inferred = if (password.isNullOrEmpty()) WifiSecurity.OPEN else WifiSecurity.WPA2
+        // Before the split, wifi_security described whichever network was selected.
+        val legacy = if (local == (network == Network.THIS_HOTSPOT)) enumOr("wifi_security", inferred) else inferred
+        return enumOr(if (local) "local_wifi_security" else "uplink_wifi_security", legacy)
+    }
 
     var usbEnabled: Boolean
         get() = prefs.getBoolean("usb_enabled", false)
@@ -72,17 +121,32 @@ class Settings(context: Context) {
 
     val usesUsb: Boolean get() = usbEnabled && (iphoneLink != IphoneLink.WIRELESS || usbInternet)
 
-    /** Separate local consent: changing from an app-only link to a device-wide Internet VPN. */
+    /** The saved choice is separate from permission and from an actually working upstream. */
+    // Phone USB internet is a separate opt-in; old wired CarPlay consent must not start USB after upgrade.
+    private fun usbInternetKey(kind: DeviceKind) = if (kind == DeviceKind.PHONE) "phone_usb_internet" else "usb_internet"
+    val usbInternetRequested: Boolean get() = usbInternetRequested(deviceKind)
+    fun usbInternetRequested(kind: DeviceKind): Boolean = prefs.getBoolean(usbInternetKey(kind), kind == DeviceKind.BOX)
+    val usbChoiceMade: Boolean get() = prefs.contains("usb_enabled")
+    val iphoneLinkChosen: Boolean get() = prefs.contains(KEY_IPHONE)
+    fun initialIphoneLink(supportsUsb: Boolean): IphoneLink =
+        if (wiredCarPlaySupported && !setupDone && !iphoneLinkChosen && supportsUsb) IphoneLink.WIRED else iphoneLink
+
+    fun requestUsbInternet(value: Boolean, kind: DeviceKind = deviceKind) {
+        check(prefs.edit().putBoolean(usbInternetKey(kind), value)
+            .apply { if (!value) putBoolean("usb_hotspot_share", false) }.commit())
+    }
+
+    /** Runtime callers never install Internet routes merely because the checkbox is preselected. */
     var usbInternet: Boolean
-        get() = prefs.getBoolean("usb_internet", false)
+        get() = usbInternetRequested && usbInternetAllowed && usbEnabled
         set(value) {
-            require(!value || usbInternetAllowed) { "请先在安卓设备的数据线连接页允许借用 iPhone 网络。" }
-            check(prefs.edit().putBoolean("usb_internet", value).apply { if (!value) putBoolean("usb_hotspot_share", false) }.commit())
+            require(!value || usbInternetAllowed) { "请先在安卓设备的 USB 设置页允许使用 iPhone 网络。" }
+            requestUsbInternet(value)
         }
     val usbInternetAllowed: Boolean get() = prefs.getBoolean("usb_internet_consent", false)
     fun allowUsbInternet() {
-        require(usbEnabled && android.net.VpnService.prepare(app) == null) { "请先启用数据线连接并允许 VPN。" }
-        check(prefs.edit().putBoolean("usb_internet_consent", true).putBoolean("usb_internet", true).commit())
+        require(usbEnabled && android.net.VpnService.prepare(app) == null) { "请先在本机 USB 设置页启用 USB 并允许 VPN。" }
+        check(prefs.edit().putBoolean("usb_internet_consent", true).putBoolean(usbInternetKey(deviceKind), true).commit())
     }
 
     var usbHotspotShare: Boolean
@@ -94,7 +158,7 @@ class Settings(context: Context) {
     val usbHotspotShareAllowed: Boolean get() = prefs.getBoolean("usb_hotspot_share_consent", false)
     fun allowUsbHotspotShare() {
         require(usbEnabled && usbInternet && network == Network.THIS_HOTSPOT && android.net.VpnService.prepare(app) == null) {
-            "请先启用数据线借网，并选择这台设备的热点。"
+            "请先启用通过数据线使用 iPhone 网络，并选择这台设备的热点。"
         }
         check(prefs.edit().putBoolean("usb_hotspot_share_consent", true).putBoolean("usb_hotspot_share", true).commit())
     }
@@ -102,7 +166,42 @@ class Settings(context: Context) {
     /** Root authorization can only be initiated on the Android device, never by a viewer. */
     var teslaRootAccess: Boolean
         get() = prefs.getBoolean("tesla_root_access", false)
-        set(value) { check(prefs.edit().putBoolean("tesla_root_access", value).commit()) }
+        set(value) {
+            require(!value || (!compatHttp && !UsbVpnService.compatAddressAttached)) { "请先关闭免 Root HTTP 并断开数据线，再启用 Root 地址。" }
+            check(prefs.edit().putBoolean("tesla_root_access", value).commit())
+        }
+
+    /**
+     * The plain-HTTP compatibility entry (2026-11-03): a Tesla's browser can open the page but has no WebCodecs over
+     * HTTP, so the picture arrives as JPEG stills. Off by default — an upgrade must never open a new port by itself.
+     * It never carries management: see BrowserEndpoint.
+     */
+    var compatHttp: Boolean
+        get() = prefs.getBoolean("compat_http", false)
+        set(value) {
+            require(!value || !teslaRootAccess) { "请先关闭 Root 地址，再启用免 Root HTTP。" }
+            check(prefs.edit().putBoolean("compat_http", value).commit())
+        }
+
+    /** A single non-privileged port for HTTPS and the optional HTTP viewer. */
+    var browserPort: Int
+        get() = BrowserPort.selected(
+            if (prefs.contains("browser_port")) prefs.getInt("browser_port", BrowserPort.DEFAULT) else null,
+            if (prefs.contains("compat_http_port")) prefs.getInt("compat_http_port", 8081) else null)
+        set(value) {
+            BrowserPort.validate(value)
+            check(prefs.edit().putInt("browser_port", value).commit())
+        }
+
+    /** Compatibility alias for previous management clients. Both protocols now use this port. */
+    var compatHttpPort: Int
+        get() = browserPort
+        set(value) { browserPort = value }
+
+    /** Which picture channel a new page should prefer; a page that cannot do it falls back by itself. */
+    var videoTransport: VideoTransport
+        get() = enumOr("video_transport", VideoTransport.AUTO)
+        set(value) { prefs.edit().putString("video_transport", value.name).apply() }
 
     var teslaOfflineChecks: Boolean
         get() = prefs.getBoolean("tesla_offline_checks", false)
@@ -112,6 +211,7 @@ class Settings(context: Context) {
         }
 
     fun enableTeslaRootAccess() {
+        require(!compatHttp && !UsbVpnService.compatAddressAttached) { "请先关闭免 Root HTTP 并断开数据线，再启用 Root 地址。" }
         check(prefs.edit().putBoolean("tesla_root_access", true).putString(KEY_CAR, Car.TESLA.name).commit())
     }
 
@@ -160,7 +260,11 @@ class Settings(context: Context) {
 
     var network: Network
         get() = enumOr(KEY_NETWORK, Network.THIS_HOTSPOT)
-        set(value) { prefs.edit().putString(KEY_NETWORK, value.name).apply() }
+        set(value) = synchronized(WRITE_LOCK) {
+            check(prefs.edit().putString("local_wifi_security", securityForNetwork(Network.THIS_HOTSPOT).name)
+                .putString("uplink_wifi_security", securityForNetwork(Network.MIFI).name)
+                .putString(KEY_NETWORK, value.name).commit())
+        }
 
     /** Shared N1/OpenWrt sound output: all categories either remain in CarPlay or leave it. */
     var audioOutsideCarPlay: Boolean
@@ -175,8 +279,11 @@ class Settings(context: Context) {
     val webCarVoice: Boolean get() = AudioPolicy.webCarVoice(audioOutsideCarPlay, car == Car.TESLA)
 
     var iphoneLink: IphoneLink
-        get() = enumOr(KEY_IPHONE, IphoneLink.ANY)
-        set(value) { prefs.edit().putString(KEY_IPHONE, value.name).apply() }
+        get() = ConnectionSupport.effectiveLink(deviceKind, enumOr(KEY_IPHONE, IphoneLink.ANY))
+        set(value) {
+            require(wiredCarPlaySupported || value == IphoneLink.WIRELESS) { ConnectionSupport.PHONE_WIRELESS_ONLY }
+            prefs.edit().putString(KEY_IPHONE, value.name).apply()
+        }
 
     /** The iPhone added in the app (its Bluetooth address); null takes the paired iPhone. */
     var iphoneAddress: String?
@@ -219,7 +326,7 @@ class Settings(context: Context) {
 
     fun saveHotspot(ssid: String, passphrase: String) {
         prefs.edit().putString(KEY_SSID, ssid.trim()).putString(KEY_PASSPHRASE, passphrase)
-            .remove("wifi_security").apply()
+            .putString("local_wifi_security", (if (passphrase.isEmpty()) WifiSecurity.OPEN else WifiSecurity.WPA2).name).apply()
     }
 
     /**
@@ -236,8 +343,18 @@ class Settings(context: Context) {
         return Uplink(ssid, prefs.getString(KEY_UPLINK_PASSPHRASE, null).orEmpty())
     }
 
+    val externalWifiChoice: ExternalWifiChoice?
+        get() = if (prefs.getString("uplink_confirmed_ssid", null) == uplink()?.ssid)
+            prefs.getString("uplink_choice", null)?.let { value -> ExternalWifiChoice.values().firstOrNull { it.name == value } }
+        else null
+
+    /** Manual system hotspot and external Wi-Fi must advertise their own credentials to the phone. */
+    fun connectionWifi(): Hotspot? = if (network == Network.THIS_HOTSPOT) hotspot()
+        else uplink()?.let { Hotspot(it.ssid, it.passphrase, false) }
+
     fun saveUplink(ssid: String, passphrase: String) {
-        prefs.edit().putString(KEY_UPLINK_SSID, ssid.trim()).putString(KEY_UPLINK_PASSPHRASE, passphrase).apply()
+        prefs.edit().putString(KEY_UPLINK_SSID, ssid.trim()).putString(KEY_UPLINK_PASSPHRASE, passphrase)
+            .putString("uplink_wifi_security", (if (passphrase.isEmpty()) WifiSecurity.OPEN else WifiSecurity.WPA2).name).apply()
     }
 
     /**
@@ -261,59 +378,107 @@ class Settings(context: Context) {
         edit.apply()
     }
 
+    internal val bluetoothSupported: Boolean
+        get() = app.packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_BLUETOOTH)
+
+    internal fun connectionProblem(targetNetwork: Network, targetLink: IphoneLink, kind: DeviceKind = deviceKind): String? =
+        ConnectionSupport.problem(targetNetwork, targetLink,
+            app.packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_USB_HOST),
+            bluetoothSupported, kind)
+
     /** One durable transaction for browser edits; invalid combinations leave all previous values intact. */
     fun apply(update: ManagementSettings) = synchronized(WRITE_LOCK) {
+        val targetKind = update.deviceKind ?: deviceKind
+        val targetLink = update.iphoneLink ?: ConnectionSupport.effectiveLink(targetKind, iphoneLink)
+        if (update.deviceKind != null || update.network != null || update.iphoneLink != null || update.setupDone == true) {
+            connectionProblem(update.network ?: network, targetLink, targetKind)?.let {
+                throw IllegalArgumentException(it)
+            }
+        }
+        val targetCar = update.car ?: car
+        val target = update.network ?: network
+        require(!(targetCar == Car.TESLA && target == Network.CAR_HOTSPOT)) {
+            "当前特斯拉方案不提供车机热点路径。请选择本机热点或外部网络。"
+        }
         update.deviceName?.let(SettingValidation::name)
         update.idleReleaseSeconds?.let { require(it in 0..86400) { "空闲释放时间需在 0–86400 秒之间。" } }
         update.wifiChannel?.let(SettingValidation::channel)
         update.updateMirror?.let { SettingValidation.updateMirror(it.trim()) }
         if (update.usbInternet == true) {
             require(usbInternetAllowed && usbEnabled) {
-                "请先在安卓设备的数据线连接页启用 USB，并允许借用 iPhone 网络。"
+                "请先在安卓设备的 USB 设置页启用 USB，并允许使用 iPhone 网络。"
             }
         }
         if (update.usbHotspotShare == true) {
             require(usbHotspotShareAllowed && usbEnabled && (update.usbInternet ?: usbInternet) &&
                 (update.network ?: network) == Network.THIS_HOTSPOT) {
-                "请先在安卓设备上允许 Root 热点共享，并启用数据线借网。"
+                "请先在安卓设备上允许 Root 热点共享，并启用通过数据线使用 iPhone 网络。"
             }
         }
         val automatic = (update.autoHotspot ?: autoHotspot) && (update.network ?: network) == Network.THIS_HOTSPOT
         if (automatic) {
-            require(android.os.Build.VERSION.SDK_INT >= 29 && app.packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_WIFI_DIRECT)) {
-                "此设备不支持应用本地热点，请使用系统热点或外部 Wi-Fi。"
-            }
+            if (android.os.Build.VERSION.SDK_INT < 29 || !app.packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_WIFI_DIRECT))
+                throw IllegalArgumentException("此设备不支持应用本地热点，请使用系统热点或外部 Wi-Fi。")
             val permission = if (android.os.Build.VERSION.SDK_INT >= 33) android.Manifest.permission.NEARBY_WIFI_DEVICES else android.Manifest.permission.ACCESS_FINE_LOCATION
             require(app.checkSelfPermission(permission) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
                 "请先在安卓设备的本地热点设置中授予附近设备或位置信息权限。"
             }
         }
+        val local = target == Network.THIS_HOTSPOT
+        val targetCompat = update.compatHttp ?: compatHttp
+        require(!targetCompat || !teslaRootAccess) { "请先关闭 Root 地址，再启用免 Root HTTP。" }
+        require(update.browserPort == null || update.compatHttpPort == null || update.browserPort == update.compatHttpPort) {
+            "HTTP 和 HTTPS 使用同一个网页端口，请填写相同端口。"
+        }
+        val targetPort = update.browserPort ?: update.compatHttpPort ?: browserPort
+        BrowserPort.validate(targetPort)
+        if (update.videoTransport == VideoTransport.WEBCODECS && targetCompat) {
+            throw IllegalArgumentException("HTTP 兼容入口不提供 WebCodecs（明文页面没有安全上下文）。请改用自动或仅图片。")
+        }
         val previousUplink = uplink()
-        val uplinkSsid = update.uplinkSsid ?: previousUplink?.ssid.orEmpty()
-        val uplinkPassphrase = update.uplinkPassphrase ?: previousUplink?.passphrase.orEmpty()
-        val changesUplink = update.uplinkSsid != null || update.uplinkPassphrase != null
-        if (changesUplink) SettingValidation.wifi(uplinkSsid, uplinkPassphrase, update.wifiSecurity ?: wifiSecurity)
+        val uplinkSsid = (update.uplinkSsid ?: previousUplink?.ssid.orEmpty()).trim()
+        if (update.externalWifiChoice == ExternalWifiChoice.CURRENT) {
+            val actual = CurrentWifi.ssid(app)
+            require(actual != null) { "暂时无法读取当前 Wi-Fi 名称。请在 App 中允许读取，或选择其他 Wi-Fi 后手动填写。" }
+            require(actual == uplinkSsid) { "当前 Wi-Fi 已变化，请重新选择当前网络。" }
+        }
+        val uplinkPassphrase = ExternalWifiPolicy.password(previousUplink?.ssid, previousUplink?.passphrase,
+            uplinkSsid, update.uplinkPassphrase)
+        val targetWifiChoice = update.externalWifiChoice ?: externalWifiChoice?.takeIf { previousUplink?.ssid == uplinkSsid }
         val previous = hotspot()
         val ssid = update.ssid ?: previous?.ssid.orEmpty()
         val password = update.passphrase ?: previous?.passphrase.orEmpty()
-        val security = update.wifiSecurity ?: wifiSecurity
-        val changesWifi = update.ssid != null || update.passphrase != null || update.wifiSecurity != null
-        val wireless = Plan.of(update.car ?: car, update.network ?: network,
-            update.iphoneLink ?: iphoneLink, update.audioOutsideCarPlay ?: audioOutsideCarPlay).wireless
-        if (changesWifi || (update.setupDone ?: setupDone) && wireless && !automatic) {
-            SettingValidation.wifi(ssid, password, security)
+        val localSecurity = if (local) update.wifiSecurity ?: securityForNetwork(Network.THIS_HOTSPOT)
+            else securityForNetwork(Network.THIS_HOTSPOT)
+        val uplinkSecurity = if (!local) update.wifiSecurity ?: securityForNetwork(Network.MIFI)
+            else securityForNetwork(Network.MIFI)
+        val changesWifi = update.ssid != null || update.passphrase != null || (local && update.wifiSecurity != null)
+        val changesUplink = update.uplinkSsid != null || update.uplinkPassphrase != null || (!local && update.wifiSecurity != null)
+        val wireless = Plan.of(update.car ?: car, target,
+            targetLink, update.audioOutsideCarPlay ?: audioOutsideCarPlay).wireless && bluetoothSupported
+        val requiresWifi = (update.setupDone ?: setupDone) && wireless && !automatic
+        if (changesWifi || requiresWifi && local) SettingValidation.wifi(ssid, password, localSecurity)
+        if (changesUplink || requiresWifi && !local) SettingValidation.wifi(uplinkSsid, uplinkPassphrase, uplinkSecurity)
+        if (requiresWifi && !local) require(targetWifiChoice != null) {
+            "请先选择使用当前 Wi-Fi 或其他 Wi-Fi，再保存无线连接设置。"
         }
         val edit = prefs.edit()
         update.autoHotspot?.let { edit.putBoolean("auto_hotspot", it) }
-        update.usbInternet?.let { edit.putBoolean("usb_internet", it) }
+        update.usbInternet?.let { edit.putBoolean(if (targetKind == DeviceKind.PHONE) "phone_usb_internet" else "usb_internet", it) }
         update.usbHotspotShare?.let { edit.putBoolean("usb_hotspot_share", it) }
         if (update.usbInternet == false) edit.putBoolean("usb_hotspot_share", false)
         update.deviceName?.let { edit.putString("device_name", it) }
         update.car?.let { edit.putString(KEY_CAR, it.name) }
         update.network?.let { edit.putString(KEY_NETWORK, it.name) }
-        update.iphoneLink?.let { edit.putString(KEY_IPHONE, it.name) }
-        if (changesWifi) edit.putString(KEY_SSID, ssid).putString(KEY_PASSPHRASE, password).putString("wifi_security", security.name)
-        if (changesUplink) edit.putString(KEY_UPLINK_SSID, uplinkSsid.trim()).putString(KEY_UPLINK_PASSPHRASE, uplinkPassphrase)
+        update.deviceKind?.let { edit.putString(KEY_DEVICE_KIND, it.name) }
+        if (update.iphoneLink != null || update.deviceKind != null) edit.putString(KEY_IPHONE, targetLink.name)
+        if (changesWifi) edit.putString(KEY_SSID, ssid).putString(KEY_PASSPHRASE, password)
+        if (changesUplink) edit.putString(KEY_UPLINK_SSID, uplinkSsid).putString(KEY_UPLINK_PASSPHRASE, uplinkPassphrase)
+        if (update.externalWifiChoice != null) edit.putString("uplink_choice", update.externalWifiChoice.name)
+            .putString("uplink_confirmed_ssid", uplinkSsid)
+        else if (previousUplink?.ssid != uplinkSsid) edit.remove("uplink_choice").remove("uplink_confirmed_ssid")
+        // Save both resolved modes before changing topology so legacy WPA3 also survives a switch.
+        edit.putString("local_wifi_security", localSecurity.name).putString("uplink_wifi_security", uplinkSecurity.name)
         update.wifiChannel?.let { edit.putInt("wifi_channel", it) }
         update.audioOutsideCarPlay?.let { edit.putBoolean(KEY_AUDIO_OUTSIDE, it) }
         update.startAtBoot?.let { edit.putBoolean(KEY_BOOT, it) }
@@ -322,6 +487,9 @@ class Settings(context: Context) {
         update.ownNameOnHotspot?.let { edit.putBoolean("own_name_on_hotspot", it) }
         update.updateCheck?.let { edit.putBoolean("update_check", it) }
         update.updateMirror?.let { edit.putString("update_mirror", it.trim()) }
+        update.compatHttp?.let { edit.putBoolean("compat_http", it) }
+        if (update.browserPort != null || update.compatHttpPort != null) edit.putInt("browser_port", targetPort)
+        update.videoTransport?.let { edit.putString("video_transport", it.name) }
         check(edit.commit()) { "设置未保存，请重试。" }
     }
 

@@ -1,0 +1,188 @@
+Viewer: fixes from testing against the F50 and a second review (2026-10-12).
+
+- A realignment queues the unheard seconds again (up to 5 s); the "music buffer is not advancing" limit was
+  12 fragments for FLAC (1 s) and closed the music. Now 80 fragments (6.8 s) for AAC and FLAC alike.
+- No realignment while the music element is paused (not unlocked yet, or the car gave the sound to another
+  app); it aligns when it plays again instead of reshuffling the buffer every 5 s.
+- Resuming never steps back: after a pause the buffer may be played out, and going 1 s back replayed what was
+  heard. The element now waits for a cushion of new audio and plays on.
+- Fullscreen: Chrome tells a hidden page it left fullscreen only once the page is shown again (hidden, shown,
+  then out of fullscreen), which looked like leaving on purpose and renegotiated the picture. An exit within
+  2 s of being shown after the page was covered in fullscreen now counts as covered. A pending decision is
+  dropped when fullscreen changes again, and leaving on purpose fits the window afterwards.
+- No renegotiation while the page is hidden or waits for its fullscreen tap: a resize timer set just before the
+  page was covered fired while hidden and renegotiated to the small size Chrome reports then.
+Headless Chrome against the F50 with an iPhone in CarPlay, three runs: hidden for 2.5 s before the exit, and
+leaving fullscreen on purpose then re-entering before the car covers the page: the hint shows, one tap goes back
+to fullscreen, the tap does not reach CarPlay, and no renegotiation after the first fullscreen.
+
+--- a/web/src/music-output.ts
++++ b/web/src/music-output.ts
+@@ -11,6 +11,8 @@
+ const CUSHION: Record<MusicKind,number> = { aac: 1, flac: .65 };
+ /** AAC frames (1024 samples, 21 ms) per MP4 fragment: small, so audio reaches the element as it arrives. */
+ const AAC_FRAGMENT = 4;
++/** Fragments (85 ms each, AAC and FLAC alike) that may wait for the buffer: more than a realignment replays (5 s). */
++const MAX_PENDING = 80;
+ /** A real HTML media timeline makes received music eligible for OS media controls. */
+ export class MusicOutput {
+   static supported(kind: MusicKind = 'aac') { return typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(MIMES[kind]); }
+@@ -58,13 +60,21 @@
+       catch(error){this.onError(String(error));}
+     },{once:true});
+   }
+-  get unlocked(){return !this.element.paused;}
++  /** Waiting for a cushion before playing on (unlock). */
++  private holding=false;
++  get unlocked(){return !this.element.paused||this.holding;}
+   get playing(){return this.running&&!this.element.paused&&performance.now()-this.lastPacket<1800;}
+-  pause(){this.pausing=!this.element.paused;this.element.pause();this.running=false;this.frames=[];this.pcm=[];this.pcmBytes=0;}
++  pause(){this.holding=false;this.pausing=!this.element.paused;this.element.pause();this.running=false;this.frames=[];this.pcm=[];this.pcmBytes=0;}
+   unlock(){
+-    // Not right at the end: playing from the last sample ran dry at once, a crackle on opening the page.
++    // Not right at the end: playing from the last sample ran dry at once, a crackle on opening the page. Never
++    // backwards either: after a pause the buffer may be played out, and going back replayed what was heard
++    // (review 2026-10-12); then the music waits for its cushion and plays on (pump).
+     const b=this.buffer;
+-    if(this.element.paused && b?.buffered.length) this.element.currentTime=Math.max(b.buffered.start(0),b.buffered.end(b.buffered.length-1)-CUSHION[this.kind]);
++    if(this.element.paused && b?.buffered.length){
++      const target=b.buffered.end(b.buffered.length-1)-CUSHION[this.kind];
++      if(target>this.element.currentTime)this.element.currentTime=Math.max(b.buffered.start(0),target);
++      else{this.holding=true;this.pump();return Promise.resolve();}
++    }
+     return this.element.play();
+   }
+   volume(value:number){this.element.volume=Math.max(0,Math.min(1,value));}
+@@ -74,7 +84,7 @@
+     this.lastPacket=performance.now();this.frames.push(data.slice());
+     if(this.frames.length<AAC_FRAGMENT)return;
+     this.queue(aacFragment(this.sequence++,this.samples,this.frames),1024*this.frames.length);this.frames=[];
+-    if(this.pending.length>48){this.onError('Music buffer is not advancing');this.close();return;}
++    if(this.pending.length>MAX_PENDING){this.onError('Music buffer is not advancing');this.close();return;}
+     this.pump();
+   }
+   /** LPCM packets (352 samples each) are cut into fixed FLAC_BLOCK blocks, one MP4 fragment each. */
+@@ -91,7 +101,7 @@
+       this.pcmBytes-=step;
+       this.queue(flacFragment(this.sequence++,this.samples,flacFrame(this.block++,this.rate,this.channels,block),FLAC_BLOCK),FLAC_BLOCK);
+     }
+-    if(this.pending.length>12){this.onError('Music buffer is not advancing');this.close();return;}
++    if(this.pending.length>MAX_PENDING){this.onError('Music buffer is not advancing');this.close();return;}
+     this.pump();
+   }
+   private queue(data:Uint8Array,length:number){
+@@ -117,7 +127,8 @@
+       this.element.currentTime=from/this.rate+offset;
+       return false;
+     }
+-    const song=this.song;if(!song||!this.started)return false;
++    // Paused (by the car for another app, or not unlocked yet): aligned when it plays again.
++    const song=this.song;if(!song||!this.started||this.element.paused)return false;
+     const position=Math.min(song.duration,song.position+(song.playing?(performance.now()-song.at)/1000:0));
+     const now=performance.now();
+     if(song.key===this.alignedKey&&(Math.abs(this.element.currentTime-position)<=3||now-this.alignedAt<5000))return false;
+@@ -142,6 +153,7 @@
+         const end=b.buffered.end(b.buffered.length-1),now=this.element.currentTime;
+         if(end-now>CUSHION[this.kind]+1.35){this.element.currentTime=Math.max(b.buffered.start(0),end-CUSHION[this.kind]);this.counts.musicSkips++;}
+         if(now-b.buffered.start(0)>15){b.remove(0,now-10);return;}
++        if(this.holding&&end-now>=CUSHION[this.kind]){this.holding=false;void this.element.play().catch(()=>{});}
+       }
+       const next=this.pending.shift();if(next){b.appendBuffer(next as Uint8Array<ArrayBuffer>);this.started=true;}
+     }catch(error){this.onError(String(error));}
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -183,7 +183,7 @@
+ /** The car shows something else over the page (reverse camera): the page is hidden and comes back out of
+  *  fullscreen (Xpeng G6, 2026-10-12). Such an exit keeps the picture as negotiated, and the next tap on the
+  *  picture goes back to fullscreen; a browser enters fullscreen only on a tap, never by itself. */
+-let wantFullscreen = false, hiddenAt = -Infinity, exitedAt = -Infinity;
++let wantFullscreen = false, hiddenAt = -Infinity, shownAt = -Infinity, coveredInFullscreen = false, fullscreenSeq = 0;
+ const restoring = () => wantFullscreen && !document.fullscreenElement && !document.hidden;
+ async function toggleFullscreen() {
+   try {
+@@ -203,10 +203,15 @@
+ }
+ document.addEventListener('fullscreenchange', () => {
+   updateFullscreen(); fit(); pageEvent(document.fullscreenElement ? 3 : 4);
+-  if (document.fullscreenElement) { wantFullscreen = true; toast(t('fullscreenHint')); return; }
+-  el('toast').hidden = true; exitedAt = performance.now();
+-  // Not hidden around the exit (within 2 s): the user left fullscreen on purpose.
+-  window.setTimeout(() => { if (!document.hidden && Math.abs(exitedAt - hiddenAt) > 2000) wantFullscreen = false; }, 2000);
++  const seq = ++fullscreenSeq;
++  if (document.fullscreenElement) { wantFullscreen = true; coveredInFullscreen = false; toast(t('fullscreenHint')); return; }
++  el('toast').hidden = true;
++  // The car covered the page: the browser leaves fullscreen while it is hidden, and may tell the page only once it
++  // is shown again (Chrome, 2026-10-12: hidden, shown, then out of fullscreen). Fullscreen comes back on a tap.
++  if (wantFullscreen && (document.hidden || (coveredInFullscreen && performance.now() - shownAt < 2000))) { showRestoreHint(); return; }
++  // Left while shown: on purpose, unless the page is hidden within 2 s; then fit the window as usual.
++  const exitedAt = performance.now();
++  window.setTimeout(() => { if (seq !== fullscreenSeq || hiddenAt >= exitedAt) return; wantFullscreen = false; scheduleAuto(); }, 2000);
+ });
+ function showRestoreHint() {
+   if (!restoring()) return;
+@@ -253,10 +258,11 @@
+   autoTimer=window.setTimeout(() => { void adapt(); },1500);
+ }
+ async function adapt() {
+-  if (!display || !autoFit.checked || displayBusy) return;
++  // Not for a hidden page (a covered page reports a small window) nor while fullscreen waits for its tap; a timer
++  // set just before the car covered the page fired anyway and renegotiated to 800x400 (Chrome, 2026-10-12).
++  if (!display || !autoFit.checked || displayBusy || document.hidden || (wantFullscreen && !document.fullscreenElement)) return;
+   const target=autoTarget();
+   if (!document.fullscreenElement && closeShape(display,target)) return;
+-  if (restoring()) return;   // back from the reverse camera: the next tap restores the negotiated shape
+   const key=`${target.width}x${target.height}`;
+   if (!aspectChanged(display,target) || key===lastAutoTarget) return;
+   // Avoid a reconnect loop even when another viewer has a different screen shape.
+@@ -280,7 +286,8 @@
+ new ResizeObserver(()=>{ fit(); scheduleAuto(); }).observe(screen);
+ document.addEventListener('visibilitychange',()=>{
+   pageEvent(document.hidden ? 1 : 2);
+-  if (document.hidden) { hiddenAt = performance.now(); return; }
++  if (document.hidden) { hiddenAt = performance.now(); if (document.fullscreenElement || wantFullscreen) coveredInFullscreen = true; return; }
++  shownAt = performance.now();
+   // The picture at once instead of the phone's next keyframe; then the sound.
+   send({ type:'keyframe' }); fit(); scheduleAuto(); void unlock(); showRestoreHint();
+ });
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -85,13 +85,15 @@
+     get buffered(){return new Ranges(this.ranges);},appendBuffer(){log.push('append');},remove(a,b){log.push(`remove ${a}-${b}`);this.ranges=[];}};
+   const source={readyState:'open',duration:Infinity,addEventListener(n,h){h();},addSourceBuffer(){return buffer;}};
+   globalThis.MediaSource=class {constructor(){return source;}};globalThis.URL.createObjectURL=()=>'blob:x';
+-  const element={currentTime:0,paused:true,setAttribute(){},addEventListener(){},play(){return Promise.resolve();},pause(){}};
++  const element={currentTime:0,paused:true,plays:0,setAttribute(){},removeAttribute(){},load(){},remove(){},addEventListener(){},play(){this.plays++;this.paused=false;return Promise.resolve();},pause(){this.paused=true;}};
+   globalThis.document={createElement:()=>element,body:{append(){}}};
+-  const {MusicOutput}=await load('music-output',s=>'const FLAC_BLOCK=4096,FLAC_MIME="audio/mp4";function flacInit(){return new Uint8Array(1);}function aacInit(){return new Uint8Array(1);}\n'+s.replace(/^import .*?;$/gm,''));
++  const {MusicOutput}=await load('music-output',s=>'const FLAC_BLOCK=4096,FLAC_MIME="audio/mp4";function flacInit(){return new Uint8Array(1);}function aacInit(){return new Uint8Array(1);}function flacFrame(){return new Uint8Array(1);}function flacFragment(){return new Uint8Array(1);}\n'+s.replace(/^import .*?;$/gm,''));
+   const music=new MusicOutput({sampleRate:48000,channels:2,description:new Uint8Array()},()=>{},'flac');
+   assert.deepEqual(log,['append'],'init segment');
+   element.currentTime=600;buffer.ranges=[[599,600.6]];
+   music.follow({position:8,duration:269,key:'A',playing:true});
++  assert.deepEqual(log.slice(1),[],'Nothing moves while the element is paused (not unlocked, or the car gave the sound to another app)');
++  element.paused=false;music.follow({position:8,duration:269,key:'A',playing:true});
+   assert.deepEqual(log.slice(1),['remove 0-Infinity'],'A new song first drops the old timeline');
+   clock=100;buffer.listeners.updateend();
+   assert.equal(element.currentTime,8,'then what was being heard is the song position');assert.equal(source.duration,269,'with the song duration');
+@@ -102,6 +104,21 @@
+   assert.ok(!log.some(x=>x.startsWith('remove')),'Following the same song moves nothing');
+   clock=10000;music.follow({position:60,duration:269,key:'A',playing:true});
+   assert.ok(log.includes('remove 0-Infinity'),'A seek on the iPhone (more than 3 s off) realigns');
++  // A realignment queues the unheard seconds again (up to 5 s): that is not a stuck buffer.
++  const errors=[];const flac=new MusicOutput({sampleRate:48000,channels:2,description:new Uint8Array()},m=>errors.push(m),'flac');
++  buffer.updating=true;for(let i=0;i<40;i++)flac.packet(new Uint8Array(4096*4));
++  assert.deepEqual(errors,[],'Forty fragments (3.4 s) waiting on a busy buffer close nothing');
++  for(let i=0;i<60;i++)flac.packet(new Uint8Array(4096*4));
++  assert.deepEqual(errors,['Music buffer is not advancing'],'but a buffer stuck for good still does');buffer.updating=false;
++  // Resuming after a pause whose buffer was played out: no step back (that replayed a second already heard).
++  const resumed=new MusicOutput({sampleRate:48000,channels:2,description:new Uint8Array()},()=>{},'aac');
++  element.paused=true;element.plays=0;element.currentTime=10;buffer.ranges=[[5,10]];
++  await resumed.unlock();
++  assert.equal(element.currentTime,10,'No step back');assert.equal(element.plays,0,'it waits for a cushion');assert.equal(resumed.unlocked,true);
++  buffer.ranges=[[5,11.2]];buffer.listeners.updateend();
++  assert.equal(element.plays,1,'and plays on once a second of new audio is in');
++  element.paused=true;element.currentTime=6;buffer.ranges=[[5,12]];await resumed.unlock();
++  assert.equal(element.currentTime,11,'A stale buffer still jumps forward to 1 s before its end');
+   Object.defineProperty(performance,'now',{value:realNow,configurable:true,writable:true}); }
+ media.setActive(false);assert.equal(navigator.mediaSession.playbackState,'none');assert.equal(navigator.mediaSession.metadata,null);
+ // Music must take exactly one route; voice/navigation keep the existing Web Audio path.

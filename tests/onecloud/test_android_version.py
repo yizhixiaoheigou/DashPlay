@@ -21,6 +21,8 @@ class VersionCodeTests(unittest.TestCase):
         # The Xiaomi test phone carries 0.3.0-beta.1 at the old formula's 3001.
         self.assertGreater(android_version.code('0.3.0-beta.2'), 3001)
         self.assertGreater(android_version.code('0.3.0-beta.1'), 3001)
+        # November setup candidates used 3004xx. The release candidate must also upgrade those installs.
+        self.assertGreater(android_version.code('0.3.1-beta.1'), 300441)
 
     def test_fits_android_and_rejects_what_it_cannot_order(self):
         self.assertLessEqual(android_version.code('99.99.99'), 2_100_000_000)

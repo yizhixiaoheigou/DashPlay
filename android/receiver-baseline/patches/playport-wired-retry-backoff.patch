@@ -1,0 +1,94 @@
+diff --git a/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt b/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt
+--- a/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt
++++ b/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt
+@@ -39,11 +39,14 @@
+     @Volatile private var mux: Iap2UsbMuxHost? = null
+     @Volatile private var session: Iap2Session? = null
+     @Volatile private var serial: String? = null   // USB serial (UDID) of the iPhone on the cable
++    @Volatile private var sawDevice = false        // this run reached an iPhone (see the retry ladder in start())
+     private val statusFile = System.getenv("CARPLAY_WIRED_STATUS")?.takeIf { it.isNotBlank() }?.let { Path.of(it) }
+ 
+     fun start() {
+         Thread({
++            var step = 0
+             while (!stopped) {
++                sawDevice = false
+                 try {
+                     runOnce()
+                 } catch (error: Exception) {
+@@ -54,7 +57,12 @@
+                     mux = null
+                     session = null
+                 }
+-                if (!stopped) Thread.sleep(RETRY_MILLIS)
++                // Back off only while the helper keeps ending before any iPhone shows up (a phone or MiFi on
++                // the port giving the box internet, a broken cable): 2, 5, 10, 15, 20 then 30 s. A run that
++                // saw an iPhone — including the normal unplug — starts again at 2 s, so replugging stays quick
++                // (2026-10-31: with an Android sharing internet the 2 s loop competed with the wireless invite).
++                step = if (sawDevice) 0 else minOf(step + 1, RETRY_DELAYS_MS.size - 1)
++                if (!stopped) Thread.sleep(RETRY_DELAYS_MS[step])
+             }
+         }, "wired-bootstrap").apply { isDaemon = true; start() }
+     }
+@@ -67,8 +75,8 @@
+             val parts = state.split(" ")
+             when (parts[0]) {
+                 "waiting" -> { server.cableUnplugged(); status("cable") }
+-                "iphone" -> { serial = parts.getOrNull(1); server.setCablePhone(true); status("starting") }
+-                "tether" -> { serial = parts.getOrNull(1); server.cableWithoutCarPlay(); status("") }
++                "iphone" -> { serial = parts.getOrNull(1); sawDevice = true; server.setCablePhone(true); status("starting") }
++                "tether" -> { serial = parts.getOrNull(1); sawDevice = true; server.cableWithoutCarPlay(); status("") }
+             }
+         }.also { pipe = it }
+         // The helper exits when the iPhone is unplugged, but the iAP2 session blocked in recv never
+@@ -220,14 +228,34 @@
+     private fun awaitSession(bridge: UsbBridgePipe) {
+         Thread({
+             val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(SESSION_WAIT_SECONDS)
+-            while (!stopped && pipe === bridge && System.nanoTime() < deadline) {
++            var live = false
++            var goneSince = 0L
++            while (!stopped && pipe === bridge) {
+                 if (server.wiredSessionActive()) {
++                    live = true
++                    goneSince = 0L
+                     status("live")
++                    Thread.sleep(250)
++                    continue
++                }
++                if (!live) {
++                    if (System.nanoTime() >= deadline) break
++                    Thread.sleep(250)
++                    continue
++                }
++                // The session was up and went away — the owner turned the phone's personal hotspot on, iOS
++                // reset the USB network, ... — and the iPhone does not open CarPlay again by itself, while the
++                // iAP2 link stays up and the page waits forever (dp-0017, 2026-10-31). Start the cable over.
++                if (goneSince == 0L) goneSince = System.nanoTime()
++                if (System.nanoTime() - goneSince >= TimeUnit.SECONDS.toNanos(SESSION_END_GRACE_SECONDS)) {
++                    log.info("wired: the CarPlay session ended and did not come back within {} s; starting over",
++                             SESSION_END_GRACE_SECONDS)
++                    closeLink()
+                     return@Thread
+                 }
+                 Thread.sleep(250)
+             }
+-            if (!stopped && pipe === bridge) {
++            if (!stopped && pipe === bridge && !live) {
+                 log.info("wired: the iPhone did not open CarPlay within {} s; starting over", SESSION_WAIT_SECONDS)
+                 closeLink()
+             }
+@@ -277,9 +305,12 @@
+ 
+     private companion object {
+         const val LABEL = "DashPlay"
+-        const val RETRY_MILLIS = 2_000L
++        /** Retry ladder while no iPhone shows up: 2, 5, 10, 15, 20 then 30 s (2026-10-31). */
++        val RETRY_DELAYS_MS = longArrayOf(2_000, 5_000, 10_000, 15_000, 20_000, 30_000)
+         const val PAIR_TIMEOUT_MILLIS = 120_000L
+         const val SESSION_WAIT_SECONDS = 8L   // the iPhone normally connects ~2 s after the start
++        /** The wired session went away (hotspot toggled on the phone): how long to wait for it before starting over. */
++        const val SESSION_END_GRACE_SECONDS = 10L
+     }
+ }
+ 

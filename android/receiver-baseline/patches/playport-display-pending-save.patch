@@ -1,0 +1,53 @@
+diff --git a/server/src/main/kotlin/com/playport/server/DisplayState.kt b/server/src/main/kotlin/com/playport/server/DisplayState.kt
+--- a/server/src/main/kotlin/com/playport/server/DisplayState.kt
++++ b/server/src/main/kotlin/com/playport/server/DisplayState.kt
+@@ -60,4 +60,14 @@
+     fun defer(request: DisplayRequest) { pending = request }
+ 
++    /**
++     * What config.json keeps for the next start: the waiting change when there is one. A car that cuts the box's power
++     * at once never ends the session by itself; kept only in memory, the change was lost at every stop and the page
++     * deferred it again on the next drive (F50, 2026-10-22).
++     */
++    fun forNextStart(): DisplayPrefs = pending?.let {
++        DisplayPrefs(it.width, it.height, it.fps, CarPlayUiScale.sanitize(it.uiScale), it.hevc,
++            it.areas.takeIf { areas -> areas.size > 1 } ?: emptyList(), it.area)
++    } ?: DisplayPrefs(width, height, fps, uiScale, hevc, areas, area)
++
+     /** Takes up the pending change, if any; true when the display changed. */
+     fun applyPending(): Boolean {
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -693,5 +693,5 @@
+             if (request.area == display.area) return DisplayOutcome()
+             display.useArea(request.area)
+-            configStore?.save(PersistentConfig.of(config, display))
++            configStore?.save(PersistentConfig.of(config, display).copy(display = display.forNextStart()))
+             val sent = session.showViewArea(request.area)
+             log.info("view area {} ({}x{}) of {}x{} sent={} ({})", request.area, areas[request.area].width,
+@@ -710,4 +710,5 @@
+         if (request.defer && session != null) {
+             display.defer(request.copy(areas = areas))
++            configStore?.save(PersistentConfig.of(config, display).copy(display = display.forNextStart()))
+             log.info("display {}x{} @{}fps codec={} waits for the session to end ({})", width, height, fps,
+                 if (hevc) "h265" else "h264", reason)
+diff --git a/server/src/test/kotlin/com/playport/server/ViewAreaTest.kt b/server/src/test/kotlin/com/playport/server/ViewAreaTest.kt
+--- a/server/src/test/kotlin/com/playport/server/ViewAreaTest.kt
++++ b/server/src/test/kotlin/com/playport/server/ViewAreaTest.kt
+@@ -82,3 +82,15 @@
+         assertEquals(1920, display.width)
+     }
++
++    @Test
++    fun aWaitingChangeIsWhatTheNextStartUses() {
++        val display = DisplayState(1280, 720, 30, 100, false)
++        assertEquals(DisplayPrefs(1280, 720, 30, 100, false), display.forNextStart())
++        display.defer(DisplayRequest(1372, 1260, 30, 100, hevc = true, defer = true, reason = "quality"))
++        assertEquals("the box may lose power before the session ends", DisplayPrefs(1372, 1260, 30, 100, true),
++            display.forNextStart())
++        assertEquals("the running session keeps its own", 1280, display.width)
++        display.defer(DisplayRequest(1920, 1080, 30, 100, areas = listOf(full, windowed), area = 1, defer = true))
++        assertEquals(DisplayPrefs(1920, 1080, 30, 100, false, listOf(full, windowed), 1), display.forNextStart())
++    }
+ }

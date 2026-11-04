@@ -1,0 +1,104 @@
+--- a/web/index.html
++++ b/web/index.html
+@@ -3 +3,2 @@
+-<body><main id="app">
++<body><section id="browser-check" style="position:fixed;top:0;right:0;bottom:0;left:0;z-index:99999;background:#141920;color:#f4f6f8;overflow:auto;padding:24px;font:16px/1.6 sans-serif;box-sizing:border-box">
++<h1 id="browser-check-title" style="font-size:24px">浏览器兼容性检测</h1><p id="browser-check-note">正在检测。如果此提示一直不变，请确认 JavaScript 已启用，或刷新页面重新加载检测脚本。</p><noscript>此浏览器禁用了 JavaScript，无法使用 CarPlay。</noscript><ul id="browser-check-list" style="padding-left:22px"></ul><button id="browser-check-continue" disabled style="padding:12px 20px;font-size:18px">正在检测…</button><p id="browser-check-agent" style="word-wrap:break-word;font-size:12px"></p></section><script src="./browser-check.js"></script><main id="app">
+@@ -18 +19 @@
+-  <details><summary data-i18n="diagnostics"></summary><p id="capabilities"></p><p id="media-support"></p><p id="stats"></p><p data-i18n="micHint"></p><p id="mic-status"></p><p class="hint" data-i18n="privacy"></p></details>
++  <details><summary data-i18n="diagnostics"></summary><button id="browser-check-show" type="button">浏览器兼容性检测 / Browser check</button><p id="capabilities"></p><p id="media-support"></p><p id="stats"></p><p data-i18n="micHint"></p><p id="mic-status"></p><p class="hint" data-i18n="privacy"></p></details>
+@@ -22 +23 @@
+-<script type="module" src="/src/main.ts"></script></body></html>
++<script type="module" src="/src/boot.ts"></script></body></html>
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -194,0 +195,2 @@
++
++el('browser-check-show').onclick = () => (window as unknown as { F50BrowserCheck: { show(): void } }).F50BrowserCheck.show();
+--- a/web/src/style.css
++++ b/web/src/style.css
+@@ -11 +11 @@
+-#screen-container { position:absolute; inset:0; display:flex; justify-content:center; align-items:center; }
++#screen-container { position:absolute; top:0;right:0;bottom:0;left:0; inset:0; display:flex; justify-content:center; align-items:center; }
+@@ -14 +14 @@
+-#overlay { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:28px; text-align:center; background:#000; pointer-events:none; }
++#overlay { position:absolute; top:0;right:0;bottom:0;left:0; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:28px; text-align:center; background:#000; pointer-events:none; }
+@@ -17 +17 @@
+-#btn-settings { position:absolute; top:max(12px,env(safe-area-inset-top)); left:max(12px,env(safe-area-inset-left)); min-width:48px; padding:10px 12px; background:#252b33d9; border-color:#5a616b; display:flex; align-items:center; gap:8px; }
++#btn-settings { position:absolute; top:12px;top:max(12px,env(safe-area-inset-top)); left:12px;left:max(12px,env(safe-area-inset-left)); min-width:48px; padding:10px 12px; background:#252b33d9; border-color:#5a616b; display:flex; align-items:center; gap:8px; }
+@@ -39 +39 @@
+-#btn-fullscreen { position:absolute; top:max(12px,env(safe-area-inset-top)); right:max(12px,env(safe-area-inset-right)); display:flex; align-items:center; gap:8px; min-width:48px; min-height:48px; padding:10px 12px; background:#252b33c9; border-color:#77818e; }
++#btn-fullscreen { position:absolute; top:12px;top:max(12px,env(safe-area-inset-top)); right:12px;right:max(12px,env(safe-area-inset-right)); display:flex; align-items:center; gap:8px; min-width:48px; min-height:48px; padding:10px 12px; background:#252b33c9; border-color:#77818e; }
+--- /dev/null
++++ b/web/src/boot.ts
+@@ -0,0 +1,8 @@
++interface BrowserCheck { done: boolean; allowed: boolean; appReady(): void; appFailed(): void }
++const check = (window as unknown as { F50BrowserCheck?: BrowserCheck }).F50BrowserCheck;
++function start() {
++  if (!check) return; // Keep the independent diagnostic visible if its script failed.
++  if (!check.done) { setTimeout(start, 50); return; }
++  if (check.allowed) void import('./main').then(() => check.appReady()).catch(() => check.appFailed());
++}
++start();
+--- /dev/null
++++ b/web/public/browser-check.js
+@@ -0,0 +1,32 @@
++/* ES5 classic script: independent of the modern player bundle. */
++(function(w,d){
++ 'use strict';
++ var panel=d.getElementById('browser-check'), list=d.getElementById('browser-check-list'), title=d.getElementById('browser-check-title'), note=d.getElementById('browser-check-note'), button=d.getElementById('browser-check-continue');
++ var failures=0,pending=0,timer,api=w.F50BrowserCheck={done:false,allowed:false,ready:false};
++ function add(name,ok,required,detail){var row=d.createElement('li');row.style.marginBottom='10px';row.style.color=ok?'#b5edc9':required?'#ffb7ad':'#ffe3a1';row.appendChild(d.createTextNode((ok?'通过：':required?'缺少：':'受限：')+name+'。'+detail));list.appendChild(row);if(!ok&&required)failures++;}
++ function finish(){if(api.done||pending)return;api.done=true;api.allowed=failures===0;title.textContent=api.allowed?'浏览器基础检测通过':'此浏览器暂不能使用标准 CarPlay 模式';note.textContent=api.allowed?'正在加载播放器；实际画面、声音仍需连接后验证。':'缺失能力会造成黑屏或操作异常。请使用较新的浏览器；实验兼容模式仍在研究，当前未启用。';button.textContent=api.allowed?'正在加载播放器…':'标准模式不可用';if(api.allowed)timer=w.setTimeout(function(){if(!api.ready)api.appFailed();},12000);}
++ api.appReady=function(){api.ready=true;w.clearTimeout(timer);button.disabled=false;button.textContent='进入 CarPlay';note.textContent='播放器已启动。检测通过不代表已连接 iPhone；首次声音播放可能需要点击。';w.setTimeout(function(){if(api.allowed)panel.style.display='none';},2500);};
++ api.appFailed=function(){w.clearTimeout(timer);panel.style.display='block';title.textContent='播放器未正常启动';note.textContent='可能是现代 JavaScript 不兼容、脚本加载失败或初始化失败。请刷新或更新浏览器。';button.disabled=true;};
++ api.show=function(){panel.style.display='block';};button.onclick=function(){if(api.allowed&&api.ready)panel.style.display='none';};
++ d.getElementById('browser-check-agent').textContent='浏览器上报：'+w.navigator.userAgent;
++ add('HTTPS 安全上下文',w.isSecureContext===true,true,'视频解码需要安全上下文；证书页面必须能正常访问。');
++ add('WebSocket',typeof w.WebSocket==='function',true,'接收画面与发送触控。');
++ add('JavaScript 模块','noModule' in d.createElement('script'),true,'播放器还会验证现代脚本是否成功启动。');
++ add('Canvas',!!d.createElement('canvas').getContext('2d'),true,'绘制画面。');
++ add('Web Audio',!!w.AudioContext,true,'当前播放器初始化及辅助音轨需要。');
++ add('Pointer Events',!!w.PointerEvent,true,'画面内触控需要。');
++ add('设置弹窗',!!d.createElement('dialog').showModal,true,'打开设置需要。');
++ add('WebCodecs 视频解码',!!w.VideoDecoder,true,'缺少 VideoDecoder 无法显示标准模式画面。');
++ add('实验候选：MSE H.264 播放',!!w.MediaSource&&typeof w.MediaSource.isTypeSupported==='function'&&w.MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01F"'),false,'仅调查兼容路线，不代表兼容模式已经实现。');
++ add('AAC 原生音乐播放',!!w.MediaSource&&w.MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"'),false,'不支持时可能降级或没有声音，系统媒体控制也可能不可用。');
++ add('辅助音频解码',!!w.AudioDecoder,false,'缺少 AudioDecoder 时部分音轨不可用。');
++ add('全屏',!!d.documentElement.requestFullscreen,false,'不支持时仍可在窗口内显示。');
++ add('系统媒体控制',!!w.navigator.mediaSession,false,'用于车机系统媒体卡片与方向盘切歌。');
++ if(w.VideoDecoder&&typeof w.VideoDecoder.isConfigSupported==='function'){
++  pending++;var completed=false;
++  function result(ok,detail){if(completed)return;completed=true;add('H.264 解码探测',ok,true,detail);pending--;finish();}
++  w.setTimeout(function(){result(false,'检测超时，无法确认支持。');},5000);
++  try{w.VideoDecoder.isConfigSupported({codec:'avc1.42E01F',codedWidth:1280,codedHeight:720}).then(function(r){result(!!r.supported,'检测 720p 基础配置；手机实际编码与分辨率仍需连接后验证。');},function(){result(false,'浏览器拒绝检测请求。');});}catch(e){result(false,'浏览器无法检测该配置。');}
++ }else if(w.VideoDecoder)add('H.264 解码探测',false,true,'缺少 isConfigSupported。');
++ finish();
++}(window,document));
+--- /dev/null
++++ b/web/check-browser.mjs
+@@ -0,0 +1,19 @@
++import assert from 'node:assert/strict';
++import vm from 'node:vm';
++import fs from 'node:fs';
++import ts from 'typescript';
++const code=fs.readFileSync(new URL('./public/browser-check.js',import.meta.url),'utf8');
++const tree=ts.createSourceFile('classic.js',code,ts.ScriptTarget.ES5,true,ts.ScriptKind.JS);
++function syntax(n){assert(![ts.SyntaxKind.ArrowFunction,ts.SyntaxKind.ClassDeclaration,ts.SyntaxKind.TemplateExpression,ts.SyntaxKind.AwaitExpression].includes(n.kind));if(ts.isVariableDeclarationList(n))assert.equal(n.flags&(ts.NodeFlags.Let|ts.NodeFlags.Const),0);ts.forEachChild(n,syntax);} syntax(tree);
++function setup(modern,codec=true){
++ const nodes={}; function node(){return {style:{},children:[],disabled:true,appendChild(n){this.children.push(n);}};}
++ const d={getElementById(id){return nodes[id]??=node();},createElement(tag){const n=node();if(tag==='canvas')n.getContext=()=>({});if(modern&&tag==='script')n.noModule=false;if(modern&&tag==='dialog')n.showModal=()=>{};return n;},createTextNode(s){return s;},documentElement:modern?{requestFullscreen(){}}:{}};
++ const w={navigator:{userAgent:modern?'Modern':'Android 4.2.2 Firefox/68'},setTimeout(){return 1;},clearTimeout(){},isSecureContext:true,WebSocket:function(){}};
++ if(modern)Object.assign(w,{AudioContext:function(){},PointerEvent:function(){},AudioDecoder:function(){},VideoDecoder:{isConfigSupported:()=>Promise.resolve({supported:codec})},MediaSource:{isTypeSupported:()=>true}});
++ vm.runInNewContext(code,{window:w,document:d});return {w,nodes};
++}
++let old=setup(false);assert.equal(old.w.F50BrowserCheck.allowed,false);assert.equal(old.w.F50BrowserCheck.done,true);assert(old.nodes['browser-check-list'].children.some(n=>n.children[0].includes('缺少：WebCodecs')));
++let good=setup(true);await Promise.resolve();assert.equal(good.w.F50BrowserCheck.allowed,true);good.w.F50BrowserCheck.appReady();assert.equal(good.nodes['browser-check-continue'].disabled,false);
++let bad=setup(true,false);await Promise.resolve();assert.equal(bad.w.F50BrowserCheck.allowed,false);
++good.w.F50BrowserCheck.appFailed();assert.equal(good.nodes['browser-check'].style.display,'block');assert.equal(good.nodes['browser-check-continue'].disabled,true);
++console.log('Browser check: legacy API failures, supported browser, H264 rejection and bundle failure passed.');
+--- a/web/package.json
++++ b/web/package.json
+@@ -8 +8 @@
+-    "test": "node check.mjs && node check-audio.mjs && node check-car.mjs",
++    "test": "node check.mjs && node check-audio.mjs && node check-car.mjs && node check-browser.mjs",

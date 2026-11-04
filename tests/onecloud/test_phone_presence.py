@@ -14,6 +14,11 @@ spec.loader.exec_module(presence)
 
 
 class PresenceTests(unittest.TestCase):
+    def test_unplug_prefers_the_authenticated_cable_phone_over_previous_wireless(self):
+        self.assertEqual(presence.invite_phone({'last_phone': 'A'}, {'A', 'B'}, 'B'), 'B')
+        self.assertIsNone(presence.invite_phone({'last_phone': 'A'}, {'A'}, 'B'))
+        self.assertIsNone(presence.invite_phone({'last_phone': 'A', 'paused': ['B']}, {'A', 'B'}, 'B'))
+
     def test_boot_grant_not_repeated_by_service_restart(self):
         state = {}
         self.assertTrue(presence.grant_boot(state, 'boot-one'))
@@ -210,6 +215,79 @@ class BluezNotReadyTests(unittest.TestCase):
             networks = json.loads(state.read_text())['phones'][phone]['networks']
         self.assertEqual(networks['100.96.0.0/24'], {'ip': '100.96.0.234', 'mac': mac})
         self.assertEqual(networks['192.168.77.0/24']['ip'], '192.168.77.234', 'the old identity is kept for going back')
+
+class ActiveSessionTests(unittest.TestCase):
+    def test_viewer_pause_persists_and_cancels_only_its_pending_invitation(self):
+        import os, tempfile, types
+        phone, other = '02:00:00:00:00:01', '02:00:00:00:00:02'
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory, 'phone-presence.json')
+            state.write_text(json.dumps({'active': phone, 'phones': {phone: {}}}))
+            grant = state.with_name('pairing-request.json')
+            grant.write_text(json.dumps({'phone': phone}))
+            with patch.dict(os.environ, {'CARPLAY_PRESENCE_STATE': str(state), 'CARPLAY_PRESENCE_INTERFACE': 'test0'}), \
+                    patch.object(presence, 'paired_cached', return_value={phone}), \
+                    patch.object(presence, 'get_platform', return_value=types.SimpleNamespace(boot_id=lambda: 'boot')), \
+                    patch.object(presence.subprocess, 'check_output', side_effect=AssertionError('no ARP for pause')):
+                with patch.object(presence.sys, 'argv', ['x', 'pause', phone]):
+                    self.assertEqual(presence.main(), 0)
+                self.assertFalse(grant.exists())
+                self.assertEqual(json.loads(state.with_name('phone-paused.json').read_text())['phones'], [phone])
+                self.assertEqual(json.loads(state.read_text())['active'], phone, 'receiver clears the actual session')
+                grant.write_text(json.dumps({'phone': other}))
+                with patch.object(presence.sys, 'argv', ['x', 'pause', other]):
+                    self.assertEqual(presence.main(), 1)
+                self.assertEqual(json.loads(grant.read_text())['phone'], other)
+                with patch.object(presence.sys, 'argv', ['x', 'allowed', phone]):
+                    self.assertEqual(presence.main(), 1)
+                with patch.object(presence.sys, 'argv', ['x', 'switch', phone]):
+                    self.assertEqual(presence.main(), 0)
+                self.assertEqual(json.loads(state.with_name('phone-paused.json').read_text())['phones'], [])
+
+    def test_live_owner_is_reported_without_arp_and_page_offers_disconnect(self):
+        import os, tempfile, types
+        import settings_ui
+        phone = '02:00:00:00:00:01'
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory, 'phone-presence.json')
+            state.write_text(json.dumps({'phones': {phone: {}}}))
+            with patch.dict(os.environ, {'CARPLAY_PRESENCE_STATE': str(state), 'CARPLAY_PRESENCE_INTERFACE': 'test0'}), \
+                    patch.object(presence, 'paired_cached', return_value={phone}), \
+                    patch.object(presence, 'get_platform', return_value=types.SimpleNamespace(boot_id=lambda: 'boot')), \
+                    patch.object(presence.subprocess, 'check_output', side_effect=AssertionError('no interface probe for session state')), \
+                    patch.object(presence, 'probe', side_effect=AssertionError('no ARP required')):
+                with patch.object(presence.sys, 'argv', ['x', 'active', phone]):
+                    self.assertEqual(presence.main(), 0)
+                saved = json.loads(state.read_text())
+                self.assertEqual(saved['active'], phone)
+                self.assertEqual(saved['last_phone'], phone)
+                self.assertFalse(saved['phones'][phone].get('networks'), 'do not invent a Wi-Fi identity')
+                html = settings_ui.phone_rows({phone: 'Test iPhone'}, saved['active'], saved['last_phone'], 'nonce', False)
+                self.assertIn('value=disconnect', html)
+                self.assertNotIn('value=switch', html)
+                with patch.object(presence.sys, 'argv', ['x', 'idle']):
+                    self.assertEqual(presence.main(), 0)
+                self.assertNotIn('active', json.loads(state.read_text()))
+
+    def test_active_report_does_not_unpause_or_accept_unpaired_phone(self):
+        import os, tempfile, types
+        phone, other = '02:00:00:00:00:01', '02:00:00:00:00:02'
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory, 'phone-presence.json')
+            state.write_text(json.dumps({'phones': {phone: {}}}))
+            paused = state.with_name('phone-paused.json')
+            paused.write_text(json.dumps({'phones': [phone]}))
+            with patch.dict(os.environ, {'CARPLAY_PRESENCE_STATE': str(state), 'CARPLAY_PRESENCE_INTERFACE': 'test0'}), \
+                    patch.object(presence, 'paired_cached', return_value={phone}), \
+                    patch.object(presence, 'get_platform', return_value=types.SimpleNamespace(boot_id=lambda: 'boot')), \
+                    patch.object(presence.subprocess, 'check_output', side_effect=AssertionError('no network query')):
+                with patch.object(presence.sys, 'argv', ['x', 'active', phone]):
+                    self.assertEqual(presence.main(), 0)
+                self.assertEqual(json.loads(paused.read_text())['phones'], [phone])
+                with patch.object(presence.sys, 'argv', ['x', 'active', other]):
+                    self.assertEqual(presence.main(), 1)
+                self.assertEqual(json.loads(state.read_text())['active'], phone)
+
 
 if __name__ == '__main__':
     unittest.main()

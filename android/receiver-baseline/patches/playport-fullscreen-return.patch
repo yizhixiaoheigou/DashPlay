@@ -1,0 +1,142 @@
+Viewer: back from the reverse camera without a reconnect; one tap goes back to fullscreen (2026-10-12).
+
+On the Xpeng G6 the reverse camera hides the browser, which comes back out of fullscreen. The page then
+renegotiated the picture for the smaller window, a CarPlay restart of several seconds, and once more when
+fullscreen was entered again. A browser enters fullscreen only on a tap, so the page cannot do it by itself.
+Now an exit from fullscreen within 2 s of the page being hidden keeps the negotiated picture (shown scaled)
+and the next tap on the picture goes back to fullscreen instead of reaching CarPlay ("轻点画面恢复全屏");
+leaving fullscreen on purpose works as before. When the page is shown again it asks for a keyframe at once.
+The viewer log gets page events right away (ev 1 hidden, 2 shown, 3 fullscreen, 4 out of fullscreen) and
+counts music the car paused (musicSysPauses: another app took the sound).
+
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -180,9 +180,14 @@
+     el(id).dataset.fullscreen = String(full);
+   }
+ }
++/** The car shows something else over the page (reverse camera): the page is hidden and comes back out of
++ *  fullscreen (Xpeng G6, 2026-10-12). Such an exit keeps the picture as negotiated, and the next tap on the
++ *  picture goes back to fullscreen; a browser enters fullscreen only on a tap, never by itself. */
++let wantFullscreen = false, hiddenAt = -Infinity, exitedAt = -Infinity;
++const restoring = () => wantFullscreen && !document.fullscreenElement && !document.hidden;
+ async function toggleFullscreen() {
+   try {
+-    if (document.fullscreenElement) await document.exitFullscreen();
++    if (document.fullscreenElement) { wantFullscreen = false; await document.exitFullscreen(); }
+     else await document.documentElement.requestFullscreen();
+     if (panel.open) panel.close();
+   } catch { error(t('fullscreenFail')); }
+@@ -197,9 +202,22 @@
+   window.clearTimeout(toastTimer); toastTimer = window.setTimeout(() => { el('toast').hidden = true; }, 6000);
+ }
+ document.addEventListener('fullscreenchange', () => {
+-  updateFullscreen(); fit();
+-  if (document.fullscreenElement) toast(t('fullscreenHint')); else el('toast').hidden = true;
++  updateFullscreen(); fit(); pageEvent(document.fullscreenElement ? 3 : 4);
++  if (document.fullscreenElement) { wantFullscreen = true; toast(t('fullscreenHint')); return; }
++  el('toast').hidden = true; exitedAt = performance.now();
++  // Not hidden around the exit (within 2 s): the user left fullscreen on purpose.
++  window.setTimeout(() => { if (!document.hidden && Math.abs(exitedAt - hiddenAt) > 2000) wantFullscreen = false; }, 2000);
+ });
++function showRestoreHint() {
++  if (!restoring()) return;
++  window.clearTimeout(toastTimer); el('toast').textContent = t('tapFullscreen'); el('toast').hidden = false;
++}
++// Capture phase, ahead of the CarPlay input: this tap only goes back to fullscreen.
++for (const name of ['pointerdown', 'pointerup'] as const) window.addEventListener(name, event => {
++  if (!restoring() || !surface.contains(event.target as Node)) return;
++  event.stopPropagation(); event.preventDefault();
++  if (name === 'pointerup') void document.documentElement.requestFullscreen().catch(() => { wantFullscreen = false; el('toast').hidden = true; });
++}, { capture: true });
+ document.querySelectorAll<HTMLButtonElement>('[data-command]').forEach(button => button.onclick = () => {
+   const cmd = button.dataset.command;
+   if (cmd === 'home' || cmd === 'back') send({ type:'knob', knob:{ select:false, home:cmd==='home', back:cmd==='back', x:0,y:0,wheel:0 } });
+@@ -238,6 +256,7 @@
+   if (!display || !autoFit.checked || displayBusy) return;
+   const target=autoTarget();
+   if (!document.fullscreenElement && closeShape(display,target)) return;
++  if (restoring()) return;   // back from the reverse camera: the next tap restores the negotiated shape
+   const key=`${target.width}x${target.height}`;
+   if (!aspectChanged(display,target) || key===lastAutoTarget) return;
+   // Avoid a reconnect loop even when another viewer has a different screen shape.
+@@ -259,7 +278,16 @@
+   void saveDisplay({...size,fps:Number(el<HTMLSelectElement>('fps').value),uiScale:Number(el<HTMLSelectElement>('ui-scale').value),hevc:false});
+ };
+ new ResizeObserver(()=>{ fit(); scheduleAuto(); }).observe(screen);
+-document.addEventListener('visibilitychange',()=>{if(!document.hidden){fit();scheduleAuto();void unlock();}});
++document.addEventListener('visibilitychange',()=>{
++  pageEvent(document.hidden ? 1 : 2);
++  if (document.hidden) { hiddenAt = performance.now(); return; }
++  // The picture at once instead of the phone's next keyframe; then the sound.
++  send({ type:'keyframe' }); fit(); scheduleAuto(); void unlock(); showRestoreHint();
++});
++/** Straight into the viewer log, not only every 10 s: ev 1 hidden, 2 shown, 3 fullscreen, 4 out of fullscreen. */
++function pageEvent(ev: number) {
++  send({type:'stats',stats:{ev,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,width:screen.clientWidth,height:screen.clientHeight,want:wantFullscreen?1:0}});
++}
+ window.setInterval(()=>{
+   const now=performance.now(),fps=frames*1000/Math.max(1,now-lastStats);frames=0;lastStats=now;
+   el('stats').textContent=painted?`${canvas.width} × ${canvas.height} / ${fps.toFixed(0)} fps / ${t('latency')} ${video.decodeLatencyMs.toFixed(0)} ms`:t('noStream');
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -8,7 +8,7 @@
+   starting: ['已连接，正在等待画面…', 'Connected. Waiting for video…'], live: ['已连接', 'Connected'],
+   access: ['需要首次登录链接', 'First-time access link required'], accessHint: ['请使用私有访问资料中的完整链接打开一次，此浏览器会记住登录。', 'Open the complete link from your private access file once. This browser will remember it.'],
+   sound: ['轻点启用声音', 'Tap to enable sound'], volume: ['音量', 'Volume'],
+-  display: ['画面', 'Display'], fullscreen: ['全屏', 'Fullscreen'], exitFullscreen: ['退出全屏', 'Exit fullscreen'], fullscreenHint: ['已全屏。退出全屏：点 CarPlay 主屏幕上的「盒子设置」图标，再点「退出全屏」。', 'Fullscreen on. To exit, tap the Box settings icon on the CarPlay home screen, then Exit fullscreen.'], fullscreenFail: ['此浏览器不允许全屏，画面仍会自动适配窗口。', 'Fullscreen unavailable. The picture still fits this window.'],
++  display: ['画面', 'Display'], fullscreen: ['全屏', 'Fullscreen'], exitFullscreen: ['退出全屏', 'Exit fullscreen'], fullscreenHint: ['已全屏。退出全屏：点 CarPlay 主屏幕上的「盒子设置」图标，再点「退出全屏」。', 'Fullscreen on. To exit, tap the Box settings icon on the CarPlay home screen, then Exit fullscreen.'], fullscreenFail: ['此浏览器不允许全屏，画面仍会自动适配窗口。', 'Fullscreen unavailable. The picture still fits this window.'], tapFullscreen: ['轻点画面恢复全屏', 'Tap the picture to go back to fullscreen'],
+   auto: ['自动匹配屏幕', 'Match the screen'], autoHint: ['自动匹配让画面铺满当前窗口，进入或退出全屏时 CarPlay 会重连一次。只在一个显示端开启。', 'Matching fills the current window; entering or leaving fullscreen reconnects CarPlay once. Turn it on for one display only.'],
+   width: ['宽度', 'Width'], height: ['高度', 'Height'], apply: ['应用并重连', 'Apply and reconnect'],
+   nightMode: ['夜间模式', 'Night mode'], nightSchedule: ['自动（18:30–06:30 为夜间）', 'Auto (night 18:30–06:30)'], nightSystem: ['跟随车机浏览器深色模式', 'Follow car browser dark mode'], nightDay: ['始终白天', 'Always day'], nightNight: ['始终夜间', 'Always night'],
+--- a/web/src/music-output.ts
++++ b/web/src/music-output.ts
+@@ -37,7 +37,8 @@
+   private recent:{sample:number;length:number;data:Uint8Array}[]=[];
+   private realign:{offset:number;from:number;duration:number}|null=null;
+   /** For the viewer log: the element waited for audio, skipped ahead, moved onto the song's timeline. */
+-  private counts={musicWaits:0,musicSkips:0,musicAligns:0};
++  private counts={musicWaits:0,musicSkips:0,musicAligns:0,musicSysPauses:0};
++  private pausing=false;
+   private readonly rate:number;
+   private readonly channels:number;
+   readonly configKey: string;
+@@ -47,7 +48,8 @@
+     document.body.append(this.element);
+     this.element.addEventListener('playing',()=>{this.running=true;});
+     this.element.addEventListener('waiting',()=>{this.running=false;if(this.started&&!this.element.paused)this.counts.musicWaits++;});
+-    this.element.addEventListener('pause',()=>{this.running=false;});
++    // Paused by the car (another app took the sound), not by this page.
++    this.element.addEventListener('pause',()=>{this.running=false;if(!this.pausing&&!this.closed)this.counts.musicSysPauses++;this.pausing=false;});
+     this.element.addEventListener('error',()=>{if(!this.closed)this.onError('Music playback: '+(this.element.error?.message||'media error'));});
+     this.pending.push(kind==='flac'?flacInit(config.sampleRate,config.channels):aacInit(config.sampleRate,config.channels,config.description));
+     this.source.addEventListener('sourceopen',()=>{
+@@ -58,7 +60,7 @@
+   }
+   get unlocked(){return !this.element.paused;}
+   get playing(){return this.running&&!this.element.paused&&performance.now()-this.lastPacket<1800;}
+-  pause(){this.element.pause();this.running=false;this.frames=[];this.pcm=[];this.pcmBytes=0;}
++  pause(){this.pausing=!this.element.paused;this.element.pause();this.running=false;this.frames=[];this.pcm=[];this.pcmBytes=0;}
+   unlock(){
+     // Not right at the end: playing from the last sample ran dry at once, a crackle on opening the page.
+     const b=this.buffer;
+@@ -96,7 +98,7 @@
+     this.pending.push(data);this.recent.push({sample:this.samples,length,data});this.samples+=length;
+     while(this.recent.length&&this.recent[0].sample<this.samples-5*this.rate)this.recent.shift();
+   }
+-  report():Record<string,number>{const counts=this.counts;this.counts={musicWaits:0,musicSkips:0,musicAligns:0};return counts;}
++  report():Record<string,number>{const counts=this.counts;this.counts={musicWaits:0,musicSkips:0,musicAligns:0,musicSysPauses:0};return counts;}
+   /** A car's media card may show this element's own timeline instead of the song's (2026-10-12 drive: it ran on
+    *  from the start of the music, 0 to 671 s, duration unknown, while the song was at 8 of 269 s). */
+   follow(song:SongTimeline|null){
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -96,7 +96,7 @@
+   clock=100;buffer.listeners.updateend();
+   assert.equal(element.currentTime,8,'then what was being heard is the song position');assert.equal(source.duration,269,'with the song duration');
+   assert.equal(buffer.timestampOffset,8-600,'and the audio not heard yet is replayed on that timeline');
+-  assert.deepEqual(music.report(),{musicWaits:0,musicSkips:0,musicAligns:1},'Counted for the viewer log');
++  assert.deepEqual(music.report(),{musicWaits:0,musicSkips:0,musicAligns:1,musicSysPauses:0},'Counted for the viewer log');
+   log.length=0;element.currentTime=9;buffer.ranges=[[8.1,9.6]];
+   clock=1000;music.follow({position:9,duration:269,key:'A',playing:true});
+   assert.ok(!log.some(x=>x.startsWith('remove')),'Following the same song moves nothing');

@@ -1,0 +1,115 @@
+Receiver: a wireless session nobody watches ends after 2 min; a page opening invites the iPhone again (2026-10-13).
+
+At home with the F50 on all day the iPhone stayed in wireless CarPlay without any page open: it kept encoding and
+sending its screen (about 18 frames/s, 0.8 Mbit/s, plus music) over Wi-Fi with Bluetooth on, drew more than a USB
+port gives (-587 mA while plugged in) and ran hot and slow; with the F50 off it was fine within minutes. A real car
+ends CarPlay at switch-off. Now the supervisor releases a wireless session after 2 min without a viewer (the
+Bluetooth link and the session) and invites nobody until a page connects; then it invites as before (the phone
+must be on the box's Wi-Fi). The boot invitation keeps its 2 min for the head unit's page; a phone on the cable
+is never released. On the F50: released 2 min after boot with no page and not reconnected for 6 min; a page
+opened in headless Chrome showed the picture 7.1 s later (invitation 2.7 s after opening, live 4 s after that).
+
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -34,6 +34,9 @@
+  * The desktop CarPlay receiver: RTSP listener, mDNS advertisement, media bridge to browsers and
+  * (optionally) the wireless Bluetooth bootstrap.
+  */
++/** What the supervisor does about a wireless session nobody watches (CarPlayServer.idleAction). */
++enum class IdleAction { NONE, RELEASE, WAIT, RESUME }
++
+ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigStore? = null) : Closeable {
+     private val log = LoggerFactory.getLogger("playport")
+ 
+@@ -499,13 +502,38 @@
+         if (!config.wireless) return
+         Thread({
+             var absentChecks = 0
++            var viewerSeenAt = System.nanoTime() / 1_000_000   // the boot invitation has the full wait for a page
++            var parked = false
+             while (!closed.get()) {
+                 try {
+                     Thread.sleep(SUPERVISOR_INTERVAL_MS)
+                     if (closed.get()) return@Thread
+                     val now = System.nanoTime() / 1_000_000
+                     // The phone on the cable owns CarPlay; its session is no Wi-Fi presence either.
+-                    if (cablePhone) continue
++                    if (cablePhone) { viewerSeenAt = now; continue }
++                    if (hub.viewerCount > 0) viewerSeenAt = now
++                    when (idleAction(now, viewerSeenAt, activeSession != null, parked)) {
++                        IdleAction.RELEASE -> {
++                            parked = true
++                            log.info("no viewer for {} s: CarPlay released until a page opens", IDLE_RELEASE_MS / 1000)
++                            synchronized(this@CarPlayServer) {
++                                ++wirelessGeneration
++                                val link = wireless
++                                wireless = null
++                                link?.close()
++                            }
++                            runCatching { activeSession?.close() }
++                            continue
++                        }
++                        IdleAction.WAIT -> continue
++                        IdleAction.RESUME -> {
++                            parked = false
++                            log.info("a viewer opened the page: inviting the iPhone again")
++                            restartWireless()
++                            continue
++                        }
++                        IdleAction.NONE -> {}
++                    }
+                     if (activeSession != null) {
+                         lastBootstrapAt = now
+                         absentChecks = 0
+@@ -720,5 +748,17 @@
+         private const val HANDOFF_ADMIT_MS = 30_000L
+         private const val HANDOFF_JOIN_MS = 25_000L
+         private const val HANDOFF_RETRY_WINDOW_MS = 20_000L
++
++        /** A wireless session nobody watches ends after this; the iPhone kept encoding and sending its screen and
++         *  ran hot and slow at home with the F50 on all day (2026-10-13). A real car ends it at switch-off. */
++        const val IDLE_RELEASE_MS = 120_000L
++
++        /** [viewerSeenAt]: when a page last watched (or the box started). Parked: released, no invitations
++         *  until a page opens again. */
++        fun idleAction(now: Long, viewerSeenAt: Long, session: Boolean, parked: Boolean): IdleAction = when {
++            parked -> if (viewerSeenAt >= now) IdleAction.RESUME else IdleAction.WAIT
++            session && now - viewerSeenAt >= IDLE_RELEASE_MS -> IdleAction.RELEASE
++            else -> IdleAction.NONE
++        }
+     }
+ }
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -126,6 +126,8 @@
+ 
+     /** Invoked (once per client) when a browser is ready to receive; used to request a keyframe. */
+     @Volatile var onViewerJoined: ((Int) -> Unit)? = null
++    /** Pages connected to watch (the supervisor releases CarPlay when there are none for a while). */
++    val viewerCount: Int get() = clients.size
+ 
+     /** Applies a display change; returns null on success or an error message. */
+     @Volatile var onApplyDisplay: ((Int, Int, Int, Int, Boolean) -> String?)? = null
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/IdleReleaseTest.kt
+@@ -0,0 +1,20 @@
++package com.playport.server
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++/** Nobody watching for 2 min: the iPhone leaves CarPlay until a page opens (it ran hot at home, 2026-10-13). */
++class IdleReleaseTest {
++    private val wait = CarPlayServer.IDLE_RELEASE_MS
++
++    @Test fun aSessionNobodyWatchesIsReleasedAfterTheWait() {
++        assertEquals(IdleAction.NONE, CarPlayServer.idleAction(now = wait - 1, viewerSeenAt = 0, session = true, parked = false))
++        assertEquals(IdleAction.RELEASE, CarPlayServer.idleAction(now = wait, viewerSeenAt = 0, session = true, parked = false))
++        assertEquals(IdleAction.NONE, CarPlayServer.idleAction(now = wait, viewerSeenAt = 0, session = false, parked = false))
++    }
++
++    @Test fun parkedUntilAViewerComesBack() {
++        assertEquals(IdleAction.WAIT, CarPlayServer.idleAction(now = 10 * wait, viewerSeenAt = 0, session = false, parked = true))
++        assertEquals(IdleAction.RESUME, CarPlayServer.idleAction(now = 10 * wait, viewerSeenAt = 10 * wait, session = false, parked = true))
++    }
++}

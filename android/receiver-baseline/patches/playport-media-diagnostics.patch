@@ -1,0 +1,55 @@
+Viewer log: what the car's media card can show (2026-10-12).
+
+On the Phicomm N1 (wired) the iPhone reports the elapsed time about every 0.45 s and the box forwards
+correct durations and positions, yet the car's media card showed wrong times. To see whether that card can
+take a Media Session position at all or reads the music element's own timeline instead, the page's
+10-second stats now carry the Chrome major version, whether it is an Android WebView, setPositionState
+support, the song position/duration it gives the card, and the music element's currentTime/duration.
+
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -45,6 +45,7 @@
+   clock=12000;media.setMetadata({title:'Run',artist:'',album:'',durationMs:200000,positionMs:62000,playing:false,revision:3});
+   clock=20000;media.setPlaying(false);assert.equal(positions.at(-1).position,62,'Paused on the iPhone: the clock stands');
+   Object.defineProperty(performance,'now',{value:realNow,configurable:true,writable:true}); }
++assert.deepEqual(media.report(),{positionState:1,songPos:62,songDur:200},'The viewer log tells whether the OS card can take our song position');
+ media.setActive(false);assert.equal(navigator.mediaSession.playbackState,'none');assert.equal(navigator.mediaSession.metadata,null);
+ // Music must take exactly one route; voice/navigation keep the existing Web Audio path.
+ const edges=[];let music;let packets=0;
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -261,11 +261,19 @@
+   el('audio-unlock').hidden=!active||audio.isUnlocked;
+   el('audio-status').textContent=t(audio.isPlaying?'playing':'paused');media.setPlaying(audio.isPlaying);
+ },750);
++// Which browser the car runs and the music element's own timeline, which an OS media card may show instead of the song's.
++const chromeMajor=Number(/Chrome\/(\d+)/.exec(navigator.userAgent)?.[1] ?? 0),webView=/; wv\)/.test(navigator.userAgent)?1:0;
++function musicTimeline(): Record<string, number> {
++  const element=document.getElementById('carplay-music') as HTMLAudioElement|null;
++  if(!element) return {};
++  return {elTime:Math.round(element.currentTime),elDur:Number.isFinite(element.duration)?Math.round(element.duration):-1};
++}
+ window.setInterval(()=>{
+   const now=performance.now(),seconds=Math.max(1,(now-reportStart)/1000);
+   send({type:'stats',stats:{fps:reportFrames/seconds,decodeMs:video.decodeLatencyMs,queue:video.decodeQueueSize,
+     kbps:reportBytes*8/1000/seconds,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,
+-    width:canvas.width,height:canvas.height,...(touchCount?{touchMs:touchSum/touchCount,touches:touchCount}:{}),...(musicBytes?{musicKbps:musicBytes*8/1000/seconds}:{})}});
++    width:canvas.width,height:canvas.height,...(touchCount?{touchMs:touchSum/touchCount,touches:touchCount}:{}),...(musicBytes?{musicKbps:musicBytes*8/1000/seconds}:{}),
++    chrome:chromeMajor,webView,...media.report(),...musicTimeline()}});
+   reportFrames=0;reportBytes=0;reportStart=now;touchSum=0;touchCount=0;musicBytes=0;
+ },10000);
+ render();fit();if(token) connection.connect();
+--- a/web/src/media-session.ts
++++ b/web/src/media-session.ts
+@@ -38,6 +38,11 @@
+     if (this.supported) navigator.mediaSession.metadata = this.active && typeof MediaMetadata !== "undefined" ? new MediaMetadata(this.info) : null;
+   }
+   readonly supported = 'mediaSession' in navigator;
++  /** For the box's viewer log: can the OS media card take our song position at all, and which one we give it. */
++  report(): Record<string, number> {
++    const positionState = this.supported && typeof navigator.mediaSession.setPositionState === 'function' ? 1 : 0;
++    return this.duration > 0 ? { positionState, songPos: Math.round(this.positionNow()), songDur: Math.round(this.duration) } : { positionState };
++  }
+   constructor(private readonly send: (message: ClientMessage) => void, unlock: () => void, pause: () => void = () => {}) {
+     if (!this.supported) return;
+     const handlers: Partial<Record<MediaSessionAction, () => void>> = {

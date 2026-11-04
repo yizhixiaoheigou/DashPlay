@@ -295,10 +295,13 @@ class SignedReleaseTests(unittest.TestCase):
 
     def test_the_fastest_source_is_measured_and_used_first_even_before_github(self):
         # Before 2026-11-01 GitHub came first: a GitHub that trickles never failed, so no mirror was ever tried.
-        self.publish({'format': 1, 'version': '2026.10.20', 'online': True})
+        # The manifest is padded so the measured file is large: at ~1 KB the fetch is 0.02-0.3 s of connection
+        # setup for either source, the 20 KB/s trickle never shows, and the order flipped at random (2026-11-04).
+        # 32 KB at 20 KB/s is 1.6 s of trickle, far above that jitter.
+        self.publish({'format': 1, 'version': '2026.10.20', 'online': True, 'padding': 'x' * 60_000})
         self.server.kinds['gh'] = 'slow'
         fast, dead = self.server.at('fast'), 'http://127.0.0.1:1/'
-        with patch.object(update, 'MIRRORS', (dead, fast)), patch.object(update, 'SAMPLE', 4096):
+        with patch.object(update, 'MIRRORS', (dead, fast)), patch.object(update, 'SAMPLE', 32768):
             self.assertEqual(update.latest_manifest(self.root, False, self.pub)['version'], '2026.10.20')
             state = update.sources_state(self.root)
             self.assertEqual([r['source'] for r in state['ranking'] if 'speed' in r], [fast, ''])

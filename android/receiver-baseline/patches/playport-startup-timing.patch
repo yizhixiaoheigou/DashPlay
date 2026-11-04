@@ -1,0 +1,328 @@
+diff --git a/web/src/boot.ts b/web/src/boot.ts
+--- a/web/src/boot.ts
++++ b/web/src/boot.ts
+@@ -1,9 +1,11 @@
++import { startup } from './startup';
++startup.mark('bootMs');
+ interface BrowserCheck { done: boolean; allowed: boolean; appReady(): void; appFailed(): void }
+ const check = (window as unknown as { F50BrowserCheck?: BrowserCheck }).F50BrowserCheck;
+ function start() {
+   if (!check) return; // Keep the independent diagnostic visible if its script failed.
+   if (!check.done) { setTimeout(start, 50); return; }
+-  if (check.allowed) void access().then(() => import('./main')).then(() => check.appReady()).catch(() => check.appFailed());
++  if (check.allowed) void access().then(() => { startup.mark('accessMs'); return import('./main'); }).then(() => check.appReady()).catch(() => check.appFailed());
+ }
+ /** The viewer token the box hands to pages on its network, read from the box's own address only: a script any
+  *  site could include gave it away (audit 2026-10-13). Without a box (development) the token comes from the URL. */
+@@ -19,7 +21,7 @@
+     // mode (dashplay.main.tesla_mode) sets both.
+     const flags = window as unknown as { playportCarMusic?: boolean; playportTeslaMode?: boolean };
+     flags.playportTeslaMode = value.tesla === true;
+-    flags.playportCarMusic = value.carMusic === true || value.tesla === true;
++    flags.playportCarMusic = value.carMusic === true || (value.carMusic === undefined && value.tesla === true);
+   } catch { /* No box behind this page, or storage blocked: the page asks for a token as before. */ }
+ }
+ start();
+diff --git a/web/src/main.ts b/web/src/main.ts
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -1,3 +1,4 @@
++import { startup, startupStats } from './startup';
+ import { AudioEngine } from './audio';
+ import { InputController } from './input';
+ import { MicrophoneUplink } from './mic';
+@@ -108,6 +109,7 @@
+ function send(message: ClientMessage) { if (active) connection.send(message); }
+ const video = new VideoPlayer(canvas, error, () => {
+   if (!active) return;
++  if (!shownOnce) { startup.mark('firstFrameMs'); connection.send({type:'stats', stats:{ev:16,...startupStats()}}); }
+   frames++; reportFrames++; painted = true; shownOnce = true; el('overlay').hidden = true; el('app').dataset.live = 'true';
+   if (holding) { holding = false; el('toast').hidden = true; }
+   if (wokeAt) { lifeEvent(14, { pictureMs: Math.round(performance.now() - wokeAt) }); wokeAt = 0; }
+@@ -151,6 +153,7 @@
+   const frame = new Uint8Array(payload.length + 1); frame[0] = opus ? 0x11 : 0x10; frame.set(payload, 1); connection.sendBinary(frame);
+ }, message => { el('mic-status').textContent = message; });
+ const connection = new Connection(token, {
++  onTiming(stats) { connection.send({type:'stats', stats:{ev:16,...stats}}); },
+   onWire(message) {
+     switch (message.kind) {
+       case 'video-config': video.configure(message); break;
+@@ -491,7 +494,7 @@
+   send({type:'stats',stats:{fps:reportFrames/seconds,decodeMs:video.decodeLatencyMs,queue:video.decodeQueueSize,
+     kbps:reportBytes*8/1000/seconds,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,
+     width:canvas.width,height:canvas.height,...(touchCount?{touchMs:touchSum/touchCount,touches:touchCount}:{}),...(musicBytes?{musicKbps:musicBytes*8/1000/seconds}:{}),
+-    chrome:chromeMajor,build:BUILD,webView,carMusic:carMusic?1:0,teslaMode:teslaMode?1:0,promptGain,...(revived?{revived}:{}),fastDecoder:fastDecoder()?1:0,hevcDecodes:hevcDecodes?1:0,hevc:display?.hevc?1:0,...microphone.report(),...audio.farReport(),...media.report(),...musicTimeline(),...audio.musicReport(),...video.takeStalls(),...lag.take(performance.now())}});
++    ...startupStats(),chrome:chromeMajor,build:BUILD,webView,carMusic:carMusic?1:0,teslaMode:teslaMode?1:0,promptGain,...(revived?{revived}:{}),fastDecoder:fastDecoder()?1:0,hevcDecodes:hevcDecodes?1:0,hevc:display?.hevc?1:0,...microphone.report(),...audio.farReport(),...media.report(),...musicTimeline(),...audio.musicReport(),...video.takeStalls(),...lag.take(performance.now())}});
+   judgeDecoder(video.decodeLatencyMs, reportFrames/seconds);
+   reportFrames=0;reportBytes=0;reportStart=now;touchSum=0;touchCount=0;musicBytes=0;
+ },10000);
+diff --git a/web/src/ws.ts b/web/src/ws.ts
+--- a/web/src/ws.ts
++++ b/web/src/ws.ts
+@@ -1,3 +1,4 @@
++import { startup, startupStats } from './startup';
+ import { parseWireMessage, type ClientMessage, type ServerMessage, type WireMessage } from './protocol';
+ 
+ export type ConnectionState = 'connecting' | 'open' | 'closed';
+@@ -14,6 +15,7 @@
+   onServer: (message: ServerMessage) => void;
+   onState: (state: ConnectionState) => void;
+   onBytes?: (count: number) => void;
++  onTiming?: (stats: Record<string, number>) => void;
+ }
+ 
+ /** Reconnecting WebSocket client for the playport server. */
+@@ -40,10 +42,11 @@
+     const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+     // page: this page's id, so the box replaces this page's old link at once when it connects again.
+     const url = `${scheme}://${location.host}/ws?token=${encodeURIComponent(this.token)}&page=${PAGE_ID}`;
++    startup.mark('wsNewMs');
+     const socket = new WebSocket(url);
+     socket.binaryType = 'arraybuffer';
+     this.socket = socket;
+-    let opened = false, openedAt = 0;
++    let opened = false, openedAt = 0, firstMessage = true;
+     // After a Tesla unfroze its browser (reverse gear, 2026-10-14) a new socket hung half-open, neither open nor
+     // closed, and the page said "connecting" until refreshed: one that is not open in time is left for another.
+     // A timer that runs late means the page was frozen meanwhile: the socket may have opened with its "open" not
+@@ -63,10 +66,13 @@
+       opened = true; openedAt = performance.now();
+       this.retryDelayMs = 500;
+       this.failures = 0;
++      startup.mark('wsOpenMs');
+       this.handlers.onState('open');
++      this.handlers.onTiming?.(startupStats());
+     });
+     socket.addEventListener('message', (event: MessageEvent<string | ArrayBuffer>) => {
+       if (this.socket !== socket) return;   // a socket left by restart()
++      if (firstMessage) { firstMessage = false; startup.mark('wsFirstMs'); this.handlers.onTiming?.(startupStats()); }
+       if (typeof event.data === 'string') {
+         try {
+           this.handlers.onServer(JSON.parse(event.data) as ServerMessage);
+diff --git a/web/check-car.mjs b/web/check-car.mjs
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -216,3 +216,24 @@
+   assert.ok(Date.now()-started<1000,'gives up at the timeout');
+ }
+ console.log('Tesla fullscreen: only with its video sites reachable.');
++
++{ // Refresh timing must survive reconnects and never confuse connection time with the first painted frame.
++  const {StartupTiming}=await load('startup'); let clock=12;
++  const timing=new StartupTiming(()=>clock); timing.mark('bootMs');
++  clock=10010;timing.mark('wsNewMs');clock=10030;timing.mark('wsOpenMs');
++  clock=10040;timing.mark('wsFirstMs');clock=11600;timing.mark('firstFrameMs');
++  clock=20000;timing.mark('wsNewMs');
++  assert.deepEqual(timing.snapshot(),{navStartMs:0,bootMs:12,wsNewMs:10010,wsOpenMs:10030,wsFirstMs:10040,firstFrameMs:11600});
++  const copy=timing.snapshot();copy.wsOpenMs=0;assert.equal(timing.snapshot().wsOpenMs,10030);
++}
++
++{ // Tesla browser UI can keep sound in the webpage: explicit false wins over the legacy Tesla default.
++  const savedWindow=globalThis.window, savedFetch=globalThis.fetch, savedStorage=globalThis.localStorage;
++  globalThis.window={};globalThis.localStorage={setItem(){}};
++  const {access}=await load('boot',s=>s.replace(/^import .*?;$/gm,'const startup={mark(){}};').replace('async function access()', 'export async function access()'));
++  for(const [flags,want] of [[{tesla:true},true],[{tesla:true,carMusic:false},false],[{tesla:false,carMusic:true},true]]) {
++    globalThis.fetch=async()=>({ok:true,json:async()=>flags});await access();
++    assert.equal(window.playportCarMusic,want);assert.equal(window.playportTeslaMode,flags.tesla);
++  }
++  globalThis.window=savedWindow;globalThis.fetch=savedFetch;globalThis.localStorage=savedStorage;
++}
+diff --git a/server/src/main/kotlin/com/playport/server/WebHub.kt b/server/src/main/kotlin/com/playport/server/WebHub.kt
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -3,6 +3,9 @@
+ import com.shilapi.xcertplay.airplay.AudioFormat
+ import com.shilapi.xcertplay.airplay.VideoCodec
+ import io.ktor.server.application.Application
++import io.ktor.server.application.call
++import io.ktor.server.application.ApplicationCallPipeline
++import io.ktor.util.AttributeKey
+ import io.ktor.server.application.install
+ import io.ktor.server.plugins.origin
+ import io.ktor.server.request.receiveText
+@@ -284,17 +287,37 @@
+         }
+     }
+ 
++    private val recoveringStreams = ConcurrentHashMap.newKeySet<Int>()
++
++    /** The phone command can wait on its event socket. Never hold the viewer's Netty reader/writer behind it.
++     * Coalesce recovery per stream so a stalled phone cannot accumulate an unbounded number of workers. */
++    private fun requestKeyframe(type: Int) {
++        val handler = onViewerJoined ?: return
++        if (!recoveringStreams.add(type)) return
++        val job = scope.launch(Dispatchers.IO) {
++            val started = System.nanoTime()
++            try { handler(type) }
++            catch (error: Exception) { log.warn("keyframe request failed stream={} kind={}", type, error.javaClass.simpleName) }
++            finally { log.info("keyframe request stream={} elapsedMs={}", type, (System.nanoTime() - started) / 1_000_000) }
++        }
++        job.invokeOnCompletion { recoveringStreams.remove(type) }
++    }
++
+     private fun maybeRequestKeyframe(client: WsClient, type: Int) {
+         val now = System.nanoTime()
+         val last = client.keyframeRequested.get()
+         if (now - last > KEYFRAME_REQUEST_INTERVAL_NS && client.keyframeRequested.compareAndSet(last, now)) {
+-            onViewerJoined?.invoke(type)
++            requestKeyframe(type)
+         }
+     }
+ 
+     /** Ktor module: WebSocket endpoint with token auth plus status API. */
+     fun install(application: Application, webRoot: Path) {
+         application.install(WebSockets)
++        val wsReceived = AttributeKey<Long>("dashplayWsReceived")
++        application.intercept(ApplicationCallPipeline.Monitoring) {
++            if (call.request.uri.substringBefore('?') == "/ws") call.attributes.put(wsReceived, System.nanoTime())
++        }
+         application.routing {
+             get("/api/status") {
+                 call.respondText(statusJson(), io.ktor.http.ContentType.Application.Json)
+@@ -347,6 +370,8 @@
+                     close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "invalid token"))
+                     return@webSocket
+                 }
++                val upgradedAt = System.nanoTime()
++                val upgradeMs = (upgradedAt - (call.attributes.getOrNull(wsReceived) ?: upgradedAt)) / 1_000_000
+                 val client = WsClient(Channel(capacity = SEND_QUEUE_CAPACITY))
+                 client.page = call.request.queryParameters["page"]?.take(32)?.filter { it.isLetterOrDigit() } ?: ""
+                 client.session = this
+@@ -359,6 +384,7 @@
+                 clients.add(client)
+                 val from = "${call.request.origin.remoteHost}:${call.request.origin.remotePort}"
+                 log.info("viewer connected client={} from={} page={} viewers={}", client.id, from, client.page, clients.size)
++                log.info("viewer upgraded client={} epochMs={} upgradeMs={}", client.id, System.currentTimeMillis(), upgradeMs)
+                 var ending = "page closed"
+                 val wsSession = this
+                 val writer = launch {
+@@ -423,14 +449,17 @@
+                     audioFormatByStream.forEach { (type, format) ->
+                         client.offer(Frame.Binary(true, Wire.audioConfig(type, format)))
+                     }
+-                    configByStream.keys.forEach { streamType -> onViewerJoined?.invoke(streamType) }
++                    val readyAt = System.nanoTime()
++                    configByStream.keys.forEach { streamType -> requestKeyframe(streamType) }
++                    log.info("viewer ready client={} setupMs={} keyframeQueueMs={}", client.id,
++                        (System.nanoTime() - upgradedAt) / 1_000_000, (System.nanoTime() - readyAt) / 1_000_000)
+                     for (frame in incoming) {
+                         val heardAt = System.nanoTime()
+                         if (client.wasPaused) {
+                             // Back from a freeze on the same link: a fresh keyframe at once.
+                             client.wasPaused = false
+                             log.info("viewer resumed client={} after {} ms", client.id, (heardAt - client.lastHeard.get()) / 1_000_000)
+-                            configByStream.keys.forEach { streamType -> onViewerJoined?.invoke(streamType) }
++                            configByStream.keys.forEach { streamType -> requestKeyframe(streamType) }
+                         }
+                         client.lastHeard.set(heardAt)
+                         if (frame is Frame.Binary) {
+@@ -454,7 +483,7 @@
+                         if (message.type == "ack") {
+                             message.mark?.let { client.lag.acked(it, System.nanoTime()) }
+                         } else if (message.type == "keyframe") {
+-                            configByStream.keys.forEach { streamType -> onViewerJoined?.invoke(streamType) }
++                            configByStream.keys.forEach { streamType -> requestKeyframe(streamType) }
+                         } else if (message.type == "stats") {
+                             log.info(statsLine(client.id, client.videoSent.get(), client.videoDropped.get(),
+                                 client.bytesSent.get(), message.stats.orEmpty()))
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -393,13 +393,21 @@
+         }
+     }
+ 
++    private var touchDownIds = emptySet<Int>()
++
+     private fun routeInput(message: ClientMessage) {
+         val session = activeSession ?: return
+         try {
+             when (message.type) {
+-                "touch" -> session.sendTouch(
+-                    message.contacts.map { AirPlayContact(it.id, it.x, it.y, it.down) },
+-                )
++                "touch" -> {
++                    val down = message.contacts.filter { it.down }.map { it.id }.toSet()
++                    val receivedMs = System.currentTimeMillis()
++                    val sent = session.sendTouch(message.contacts.map { AirPlayContact(it.id, it.x, it.y, it.down) })
++                    // Only down/up transitions, never positions or every drag packet. Correlate with packet counts.
++                    if (down != touchDownIds || !sent) log.info("touch forwarded receivedMs={} epochMs={} down={} sent={}",
++                        receivedMs, System.currentTimeMillis(), down.size, sent)
++                    touchDownIds = down
++                }
+                 "media" -> message.media?.let {
+                     // Media keys from the page (1 play, 2 pause, 3 toggle, 4 next, 5 previous): the log then tells a
+                     // pause from the car's media card or steering wheel apart from one made on the CarPlay screen.
+diff --git a/web/src/startup.ts b/web/src/startup.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/startup.ts
+@@ -0,0 +1,14 @@
++/** Milliseconds since this navigation, shared by boot and the viewer. No URLs or tokens. */
++export class StartupTiming {
++  private marks: Record<string, number> = {};
++  constructor(private now: () => number = () => performance.now()) {}
++  mark(name: string): void { if (!(name in this.marks)) this.marks[name] = Math.round(this.now()); }
++  snapshot(): Record<string, number> { return { navStartMs: 0, ...this.marks }; }
++}
++export const startup = new StartupTiming();
++export function startupStats(): Record<string, number> {
++  const nav = performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined;
++  return { ...startup.snapshot(), ...(nav ? { domMs: Math.round(nav.domContentLoadedEventStart),
++    responseMs: Math.round(nav.responseStart), dnsMs: Math.round(nav.domainLookupEnd - nav.domainLookupStart),
++    tcpMs: Math.round(nav.connectEnd - nav.connectStart) } : {}) };
++}
+diff --git a/server/src/test/kotlin/com/playport/server/ViewerStartupTest.kt b/server/src/test/kotlin/com/playport/server/ViewerStartupTest.kt
+new file mode 100644
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/ViewerStartupTest.kt
+@@ -0,0 +1,49 @@
++package com.playport.server
++
++import com.shilapi.xcertplay.airplay.VideoCodec
++import io.ktor.server.engine.embeddedServer
++import io.ktor.server.netty.Netty
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.runBlocking
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.net.URI
++import java.net.http.HttpClient
++import java.net.http.WebSocket
++import java.nio.file.Files
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++
++class ViewerStartupTest {
++    @Test fun slowPhoneKeyframeRequestDoesNotBlockViewerAcknowledgements() {
++        val dir = Files.createTempDirectory("viewer-startup")
++        val scope = CoroutineScope(Dispatchers.Default)
++        val token = "0123456789abcdef0123456789abcdef"
++        val hub = WebHub(ServerConfig(identityDir=dir,stateDir=dir,accessToken=token),DisplayState(640,480,30,100),scope)
++        val entered = CountDownLatch(1)
++        val release = CountDownLatch(1)
++        val pong = CountDownLatch(1)
++        hub.setVideoCodec(110,VideoCodec.H264)
++        hub.broadcastVideoConfig(110,byteArrayOf())
++        hub.onViewerJoined = { entered.countDown(); release.await(5,TimeUnit.SECONDS) }
++        val server = embeddedServer(Netty,port=0,host="127.0.0.1") { hub.install(this,dir) }.start(false)
++        var socket: WebSocket? = null
++        try {
++            val port = runBlocking { server.engine.resolvedConnectors().first().port }
++            socket = HttpClient.newHttpClient().newWebSocketBuilder().buildAsync(
++                URI("ws://127.0.0.1:$port/ws?token=$token"),object:WebSocket.Listener {
++                    override fun onOpen(ws:WebSocket) { ws.request(100); ws.sendText("{\"type\":\"ping\"}",true) }
++                    override fun onText(ws:WebSocket,data:CharSequence,last:Boolean):java.util.concurrent.CompletionStage<*>? {
++                        if (data.toString().contains("\"pong\"")) pong.countDown()
++                        ws.request(1); return null
++                    }
++                }).get(3,TimeUnit.SECONDS)
++            assertTrue("phone recovery request started",entered.await(2,TimeUnit.SECONDS))
++            assertTrue("viewer ping is handled while phone command remains blocked",pong.await(2,TimeUnit.SECONDS))
++        } finally {
++            release.countDown(); socket?.abort(); server.stop(0,1000); scope.cancel(); dir.toFile().deleteRecursively()
++        }
++    }
++}

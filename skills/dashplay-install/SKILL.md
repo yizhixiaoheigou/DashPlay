@@ -1,17 +1,29 @@
 ---
 name: dashplay-install
-description: 帮完全不懂技术的用户把 DashPlay（网页 CarPlay）装到斐讯 N1、玩客云、ZTE F50 或其他 OpenWrt 路由器上，从识别硬件、下载刷机包、刷机、放入用户自己的 CarPlay 认证文件，到上车使用和排错，一步步做完；只有插拔电源、按按钮、在手机或车机上点选这类必须本人动手的事才请用户做。用户说“帮我装 DashPlay”“我买了 N1/玩客云/F50，想用网页 CarPlay”时使用。
+description: DashPlay（网页 CarPlay）安装总入口。先识别斐讯 N1、玩客云、ZTE F50、已有 OpenWrt 或安卓手机／安卓电视盒子；保留安卓走 APK 安装 Skill，其他设备走对应已验证范围的安装路线，协助首次配置、使用和排错。
 ---
 
 # DashPlay 装机向导（给 AI 助手）
 
-保留 Android、通过 APK 安装到电视盒子或手机时，改用 [安卓安装 Skill](../dashplay-android-install/SKILL.md)，包括首次授权与断电后零点击启动验收；不要套用下面的 Linux/OpenWrt 刷机步骤。
+## 先选安装路线（第 0 步入口分流）
+
+先问“你要装在哪种设备上”：**斐讯 N1 / 玩客云 / ZTE F50 / 已有 OpenWrt 路由器 / 普通安卓电视盒子 / 安卓手机（或平板）**。已有明确答案直接沿用。N1、F50 名称与具体安装范围不扩展成“任意 Debian 盒子”或“任意可刷 OpenWrt 的随身 Wi-Fi”。已有 OpenWrt 的插件路线保留，不代表提供未知型号的一键刷机。
+
+- **如果用户说“电视盒子”或手里是安卓系统的斐讯 N1**：先问清楚 **“你是想保留现在的安卓系统直接装个 App 用（普通安卓电视盒子路线），还是想把斐讯 N1 彻底刷成专用 Linux 系统？”** 非 N1/玩客云的普通安卓电视盒子，或用户不想刷机，一律走安卓 APK 路线，不走下方写 U 盘刷机。
+- **选择普通安卓电视盒子或安卓手机（保留系统，安装 APK）**：立即切换到 [安卓安装 Skill](../dashplay-android-install/SKILL.md) 和 [Android 逐题分支](../dashplay-android-install/references/capability-routing.md) 引导，**不再往下阅读或套用本文件的 Python 环境准备、刷机、SSH、身份来源或 Linux 网络步骤**。
+  - **安卓手机**：仅支持无线 CarPlay，需要蓝牙及可互访 Wi-Fi；不再提供有线连接。优先让用户下载安装项目发布的 APK，再按 [安卓安装 Skill](../dashplay-android-install/SKILL.md) 完成首次设置和能力说明；用户需要帮助时继续协助，不默认要求电脑、ADB、Root 或自己编译。
+  - **普通安卓电视盒子**：AI 按同一 Android Skill 协助检查操作入口（屏幕/遥控器、已运行同网的 `/manage` 网页、或已有授权 ADB）、热点、USB、无屏配置与开机恢复。已有屏幕/遥控器可先初设，没有 ADB 不等于不可用；不因选择盒子就刷机或安装 Root。
+  - APK 是否已发布，以 Android 发布资产为准；没有就说明“暂无可安装的发布包”，提供等待发布或用户选择源码构建的路径，不把编译作为所有新手的默认前置。不混用 OpenWrt 的 `.apk` 软件包。
+
+**进入安卓分支后的关键边界**：两种安卓形态使用同一 APK，但手机仅支持无线，盒子可按硬件条件使用有线/无线/自动；不能将手机改选盒子来绕过产品限制。其余能力由实测决定。按 [Android 逐题分支](../dashplay-android-install/references/capability-routing.md) 一次问一个问题，答案决定下一题；条件不足解释原因、返回改选或保存草稿。只告知需要哪些已有能力，不教刷机、获取 ADB 或获取 Root。安卓普通 CarPlay 不统一要求 Root；特斯拉可选 **HTTP 兼容方式（无需 Root，优先 WebRTC 视频，连接失败时改用 JPEG 图片；需实车验证）**，或 **HTTPS 方式**（需本机热点 App Root，或已配置可达地址的外部路由器，并配合可信证书与解析）。不要把下文 Linux 的“特斯拉模式”操作套到 Android。
+
+下文是原有 Linux/OpenWrt 安装流程；本次不更改 N1/F50 的设备范围和刷写步骤。
 
 **刷机风险：会清空选定存储；F50 Root 会降低启动校验，最坏需要拆机短接。先核对型号、备份和具体写入范围，再动手。**
 
 用户把这份文件的地址交给你，意思是：**剩下的事你来做**。你在用户的电脑上执行命令、下载、检查、排错；只在必须本人动手时请用户操作。
 
-**先确认读到的是完整原文**：用终端 `curl -fsSL https://raw.githubusercontent.com/yizhixiaoheigou/DashPlay/main/skills/dashplay-install/SKILL.md` 取原文阅读，不用网页摘要/抓取工具（它们可能给出缓存的旧版或删节版）。原文从「开始前」一直到最后一节「排错」，中间有「斐讯 N1」「玩客云」「ZTE F50 从原厂 B16 到 OpenWrt」「放认证文件（所有设备）」「特斯拉」等章节；缺任何一节就重新获取，不凭残缺内容动手。只依据本文件和它指向的项目文件，不依据这台电脑上碰巧留下的工具、网络设置或其他项目的历史记录来推断步骤。
+**先确认读到的是完整原文**：用终端 `curl -fsSL https://raw.githubusercontent.com/yizhixiaoheigou/DashPlay/main/skills/dashplay-install/SKILL.md` 取原文阅读，不用网页摘要/抓取工具（它们可能给出缓存的旧版或删节版）。原文从「开始前」一直到最后一节「排错」，中间有「斐讯 N1」「玩客云」「ZTE F50 从原厂 B16 到 OpenWrt」「放认证文件（Linux/OpenWrt）」「特斯拉」等章节；缺任何一节就重新获取，不凭残缺内容动手。只依据本文件和它指向的项目文件，不依据这台电脑上碰巧留下的工具、网络设置或其他项目的历史记录来推断步骤。
 
 项目地址：
 - 主仓库（玩客云、N1 刷机包，程序本身）：<https://github.com/yizhixiaoheigou/DashPlay>，发布页 `/releases/latest`（补丁版可能不带刷机包，见“下载工具与校验”）

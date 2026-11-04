@@ -2,7 +2,7 @@ DashPlay 安卓版随包第三方组件
 
 本文件由 scripts/android-collect-licenses.py 依据构建的运行时依赖生成，不要手改。
 许可证名称和链接取自各依赖的 POM <licenses>、jar 内的 LICENSE/NOTICE，
-或（仅四个依赖）项目公布的许可证；全文在同目录。
+或项目公布的许可证；原生组件按 RTC-SOURCE.json 的固定源码版本列出，全文在同目录。
 
 com.android.tools:desugar_jdk_libs_configuration_nio:2.1.5   BSD-3-Clause  <https://opensource.org/licenses/BSD-3-Clause>
 com.android.tools:desugar_jdk_libs_nio:2.1.5                 GNU General Public License, version 2, with the Classpath Exception  <https://github.com/google/desugar_jdk_libs/blob/master/LICENSE>
@@ -36,6 +36,16 @@ org.jmdns:jmdns:3.6.3                                        Apache License, Ver
 org.slf4j:slf4j-api:2.0.20                                   MIT License  <https://github.com/qos-ch/slf4j/blob/master/LICENSE>
 org.slf4j:slf4j-simple:2.0.20                                MIT License  <https://github.com/qos-ch/slf4j/blob/master/LICENSE>
 
+原生组件（包含静态链接和头文件依赖，不在 Gradle 依赖列表中）：
+
+native:json:55f93686c01528224f448c19128836e7df245f72  MIT  <https://raw.githubusercontent.com/nlohmann/json/55f93686c01528224f448c19128836e7df245f72/LICENSE.MIT>
+native:libjuice:b89c792e3612faf2f12cf35bcc56857313a06be3  MPL-2.0  <https://raw.githubusercontent.com/paullouisageneau/libjuice/b89c792e3612faf2f12cf35bcc56857313a06be3/LICENSE>
+native:libsrtp:24b3bf8f19b6f5ab4cd2bcceb4f4064efca86fd5  BSD-3-Clause  <https://raw.githubusercontent.com/cisco/libsrtp/24b3bf8f19b6f5ab4cd2bcceb4f4064efca86fd5/LICENSE>
+native:plog:94899e0b926ac1b0f4750bfbd495167b4a6ae9ef  MIT  <https://raw.githubusercontent.com/SergiusTheBest/plog/94899e0b926ac1b0f4750bfbd495167b4a6ae9ef/LICENSE>
+native:usrsctp:fec583d54493f879d2ae44a743423bf8a04371ab  BSD-3-Clause  <https://raw.githubusercontent.com/paullouisageneau/usrsctp/fec583d54493f879d2ae44a743423bf8a04371ab/LICENSE.md>
+native:libdatachannel:0.24.6  MPL-2.0  <https://raw.githubusercontent.com/paullouisageneau/libdatachannel/6b1e2e620f1e37f0eafeee702eaea0043cb305fd/LICENSE>
+native:mbedtls:3.6.7  Apache-2.0 OR GPL-2.0-or-later  <https://raw.githubusercontent.com/Mbed-TLS/mbedtls/068ff080b369adfac81509f9b57b2afabaf82dc5/LICENSE>
+
 移植进本仓库的源码（不是依赖，没有 POM）：
 
 com/shilapi/xcertplay/transport/                             GNU General Public License, version 3  <https://github.com/shihabal3amri/DiPlay>
@@ -48,3 +58,10 @@ com/shilapi/xcertplay/transport/                             GNU General Public 
   GPL-2.0-with-Classpath-exception.txt
   GPL-3.0.txt
   MIT.txt
+  native-json-LICENSE.MIT.txt
+  native-libdatachannel-LICENSE.txt
+  native-libjuice-LICENSE.txt
+  native-libsrtp-LICENSE.txt
+  native-mbedtls-LICENSE.txt
+  native-plog-LICENSE.txt
+  native-usrsctp-LICENSE.md.txt

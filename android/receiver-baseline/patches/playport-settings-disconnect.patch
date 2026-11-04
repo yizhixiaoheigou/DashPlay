@@ -1,0 +1,50 @@
+Disconnect a wireless CarPlay session from settings after pausing its automatic invitations.
+
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -208,6 +208,24 @@
+         return null
+     }
+ 
++    /** Settings-page request: stop only this wireless owner, after the helper has paused its invitations. */
++    @Synchronized
++    private fun disconnectPhone(phone: String): Boolean {
++        if (closed.get() || cablePhone || selectedPhone != phone) return false
++        bootInvite = false
++        switchingTo = null
++        invitedPhone = null
++        handoffAcceptedAt = Long.MIN_VALUE / 2
++        quickRetriesLeft = 0
++        ++wirelessGeneration
++        val link = wireless
++        wireless = null
++        link?.close()
++        activeSession?.close()
++        log.info("CarPlay disconnected from settings; pairing retained and automatic invitation paused")
++        return true
++    }
++
+     private fun presenceResult(command: String, vararg args: String): String? {
+         val helper = presenceHelper ?: return null
+         return runCatching {
+@@ -467,6 +485,11 @@
+                     }
+                 } else if (presenceHelper != null) {
+                     val incomingPhone = presenceResult("admit", socket.inetAddress.hostAddress)
++                    if (incomingPhone != null && !presence("allowed", incomingPhone)) {
++                        log.info("phone paused from settings; rejecting automatic CarPlay reconnect")
++                        socket.close()
++                        continue
++                    }
+                     val target = switchingTo
+                     val handoff = System.nanoTime() / 1_000_000 - handoffAcceptedAt < HANDOFF_ADMIT_MS
+                     // While the viewer switches phones, the previous phone must not slip back in: it stays on
+@@ -663,6 +686,8 @@
+                     Thread.sleep(SUPERVISOR_INTERVAL_MS)
+                     if (closed.get()) return@Thread
+                     val now = System.nanoTime() / 1_000_000
++                    val disconnect = presenceResult("disconnect-request")
++                    if (disconnect != null && disconnectPhone(disconnect)) continue
+                     // The phone on the cable owns CarPlay; its session is no Wi-Fi presence either.
+                     if (cablePhone) { idleTimer.action(now, true, activeSession); continue }
+                     // Learn the phone's Wi-Fi identity before an idle release can end its session: a phone invited

@@ -1,0 +1,792 @@
+diff --git a/web/check-image.mjs b/web/check-image.mjs
+new file mode 100644
+index 0000000..31ae22a
+--- /dev/null
++++ b/web/check-image.mjs
+@@ -0,0 +1,35 @@
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import ts from 'typescript';
++
++// The still-image frame as the server writes it (Wire.kt) and as this page reads it. A one-byte disagreement here
++// shows a shifted or empty JPEG in the car and nothing in any log, so the layout is pinned on both sides.
++const source = readFileSync(new URL('./src/protocol.ts', import.meta.url), 'utf8');
++const { outputText } = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } });
++const { parseWireMessage, WireType } = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
++
++const jpeg = new Uint8Array([0xff, 0xd8, 1, 2, 3, 0xff, 0xd9]);
++// [7][epoch u32][sequence u32][width u16][height u16][age u16][jpeg] — 15-byte head, little endian.
++const frame = new Uint8Array(15 + jpeg.length);
++const view = new DataView(frame.buffer);
++frame[0] = WireType.Image;
++view.setUint32(1, 7, true);
++view.setUint32(5, 42, true);
++view.setUint16(9, 1280, true);
++view.setUint16(11, 720, true);
++view.setUint16(13, 55, true);
++frame.set(jpeg, 15);
++
++const message = parseWireMessage(frame.buffer);
++assert.ok(message, 'a still frame parses');
++assert.equal(message.kind, 'image');
++assert.equal(message.epoch, 7);
++assert.equal(message.sequence, 42);
++assert.equal(message.width, 1280);
++assert.equal(message.height, 720);
++assert.equal(message.ageMs, 55);
++assert.deepEqual(Array.from(message.data), Array.from(jpeg), 'the JPEG payload starts after the 15-byte head');
++
++assert.equal(parseWireMessage(new Uint8Array(14).fill(0).buffer), null, 'a truncated head is not a frame');
++
++console.log('Still-image frame check passed: 15-byte head, little-endian fields, JPEG payload boundary.');
+diff --git a/web/check-rtc.mjs b/web/check-rtc.mjs
+new file mode 100644
+index 0000000..7ba3d83
+--- /dev/null
++++ b/web/check-rtc.mjs
+@@ -0,0 +1,94 @@
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import ts from 'typescript';
++
++// The RTC viewer channel, driven with a stub RTCPeerConnection: the rules that matter are which evidence counts and
++// what happens when it fails. A real peer needs two devices and a codec; those are recorded separately on hardware.
++const source = readFileSync(new URL('./src/rtc.ts', import.meta.url), 'utf8');
++const { outputText } = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } });
++
++const sent = [];
++const events = [];
++
++class StubPeer {
++  constructor(config) { this.config = config; this.connectionState = 'new'; StubPeer.last = this; }
++  addTransceiver() {}
++  async setRemoteDescription(description) { this.remote = description; }
++  async createAnswer() { return { type: 'answer', sdp: 'v=0 answer' }; }
++  async setLocalDescription(description) { this.local = description; }
++  async addIceCandidate(candidate) { (this.candidates ??= []).push(candidate); }
++  close() { this.connectionState = 'closed'; }
++}
++globalThis.RTCPeerConnection = StubPeer;
++globalThis.MediaStream = class { constructor(tracks) { this.tracks = tracks; } };
++
++const video = { autoplay: false, muted: false, playsInline: false, srcObject: null, videoWidth: 0, videoHeight: 0, play: async () => {} };
++globalThis.HTMLVideoElement = class {};
++
++const { RtcPlayer } = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
++
++// 1. No API in the browser: the channel reports it at once instead of hanging.
++const saved = globalThis.RTCPeerConnection;
++delete globalThis.RTCPeerConnection;
++const missing = new RtcPlayer((m) => { sent.push(m); return true; }, {
++  onConnected: () => events.push('connected'),
++  onFirstFrame: () => events.push('frame'),
++  onFailed: (reason) => events.push(`failed:${reason}`),
++}, video);
++missing.start();
++assert.deepEqual(events, ['failed:unsupported']);
++globalThis.RTCPeerConnection = saved;
++
++// 2. A channel starts only after the page asks for it, with a receive-only video transceiver and no ice servers.
++events.length = 0;
++const player = new RtcPlayer((message) => { sent.push(message); return true; }, {
++  onConnected: () => events.push('connected'),
++  onFirstFrame: (w, h) => events.push(`frame:${w}x${h}`),
++  onFailed: (reason) => events.push(`failed:${reason}`),
++}, video);
++player.start();
++assert.deepEqual(sent.at(-1), { type: 'rtc-start' });
++assert.deepEqual(StubPeer.last.config, { iceServers: [] }, 'local ICE only: no public STUN/TURN');
++
++// 3. The server's offer is answered with the browser's SDP; candidates are passed to the peer.
++await player.onOffer('v=0 offer');
++assert.equal(StubPeer.last.remote.type, 'offer');
++assert.deepEqual(sent.at(-1), { type: 'rtc', sdp: 'v=0 answer' });
++player.onCandidate('candidate:1 1 udp 1 192.168.43.1 5000 typ host', 'video');
++assert.equal(StubPeer.last.candidates.length, 1);
++
++// 4. ICE connecting is not a picture: no frame is reported until the element has real pixels.
++StubPeer.last.connectionState = 'connected';
++StubPeer.last.onconnectionstatechange();
++assert.deepEqual(events, ['connected']);
++assert.equal(player.paintCheck(), false, 'no pixels, no first frame');
++assert.equal(player.running, false);
++
++// 5. Real pixels are the only evidence that makes RTC the running transport.
++video.videoWidth = 1280;
++video.videoHeight = 720;
++assert.equal(player.paintCheck(), true);
++assert.deepEqual(events.at(-1), 'frame:1280x720');
++assert.equal(player.running, true);
++player.paintCheck();
++assert.equal(events.filter((e) => e.startsWith('frame')).length, 1, 'the first frame is reported once');
++
++// 6. A dropped connection reports a failure, and a fallback stops reporting from the old peer.
++StubPeer.last.connectionState = 'failed';
++StubPeer.last.onconnectionstatechange();
++assert.deepEqual(events.at(-1), 'failed:failed');
++player.close(true);
++assert.equal(video.srcObject, null);
++
++const after = events.length;
++StubPeer.last.connectionState = 'failed';
++StubPeer.last.onconnectionstatechange?.();
++assert.equal(events.length, after, 'a closed peer cannot report again');
++
++console.log('RTC viewer check passed: offer/answer, local ICE, first-frame evidence only, failure and close.');
++
++// 7. The owner's JPEG-only choice must keep RTC from starting at all on the compatibility entry.
++const mainSource = readFileSync(new URL('./src/main.ts', import.meta.url), 'utf8');
++assert.match(mainSource, /const jpegOnly = transportChoice === 'JPEG'/, 'the transport choice is read');
++assert.match(mainSource, /compatEntry && !jpegOnly && !rtcGaveUp/, 'JPEG-only skips RTC rather than trying and failing');
++console.log('Transport choice check passed: JPEG-only never starts RTC; absent keeps AUTO.');
+diff --git a/web/check-stills.mjs b/web/check-stills.mjs
+new file mode 100644
+index 0000000..4f11dcf
+--- /dev/null
++++ b/web/check-stills.mjs
+@@ -0,0 +1,96 @@
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import ts from 'typescript';
++
++// The still-image fallback, exercised with just the DOM surface it uses: no browser, no box.
++const source = readFileSync(new URL('./src/stills.ts', import.meta.url), 'utf8');
++const { outputText } = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } });
++
++const revoked = [];
++const created = [];
++globalThis.URL = {
++  createObjectURL: (blob) => { const url = `blob:${created.length}`; created.push(blob); return url; },
++  revokeObjectURL: (url) => { revoked.push(url); },
++};
++
++// Timers never run: the stall check is asserted by calling the handler directly instead.
++globalThis.window = { setTimeout: () => 1, clearTimeout: () => {} };
++
++const paints = [];
++const errors = [];
++const context = { drawImage: () => {} };
++const canvas = { width: 0, height: 0, getContext: () => context };
++let natural = { width: 320, height: 180 };
++globalThis.performance = { now: () => nowMs };
++let nowMs = 1000;
++
++// An Image whose load completes on demand, so ordering can be controlled exactly.
++const pendingImages = [];
++class Image {
++  constructor() { this.complete = false; this.src = ''; pendingImages.push(this); }
++  get naturalWidth() { return this.complete ? natural.width : 0; }
++  get naturalHeight() { return this.complete ? natural.height : 0; }
++  set src(value) { this._src = value; }
++  get src() { return this._src; }
++  finish() { this.complete = true; this.onload?.(); this.onload = null; }
++}
++globalThis.Image = Image;
++
++const { StillPlayer } = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
++
++const player = new StillPlayer(canvas, {
++  onPaint: (first) => paints.push(first),
++  onError: (message) => errors.push(message),
++});
++
++const still = (epoch, sequence, width = 320, height = 180) => ({
++  epoch, sequence, width, height, ageMs: 5, data: new Uint8Array([1, 2, 3]),
++});
++
++// 1. A first still paints, sizes the canvas and reports "first".
++player.push(still(1, 1));
++pendingImages.at(-1).finish();
++assert.deepEqual(paints, [true], 'the first still of a session paints and says so');
++assert.equal(canvas.width, 320);
++assert.equal(canvas.height, 180);
++assert.equal(revoked.length, 1, 'the object URL of a painted still is released');
++assert.equal(player.lastAgeMs, 5);
++
++// 2. An old still that overtook a newer one must not be shown.
++player.push(still(1, 3));
++pendingImages.at(-1).finish();
++const before = paints.length;
++player.push(still(1, 2));
++assert.equal(pendingImages.length, 2, 'the stale still never creates an image');
++assert.equal(paints.length, before, 'a stale still does not paint');
++
++// 3. A still from a previous session (lower epoch) is dropped outright.
++player.push(still(0, 99));
++assert.equal(pendingImages.length, 2, 'an old session never reaches the canvas');
++
++// 4. A new epoch replaces the picture and reports "first" again.
++player.push(still(2, 1));
++pendingImages.at(-1).finish();
++assert.equal(paints.at(-1), true, 'a new session reports a first picture again');
++
++// 5. Only the newest still is kept: a newer one replaces the one still loading, and the replaced URL is released.
++const released = revoked.length;
++player.push(still(2, 2));
++player.push(still(2, 3));
++assert.equal(revoked.length, released + 1, 'the replaced still releases its object URL');
++assert.equal(pendingImages.length, 5, 'the replaced still creates no image of its own beyond its own load');
++
++// 6. A broken image reports an error, not a silent black screen.
++const beforeErrors = errors.length;
++player.push(still(2, 4));
++pendingImages.at(-1).onerror?.();
++assert.equal(errors.length, beforeErrors + 1);
++assert.match(errors.at(-1), /图片/);
++
++// 7. close() drops a waiting still and releases it.
++player.push(still(2, 5));
++const marking = revoked.length;
++player.close();
++assert.equal(revoked.length, marking + 1, 'closing the player releases the waiting still');
++
++console.log('Still-image fallback check passed: epoch and sequence ordering, single-flight painting, error and close.');
+diff --git a/web/index.html b/web/index.html
+index bb06210..3be4d5e 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -2,7 +2,7 @@
+ <html lang="zh-CN"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/><meta name="color-scheme" content="dark"/><title>DashPlay</title><link rel="stylesheet" href="/src/style.css"/><noscript><style>#browser-check{display:block!important}</style></noscript></head>
+ <body><section id="browser-check" style="display:none;position:fixed;top:0;right:0;bottom:0;left:0;z-index:99999;background:#141920;color:#f4f6f8;overflow:auto;padding:24px;font:16px/1.6 sans-serif;box-sizing:border-box">
+ <h1 id="browser-check-title" style="font-size:24px">浏览器兼容性检测</h1><p id="browser-check-note">正在检测。如果此提示一直不变，请确认 JavaScript 已启用，或刷新页面重新加载检测脚本。</p><noscript>此浏览器禁用了 JavaScript，无法使用 CarPlay。</noscript><ul id="browser-check-list" style="padding-left:22px"></ul><button id="browser-check-continue" disabled style="padding:12px 20px;font-size:18px">正在检测…</button><p id="browser-check-agent" style="word-wrap:break-word;font-size:12px"></p></section><script src="./browser-check.js"></script><main id="app">
+-  <div id="screen-container"><div id="surface"><canvas id="screen" width="1280" height="720" tabindex="0" aria-label="CarPlay" inert></canvas></div></div>
++  <div id="screen-container"><div id="surface"><canvas id="screen" width="1280" height="720" tabindex="0" aria-label="CarPlay" inert></canvas><video id="rtc-video" muted playsinline aria-hidden="true"></video></div></div>
+   <div id="overlay" role="status"><div class="welcome">
+     <h1>DashPlay</h1>
+     <p class="status"><span class="spinner" aria-hidden="true"></span><span id="connection-text"></span></p>
+diff --git a/web/package.json b/web/package.json
+index a803e89..2c42b43 100644
+--- a/web/package.json
++++ b/web/package.json
+@@ -5,8 +5,8 @@
+   "type": "module",
+   "scripts": {
+     "dev": "vite",
+-    "test": "node check.mjs && node check-audio.mjs && node check-audio-lifecycle.mjs && node check-pcm-resampler.mjs && node check-audio-mix.mjs && node check-car.mjs && node check-browser.mjs && node check-flac.mjs && node check-codec-startup.mjs",
++    "test": "node check.mjs && node check-audio.mjs && node check-audio-lifecycle.mjs && node check-pcm-resampler.mjs && node check-audio-mix.mjs && node check-car.mjs && node check-browser.mjs && node check-flac.mjs && node check-codec-startup.mjs && node check-stills.mjs && node check-rtc.mjs && node check-image.mjs",
+     "test:audio-browser": "node check-pcm-browser.mjs",
+     "build": "tsc && vite build",
+     "preview": "vite preview"
+   },
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+index 682ad29..5b6379b 100644
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -68,6 +68,8 @@ const messages = {
+   mic: ['麦克风', 'Microphone'], micHint: ['网页通话与 Siri 需要浏览器允许麦克风；勾选了「通话与 Siri 走车机蓝牙」时不用网页麦克风。', 'Calls and Siri through this page require browser microphone permission; not used when calls and Siri go over the car’s Bluetooth.'],
+   compatible: ['基础解码能力可用', 'Basic decoding APIs available'], unsupported: ['此浏览器缺少视频或音频解码能力，请使用支持 WebCodecs 的浏览器。', 'This browser lacks video or audio decoding APIs. Use a browser with WebCodecs support.'],
+   insecure: ['当前页面不是安全上下文，请使用已受信任的 HTTPS 地址。', 'This page is not a secure context. Use a trusted HTTPS address.'],
++  stillsOnly: ['当前为 HTTP 兼容页面：优先使用 WebRTC 视频，连接失败时改用 JPEG 图片。请按当前设备和网络检查实际显示效果。', 'HTTP compatibility page: WebRTC video is preferred, with JPEG images used if the connection fails. Verify playback on this device and network.'],
++  stillsRunning: ['JPEG 图片画面已开始显示', 'JPEG image display started'],
+   mediaYes: ['系统媒体控制接口可用（用于车机媒体卡片与方向盘切歌）。', 'System media API available (for the car media card and steering-wheel keys).'],
+   mediaNo: ['浏览器不提供系统媒体控制接口。', 'This browser does not expose system media controls.'],
+   noStream: ['尚无音视频流', 'No media stream yet'], playing: ['音频正在播放', 'Audio playing'], paused: ['等待音频', 'Waiting for audio'],
+diff --git a/web/src/main.ts b/web/src/main.ts
+index 19bbf75..c7b02be 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -16,6 +16,8 @@ import { reachable, TESLA_HOPS } from './tesla-fullscreen';
+ import { hudLines } from './debug-hud';
+ import { compatDisplayOn } from './compat-display';
+ import { VideoCodec, type ServerMessage, type ClientMessage, type VideoConfigMessage } from './protocol';
++import { StillPlayer } from './stills';
++import { RtcPlayer } from './rtc';
+ 
+ function el<T extends HTMLElement = HTMLElement>(id: string): T { return document.getElementById(id) as T; }
+ const canvas = el<HTMLCanvasElement>('screen');
+@@ -26,6 +28,18 @@ const url = new URL(location.href);
+ const fromUrl = url.searchParams.get('token');
+ if (fromUrl) { localStorage.setItem('playport-token', fromUrl); url.searchParams.delete('token'); history.replaceState(null, '', url); }
+ const token = fromUrl || localStorage.getItem('playport-token') || '';
++// Which picture channel this page uses. WebCodecs needs a secure context; the plain-HTTP compatibility entry has
++// none, and this page must then take stills instead of refusing to start (2026-11-03).
++const stillsMode = !window.isSecureContext && typeof VideoDecoder === 'undefined' && location.protocol === 'http:';
++/** AUTO on the compatibility entry: try RTC, keep stills until a real frame arrives, fall back without a reload. */
++const compatEntry = location.protocol === 'http:';
++/** The owner's choice from the box: AUTO, WEBCODECS or JPEG; absent keeps the old behaviour. */
++const transportChoice = (window as unknown as { playportVideoTransport?: string }).playportVideoTransport ?? '';
++const jpegOnly = transportChoice === 'JPEG';
++type Transport = 'webcodecs' | 'rtc' | 'stills';
++let transport: Transport = stillsMode ? 'stills' : 'webcodecs';
++/** RTC failed or never produced a frame: this session stays on stills, and only the person may retry. */
++let rtcGaveUp = false;
+ let active = false, painted = false, frames = 0, lastStats = performance.now();
+ // Reported to the box every 10 s for its persistent drive diagnostics (no personal data).
+ let reportFrames = 0, reportBytes = 0, reportStart = performance.now();
+@@ -114,7 +128,9 @@ function render() {
+   el('connection-hint').textContent = t(hint);
+   el('overlay').hidden = painted || holding;
+   el('app').dataset.live = String(painted || holding);
+-  el('capabilities').textContent = !isSecureContext ? t('insecure') : typeof VideoDecoder === 'undefined' || typeof AudioDecoder === 'undefined' ? t('unsupported') : t('compatible');
++  el('capabilities').textContent = stillsMode ? t('stillsOnly')
++    : !isSecureContext ? t('insecure')
++      : typeof VideoDecoder === 'undefined' || typeof AudioDecoder === 'undefined' ? t('unsupported') : t('compatible');
+   el('media-support').textContent = t(media.supported ? 'mediaYes' : 'mediaNo');
+   el<HTMLInputElement>('width').disabled = !customSize.checked;
+   el<HTMLInputElement>('height').disabled = !customSize.checked;
+@@ -343,6 +359,63 @@ const video = new VideoPlayer(canvas, error, () => {
+   }
+   lastPaintAt = now;
+ }, () => send({ type:'keyframe' }), fit, compatDisplay);
++// Stills (fallback picture for a page without WebCodecs): the same canvas, touch mapping and layout as the decoder.
++const stills = new StillPlayer(canvas, {
++  onPaint: (first) => {
++    if (!active) return;
++    const firstPicture = !painted;
++    frames++; painted = true; el('overlay').hidden = true; el('app').dataset.live = 'true';
++    if (holding) { holding = false; el('toast').hidden = true; fit(); }
++    if (first || firstPicture || displayNegotiating) { displayNegotiating = false; scheduleAuto(); }
++    if (first) toast(t('stillsRunning'));
++    lastPaintAt = performance.now();
++  },
++  onError: (message) => error(message),
++}, (width, height) => { stillsResolution(width, height); });
++/** A still's size is the stream's shape: the layout follows it exactly as after a decoded frame. */
++function stillsResolution(width: number, height: number) {
++  if (!firstStillsSize) {
++    firstStillsSize = true;
++    if (!shownOnce) { startup.mark('firstFrameMs'); connection.send({type:'stats', stats:{ev:16,...startupStats()}}); }
++  }
++  void width; void height;
++  fit();
++}
++let firstStillsSize = false;
++
++// RTC: preferred on the compatibility entry, but only after a decoded frame; ICE connected alone is not enough (rtc.ts).
++const rtcVideo = el<HTMLVideoElement>('rtc-video');
++const rtc = new RtcPlayer((message) => connection.send(message as ClientMessage), {
++  onConnected: () => { /* negotiation done; the picture is still unproven until the first frame */ },
++  onFirstFrame: (width, height) => {
++    if (!active) return;
++    transport = 'rtc';
++    rtcVideo.classList.add('on');
++    canvas.style.visibility = 'hidden';
++    stills.close();
++    frames++; painted = true; el('overlay').hidden = true; el('app').dataset.live = 'true';
++    if (holding) { holding = false; el('toast').hidden = true; }
++    stillsResolution(width, height);
++    render();
++  },
++  onFailed: () => fallBackToStills(),
++}, rtcVideo);
++/** RTC is not the picture: keep (or return to) stills without touching CarPlay, the session or the audio. */
++function fallBackToStills(): void {
++  if (rtcGaveUp) return;
++  rtcGaveUp = true;
++  if (transport === 'rtc') transport = 'stills';
++  rtcVideo.classList.remove('on');
++  rtcVideo.srcObject = null;
++  canvas.style.visibility = '';
++  rtc.close(true);
++  if (stillsMode || compatEntry) {
++    transport = 'stills';
++    if (active) connection.send({ type: 'stills', on: true });
++  }
++  render();
++}
++
+ // Music over the car's Bluetooth, turned on by the person on the box (found in a Tesla, 2026-10-14; any car paired
+ // with the iPhone): the steering wheel, media card and volume are the car's own; this page plays prompts (boosted)
+ // and whatever else the iPhone still sends. ?promptgain=1..8 overrides the boost. Tesla mode sets it too, and adds
+@@ -517,6 +590,7 @@ const connection = new Connection(token, {
+       case 'audio-config': audio.handleConfig(message); voiceStarted(message.streamType, message.name); break;
+       case 'audio-packet': if (message.streamType === 102) { musicBytes += message.data.length; hudMusicBytes += message.data.length; } audio.handlePacket(message); break;
+       case 'audio-stopped': audio.stopStream(message.streamType); voiceStopped(message.streamType); break;
++      case 'image': stills.push(message); break;
+     }
+   },
+   onServer(message) { lastHeard = performance.now(); server(message); },
+@@ -525,7 +599,13 @@ const connection = new Connection(token, {
+     if (value === 'open' && closedAt) { lifeEvent(11, { downMs: Math.round(performance.now() - closedAt), failures: connection.failures }); closedAt = 0; }
+     if (value === 'closed') { if (!closedAt) closedAt = performance.now(); if (!wokeAt) wokeAt = closedAt; reset(shownOnce); state = 'reconnecting'; }
+     else if (value === 'connecting') state = 'connecting';
+-    else { state = 'waiting'; void loadDisplay(); void unlock(); }
++    else {
++      state = 'waiting'; void loadDisplay(); void unlock();
++      // A page on plain HTTP cannot decode H.264 at all; ask for stills and let the box code them.
++      if (stillsMode) connection.send({ type: 'stills', on: true });
++      // AUTO on the compatibility entry: ask for RTC, and keep stills running until a real RTC frame arrives.
++      if (compatEntry && !jpegOnly && !rtcGaveUp && RtcPlayer.supported()) { rtc.start(); transport = 'rtc'; }
++    }
+     render();
+   },
+ });
+@@ -549,7 +629,8 @@ let holding = false, holdAwakeMs = 0, holdForDisplay = false, shownOnce = false;
+ function reset(hold = false, forDisplay = false) {
+   sentNight = null; lag.reset();
+   active = painted = false; input.reset(); canvas.inert = true;
+-  video.close(); audio.stopAll(); media.setActive(false); void microphone.stop();
++  video.close(); stills.close(); rtc.close(false); rtcVideo.classList.remove('on'); canvas.style.visibility = '';
++  audio.stopAll(); media.setActive(false); void microphone.stop();
+   holding = hold; holdAwakeMs = 0; holdForDisplay = forDisplay;
+   if (hold) toast(t(forDisplay ? 'adjusting' : 'reconnecting'));
+   else clearPicture();
+@@ -564,6 +645,15 @@ function server(message: ServerMessage) {
+   if (message.type === 'host-ui' && active) {
+     openPanel(); return;
+   }
++  if (message.type === 'rtc') {
++    if (message.reason) { fallBackToStills(); return; }
++    try {
++      const payload = JSON.parse(message.payload ?? '{}') as { kind?: string; sdp?: string; candidate?: string; mid?: string };
++      if (payload.kind === 'offer' && payload.sdp) void rtc.onOffer(payload.sdp);
++      else if (payload.kind === 'candidate' && payload.candidate) rtc.onCandidate(payload.candidate, payload.mid ?? 'video');
++    } catch { /* malformed signalling is ignored; the stills keep the picture */ }
++    return;
++  }
+   if (message.type === 'mic') {
+     if (message.micActive) void microphone.start({ sampleRate:message.micRate ?? 16000, channels:message.micChannels ?? 1, codec:message.micCodec ?? 'lpcm', samplesPerPacket:message.micSamplesPerPacket ?? 320, bitrate:message.micBitrate ?? null });
+     else void microphone.stop();
+diff --git a/web/src/protocol.ts b/web/src/protocol.ts
+index c03eddb..e542b53 100644
+--- a/web/src/protocol.ts
++++ b/web/src/protocol.ts
+@@ -7,6 +7,7 @@ export const WireType = {
+   AudioPacket: 4,
+   ScreenActive: 5,
+   AudioStopped: 6,
++  Image: 7,
+ } as const;
+ 
+ export const VideoCodec = { H264: 1, H265: 2 } as const;
+@@ -56,7 +57,19 @@ export interface AudioStoppedMessage {
+   streamType: number;
+ }
+ 
++/** One JPEG still (Wire type 7): the fallback picture for pages without WebCodecs. */
++export interface ImageMessage {
++  kind: 'image';
++  epoch: number;
++  sequence: number;
++  width: number;
++  height: number;
++  ageMs: number;
++  data: Uint8Array;
++}
++
+ export type WireMessage =
++  | ImageMessage
+   | VideoConfigMessage
+   | VideoFrameMessage
+   | AudioConfigMessage
+@@ -90,7 +103,10 @@ export type ClientMessage =
+   | { type: 'keyframe' }
+   | { type: 'stats'; stats: Record<string, number> }
+   | { type: 'ping' }
+-  | { type: 'ack'; mark: number };
++  | { type: 'ack'; mark: number }
++  | { type: 'stills'; on: boolean }
++  | { type: 'rtc-start' }
++  | { type: 'rtc'; sdp?: string; candidate?: string; mid?: string };
+ 
+ export interface NowPlaying { title: string; artist: string; album: string; durationMs?: number; positionMs?: number; speed?: number; playing?: boolean | null; revision?: number; }
+ 
+@@ -115,6 +131,9 @@ export interface ServerMessage {
+   micCodec?: string;
+   micSamplesPerPacket?: number;
+   micBitrate?: number;
++  /** "rtc": the box's RTC signalling payload (an offer or a candidate), or why the channel failed. */
++  payload?: string;
++  reason?: string;
+ }
+ 
+ /** Parses one binary WebSocket payload into a typed wire message. */
+@@ -171,6 +190,18 @@ export function parseWireMessage(buffer: ArrayBuffer): WireMessage | null {
+       return { kind: 'screen-active', streamType: bytes[1], active: bytes[2] === 1 };
+     case WireType.AudioStopped:
+       return { kind: 'audio-stopped', streamType: bytes[1] };
++    case WireType.Image: {
++      if (buffer.byteLength < 15) return null;   // type + epoch + sequence + width + height + age
++      return {
++        kind: 'image',
++        epoch: view.getUint32(1, true),
++        sequence: view.getUint32(5, true),
++        width: view.getUint16(9, true),
++        height: view.getUint16(11, true),
++        ageMs: view.getUint16(13, true),
++        data: bytes.slice(15),
++      };
++    }
+     default:
+       return null;
+   }
+diff --git a/web/src/rtc.ts b/web/src/rtc.ts
+new file mode 100644
+index 0000000..3370ba9
+--- /dev/null
++++ b/web/src/rtc.ts
+@@ -0,0 +1,113 @@
++/**
++ * The RTC picture channel: the viewer side of the server's `rtc` signalling.
++ *
++ * The box sends an offer and trickle candidates over the control WebSocket; the browser answers with a standard
++ * RTCPeerConnection. Receiving video needs no camera/microphone permission — `getUserMedia` is never called — so the
++ * only capability this needs is RTCPeerConnection itself.
++ *
++ * What the page must not claim: "connected" is not "showing a picture". ICE can connect with a codec this browser
++ * cannot decode, or with no frames at all, so [onFirstFrame] is the only evidence that counts; until then AUTO keeps
++ * the stills on screen and the box's first-frame budget decides when to give up.
++ */
++
++export interface RtcHandlers {
++  /** The channel negotiated and ICE connected (still no picture). */
++  onConnected: () => void;
++  /** A real decoded frame was painted: only now is RTC the running transport. */
++  onFirstFrame: (width: number, height: number) => void;
++  /** The channel ended or failed; `reason` is shown and the page falls back. */
++  onFailed: (reason: string) => void;
++}
++
++export class RtcPlayer {
++  private peer: RTCPeerConnection | null = null;
++  private firstFrame = false;
++  private closed = false;
++
++  constructor(
++    private readonly send: (message: Record<string, unknown>) => boolean,
++    private readonly handlers: RtcHandlers,
++    private readonly video: HTMLVideoElement,
++  ) {
++    this.video.autoplay = true;
++    this.video.muted = true;
++    this.video.playsInline = true;
++  }
++
++  /** Whether this browser can even try; a missing API is an immediate, honest fallback. */
++  static supported(): boolean {
++    return typeof RTCPeerConnection !== 'undefined';
++  }
++
++  start(): void {
++    if (!RtcPlayer.supported()) { this.handlers.onFailed('unsupported'); return; }
++    this.close(false);
++    this.closed = false;
++    this.firstFrame = false;
++    const peer = new RTCPeerConnection({ iceServers: [] });   // local ICE only: the page and the box share a LAN
++    this.peer = peer;
++    peer.addTransceiver('video', { direction: 'recvonly' });
++    peer.onicecandidate = (event) => {
++      if (!event.candidate) return;
++      this.send({ type: 'rtc', candidate: event.candidate.candidate, mid: event.candidate.sdpMid ?? 'video' });
++    };
++    peer.onconnectionstatechange = () => {
++      const state = peer.connectionState;
++      if (state === 'connected') this.handlers.onConnected();
++      else if (state === 'failed' || state === 'disconnected' || state === 'closed') {
++        if (!this.closed) this.handlers.onFailed(state);
++      }
++    };
++    peer.ontrack = (event) => {
++      this.video.srcObject = event.streams[0] ?? new MediaStream([event.track]);
++      void this.video.play().catch(() => { /* autoplay may need the next tap; the stills stay meanwhile */ });
++    };
++    this.send({ type: 'rtc-start' });
++  }
++
++  /** The server's offer. */
++  async onOffer(sdp: string): Promise<void> {
++    const peer = this.peer;
++    if (!peer || this.closed) return;
++    try {
++      await peer.setRemoteDescription({ type: 'offer', sdp });
++      const answer = await peer.createAnswer();
++      await peer.setLocalDescription(answer);
++      this.send({ type: 'rtc', sdp: answer.sdp ?? '' });
++    } catch {
++      this.handlers.onFailed('negotiation');
++    }
++  }
++
++  onCandidate(candidate: string, mid: string): void {
++    const peer = this.peer;
++    if (!peer || this.closed || !candidate) return;
++    void peer.addIceCandidate({ candidate, sdpMid: mid }).catch(() => { /* a late candidate after fallback is noise */ });
++  }
++
++  /** True once the element paints real pixels: evidence from the decoder, not from ICE. */
++  paintCheck(): boolean {
++    if (this.closed) return false;
++    if (this.firstFrame) return true;
++    if (this.video.videoWidth <= 0 || this.video.videoHeight <= 0) return false;
++    this.firstFrame = true;
++    this.handlers.onFirstFrame(this.video.videoWidth, this.video.videoHeight);
++    return true;
++  }
++
++  get running(): boolean { return this.firstFrame; }
++
++  /** Stops the channel. `clear` also empties the element (a fallback keeps other transports untouched). */
++  close(clear: boolean): void {
++    this.closed = true;
++    const peer = this.peer;
++    this.peer = null;
++    if (peer) {
++      peer.onicecandidate = null;
++      peer.ontrack = null;
++      peer.onconnectionstatechange = null;
++      try { peer.close(); } catch { /* already gone */ }
++    }
++    if (clear) { this.video.srcObject = null; this.firstFrame = false; }
++  }
++}
+diff --git a/web/src/stills.ts b/web/src/stills.ts
+new file mode 100644
+index 0000000..547ae40
+--- /dev/null
++++ b/web/src/stills.ts
+@@ -0,0 +1,141 @@
++/**
++ * The fallback picture: JPEG stills over the control WebSocket (Wire type 7).
++ *
++ * Why it exists: WebCodecs — how this page has always decoded CarPlay — needs a secure context, and a Tesla's browser
++ * offers none over plain HTTP. A car on that entry can still be reached, but only with a picture the box already coded.
++ *
++ * Rules that keep it honest:
++ *  - A still from another session (epoch) replaces the picture outright; an older sequence never overwrites a newer one.
++ *  - Only one image is in flight at a time and a newer still replaces the one waiting, so a slow device shows the
++ *    newest picture rather than a queue of old ones.
++ *  - Images are drawn to the same canvas the decoder uses: touch mapping, display size and layout never change.
++ */
++
++export interface StillMessage {
++  epoch: number;
++  sequence: number;
++  width: number;
++  height: number;
++  ageMs: number;
++  data: Uint8Array;
++}
++
++export interface StillHandlers {
++  /** A still was painted; `first` is true for the first picture of this stream epoch. */
++  onPaint: (first: boolean) => void;
++  onError: (message: string) => void;
++}
++
++/** How long a still may go missing before the page says the fallback stalled. */
++const STALL_MS = 4000;
++
++export class StillPlayer {
++  private epoch = -1;
++  private sequence = -1;
++  private painting = false;
++  private lastPaintAt = 0;
++  private stallTimer = 0;
++  private pending: { url: string; image: HTMLImageElement; width: number; height: number; first: boolean } | null = null;
++  private frames = 0;
++  private bytes = 0;
++  private windowStart = 0;
++  /** Still rate measured over the last window, for the page's statistics line. */
++  fps = 0;
++  lastAgeMs = 0;
++
++  constructor(
++    private readonly canvas: HTMLCanvasElement,
++    private readonly handlers: StillHandlers,
++    private readonly onResolution: (width: number, height: number) => void = () => {},
++  ) {}
++
++  /** A new CarPlay session started: the next still replaces the picture without waiting for a sequence reset. */
++  reset(): void {
++    this.epoch = -1;
++    this.sequence = -1;
++  }
++
++  close(): void {
++    window.clearTimeout(this.stallTimer);
++    this.stallTimer = 0;
++    this.release();
++    this.frames = 0;
++    this.bytes = 0;
++    this.windowStart = 0;
++    this.fps = 0;
++  }
++
++  push(message: StillMessage): void {
++    // Numbers only: an old still that overtook a newer one, or a session that already ended, is dropped.
++    if (message.epoch < this.epoch) return;
++    if (message.epoch === this.epoch && message.sequence <= this.sequence) return;
++    const first = message.epoch !== this.epoch;
++    this.epoch = message.epoch;
++    this.sequence = message.sequence;
++    this.lastAgeMs = message.ageMs;
++    this.armStall();
++    const bytes = new Uint8Array(message.data);   // a plain copy: BlobPart will not take a possibly shared buffer
++    const url = URL.createObjectURL(new Blob([bytes], { type: 'image/jpeg' }));
++    const image = new Image();
++    // A newer picture replaces the one still loading: its object URL is released here, not when it paints.
++    if (this.pending) URL.revokeObjectURL(this.pending.url);
++    this.pending = { url, image, width: message.width, height: message.height, first };
++    image.onload = () => { this.paintNext(); };
++    image.onerror = () => {
++      URL.revokeObjectURL(url);
++      if (this.pending?.image === image) this.pending = null;
++      this.painting = false;
++      this.handlers.onError('图片画面解码失败。');
++    };
++    image.src = url;
++    this.paintNext();
++  }
++
++  private paintNext(): void {
++    if (this.painting) return;
++    const entry = this.pending;
++    if (!entry || !entry.image.complete || entry.image.naturalWidth === 0) return;
++    this.painting = true;
++    this.pending = null;
++    try {
++      if (this.canvas.width !== entry.width || this.canvas.height !== entry.height) {
++        this.canvas.width = entry.width;
++        this.canvas.height = entry.height;
++        this.onResolution(entry.width, entry.height);
++      }
++      this.canvas.getContext('2d')?.drawImage(entry.image, 0, 0, this.canvas.width, this.canvas.height);
++      this.lastPaintAt = performance.now();
++      if (!this.windowStart) this.windowStart = this.lastPaintAt;
++      this.frames++;
++      this.bytes += entry.image.naturalWidth * entry.image.naturalHeight;
++      const elapsed = this.lastPaintAt - this.windowStart;
++      if (elapsed >= 2000) {
++        this.fps = (this.frames * 1000) / elapsed;
++        this.frames = 0;
++        this.windowStart = this.lastPaintAt;
++      }
++      this.pending = null;
++      this.handlers.onPaint(entry.first);
++      URL.revokeObjectURL(entry.url);
++    } finally {
++      this.painting = false;
++      // A newer still may have arrived while this one painted.
++      if (this.pending) window.setTimeout(() => this.paintNext(), 0);
++    }
++  }
++
++  private release(): void {
++    if (this.pending) { URL.revokeObjectURL(this.pending.url); this.pending = null; }
++  }
++
++  private armStall(): void {
++    window.clearTimeout(this.stallTimer);
++    this.stallTimer = window.setTimeout(() => {
++      const since = performance.now() - this.lastPaintAt;
++      if (this.lastPaintAt && since > STALL_MS) this.handlers.onError('图片画面已停止更新，正在重连。');
++    }, STALL_MS);
++  }
++
++  /** Bytes of JPEG received since the last call, for the box's statistics line. */
++  takeBytes(): number { const value = this.bytes; this.bytes = 0; return value; }
++}
+diff --git a/web/src/style.css b/web/src/style.css
+index bcb70e9..8f9ed57 100644
+--- a/web/src/style.css
++++ b/web/src/style.css
+@@ -24,6 +24,9 @@ button:disabled { opacity:.4; cursor:default; }
+ #screen-container.area { justify-content:flex-start; align-items:flex-start; overflow:hidden; }
+ #surface { flex:none; }
+ #screen { display:block; width:100%; height:100%; touch-action:none; user-select:none; -webkit-user-select:none; }
++/* The RTC picture: the same box as the canvas, over it, so touch, fit and fullscreen code is untouched. */
++#rtc-video { position:absolute; inset:0; width:100%; height:100%; object-fit:fill; display:none; pointer-events:none; }
++#rtc-video.on { display:block; }
+ 
+ /* Waiting screen: what is happening, then the three things a driver can do here. */
+ #overlay { position:absolute; top:0; right:0; bottom:0; left:0; inset:0; display:flex; align-items:center; justify-content:center;

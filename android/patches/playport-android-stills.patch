@@ -1,0 +1,489 @@
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+index e723852..22d8469 100644
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -69,6 +69,10 @@ class CarPlayServer(
+     val platformPresence: ((String, List<String>) -> String?)? = null,
+     val platformController: ((String?, String?, Boolean) -> Boolean)? = null,
+     val platformCableRole: CableRole? = null,
++    /** An optional second consumer of the encoded picture (Android's JPEG fallback); null on Linux/OpenWrt. */
++    val platformVideoConsumer: VideoFrameConsumer? = null,
++    /** An optional RTC channel (Android); null leaves the hub's RTC hooks unset and pages keep stills. */
++    val platformRtc: PlatformRtc? = null,
+ ) : Closeable {
+     private val log = LoggerFactory.getLogger("playport")
+ 
+@@ -94,7 +98,7 @@ class CarPlayServer(
+         config.displayArea,
+     )
+     val hub = WebHub(config, display)
+-    val bridge = WebBridge(hub)
++    val bridge = WebBridge(hub, platformVideoConsumer)
+     val media = CarPlayMediaEngine(bridge, microphoneEnabled = true, audioCaptureDirectory = null)
+ 
+     private val pairings = loadPairings()
+@@ -409,6 +413,15 @@ class CarPlayServer(
+         hub.onSwitchCable = ::switchToCable
+         hub.onSwitchPhone = ::switchPhone
+         hub.onMicrophoneData = { opus, payload -> bridge.sendMicrophonePayload(payload, opus) }
++        platformRtc?.let { rtc ->
++            hub.onRtcStart = { clientId, report -> rtc.start(clientId, hub, report) }
++            hub.onRtcMessage = { clientId, sdp, candidate, mid -> rtc.message(clientId, sdp, candidate, mid) }
++            hub.onRtcClosed = { clientId -> rtc.closed(clientId) }
++        }
++        hub.onStillsChange = {
++            // The fallback producer is Android's; Linux has no consumer, so here this only records the change.
++            log.info("viewer stills changed stillsViewers={}", hub.stillsViewers)
++        }
+         hub.onViewerJoined = { streamType ->
+             if (bridge.hasRecoveryHandler) {
+                 log.info("requesting keyframe for stream {}", streamType)
+diff --git a/server/src/main/kotlin/com/playport/server/PlatformRtc.kt b/server/src/main/kotlin/com/playport/server/PlatformRtc.kt
+new file mode 100644
+index 0000000..118a5e4
+--- /dev/null
++++ b/server/src/main/kotlin/com/playport/server/PlatformRtc.kt
+@@ -0,0 +1,17 @@
++package com.playport.server
++
++/**
++ * The RTC channel as the receiver sees it (2026-11-03). Implemented in the Android app; a platform without one leaves
++ * it null, and the viewer hub then answers "unsupported" so the page stays on stills.
++ *
++ * The receiver knows nothing about ICE, DTLS or packetisation: it only routes one page's signalling and hands the
++ * platform the same encoded picture the media bridge already forwards.
++ */
++interface PlatformRtc {
++    /** A page asked for an RTC channel. Report a reason through [report] only when it cannot start; offers use hub.sendRtc. */
++    fun start(clientId: Long, hub: WebHub, report: (String?) -> Unit)
++    /** An answer or a trickle candidate from that page; empty strings are not sent. */
++    fun message(clientId: Long, sdp: String?, candidate: String?, mid: String?)
++    /** That page's link closed or was replaced: release only what belongs to it. */
++    fun closed(clientId: Long)
++}
+diff --git a/server/src/main/kotlin/com/playport/server/WebBridge.kt b/server/src/main/kotlin/com/playport/server/WebBridge.kt
+index 4d5ecb3..32cdd35 100644
+--- a/server/src/main/kotlin/com/playport/server/WebBridge.kt
++++ b/server/src/main/kotlin/com/playport/server/WebBridge.kt
+@@ -6,8 +6,27 @@ import com.shilapi.xcertplay.airplay.MicrophoneConfig
+ import com.shilapi.xcertplay.airplay.VideoCodec
+ import java.util.concurrent.atomic.AtomicBoolean
+ 
++/**
++ * An optional second consumer of the encoded CarPlay picture (the Android JPEG fallback, 2026-11-03).
++ *
++ * It is called on the media thread, must never block, and owns whatever it copies out of the frame: the byte array
++ * handed to it is reused. Presence of a consumer never changes what the browser hub receives.
++ */
++interface VideoFrameConsumer {
++    /** A new codec configuration: a new stream identity, not a re-send. */
++    fun onConfig(streamType: Int, codec: VideoCodec, codecData: ByteArray)
++    /** One access unit in Annex B form. [keyframe] is decided once here, not re-parsed by each consumer. */
++    fun onFrame(streamType: Int, keyframe: Boolean, annexB: ByteArray)
++    /** The stream ended (session end, phone switch, receiver closing). */
++    fun onStreamEnded(streamType: Int)
++}
++
+ /** Forwards decrypted CarPlay media to the browser hub without decoding it server-side. */
+-class WebBridge(private val hub: WebHub) : MediaSink {
++class WebBridge(
++    private val hub: WebHub,
++    /** Null (the default) keeps the OpenWrt/Linux receiver exactly as it was. */
++    private val fallback: VideoFrameConsumer? = null,
++) : MediaSink {
+     private val recoveryHandlers = java.util.concurrent.ConcurrentHashMap<Int, () -> Unit>()
+     private val diagnosticHandlers = java.util.concurrent.ConcurrentHashMap<Int, (String) -> Unit>()
+     private val firstFrameReported = AtomicBoolean(false)
+@@ -18,11 +37,24 @@ class WebBridge(private val hub: WebHub) : MediaSink {
+ 
+     override fun onVideoConfig(type: Int, codecData: ByteArray) {
+         hub.broadcastVideoConfig(type, codecData)
++        val consumer = fallback ?: return
++        try {
++            consumer.onConfig(type, hub.videoCodec(type) ?: VideoCodec.H264, codecData)
++        } catch (_: Exception) {
++            // A fallback channel that throws must not take the CarPlay session down.
++        }
+     }
+ 
+     override fun onVideoFrame(type: Int, naluBytes: ByteArray) {
+         val codec = hub.videoCodec(type) ?: VideoCodec.H264
+-        hub.broadcastVideoFrame(type, Wire.isKeyFrame(naluBytes, codec), naluBytes)
++        val keyframe = Wire.isKeyFrame(naluBytes, codec)
++        hub.broadcastVideoFrame(type, keyframe, naluBytes)
++        fallback?.let { consumer ->
++            try {
++                consumer.onFrame(type, keyframe, naluBytes)
++            } catch (_: Exception) {
++            }
++        }
+         if (firstFrameReported.compareAndSet(false, true)) {
+             diagnosticHandlers[type]?.invoke("first frame rendered")
+         }
+@@ -38,6 +70,12 @@ class WebBridge(private val hub: WebHub) : MediaSink {
+ 
+     override fun onScreenStreamActive(type: Int, active: Boolean) {
+         hub.broadcastScreenActive(type, active)
++        if (!active) {
++            try {
++                fallback?.onStreamEnded(type)
++            } catch (_: Exception) {
++            }
++        }
+     }
+ 
+     override fun onAudioStarted(type: Int, format: AudioFormat, firstSample: Int) {
+diff --git a/server/src/main/kotlin/com/playport/server/WebHub.kt b/server/src/main/kotlin/com/playport/server/WebHub.kt
+index e7f5c7e..4e2611a 100644
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -61,6 +61,12 @@ data class ClientMessage(
+     val stats: Map<String, Double>? = null,
+     /** "ack": the page answering the box's "mark" of the same number at once (see LagGate). */
+     val mark: Long? = null,
++    /** "stills": a page without WebCodecs asks for JPEG stills (on) or stops (off). */
++    val on: Boolean? = null,
++    /** "rtc-start": the page asks for an RTC video channel; "rtc": an answer or candidate from it. */
++    val sdp: String? = null,
++    val candidate: String? = null,
++    val mid: String? = null,
+ )
+ 
+ @Serializable
+@@ -174,6 +180,9 @@ data class ServerMessage(
+     val micBitrate: Int? = null,
+     /** "session" ended because the receiver applies a new display: the phone comes back at once (keep the picture). */
+     val restarting: Boolean? = null,
++    /** "rtc" messages: what the RTC channel is doing, in the page's own vocabulary. */
++    val payload: String? = null,
++    val reason: String? = null,
+ )
+ 
+ private class WsClient(
+@@ -200,6 +209,8 @@ private class WsClient(
+      *  picture waits for a keyframe (LagGate) until it answers again; the link itself is kept (SILENT_VIEWER_MS). */
+     fun paused(now: Long = System.nanoTime()) = now - lastHeard.get() > PAUSE_NANOS
+     @Volatile var wasPaused = false
++    /** This page asked for JPEG stills: it has no WebCodecs (plain HTTP on a Tesla). */
++    val stills = java.util.concurrent.atomic.AtomicBoolean(false)
+     val videoSent = AtomicLong(0)
+     val videoDropped = AtomicLong(0)
+     val bytesSent = AtomicLong(0)
+@@ -245,6 +256,29 @@ class WebHub(
+     /** Move CarPlay onto the USB cable (the viewer's wired row): null on success, or an error code. */
+     @Volatile var onSwitchCable: (() -> String?)? = null
+ 
++    /** A page started or stopped asking for stills: the producer may start or stop with it. */
++    @Volatile var onStillsChange: (() -> Unit)? = null
++
++    /**
++     * RTC signalling (2026-11-03). The receiver hands one page's request to the platform; null means this receiver has
++     * no RTC channel (Linux/OpenWrt), and the page then keeps stills.
++     */
++    @Volatile var onRtcStart: ((clientId: Long, report: (String?) -> Unit) -> Unit)? = null
++    @Volatile var onRtcMessage: ((clientId: Long, sdp: String?, candidate: String?, mid: String?) -> Unit)? = null
++    @Volatile var onRtcClosed: ((clientId: Long) -> Unit)? = null
++
++    /** Sends RTC signalling to one page only: offers and candidates must never reach another viewer. */
++    fun sendRtc(clientId: Long, payload: String) {
++        val text = json.encodeToString(ServerMessage.serializer(), ServerMessage(type = "rtc", payload = payload))
++        clients.firstOrNull { it.id == clientId }?.offer(Frame.Text(text))
++    }
++
++    /** Tells a page the RTC channel failed, with a reason it can show; it then goes (or stays) on stills. */
++    fun rtcFailed(clientId: Long, reason: String) {
++        val text = json.encodeToString(ServerMessage.serializer(), ServerMessage(type = "rtc", reason = reason))
++        clients.firstOrNull { it.id == clientId }?.offer(Frame.Text(text))
++    }
++
+     /** Browser microphone payloads: (isOpus, payload). */
+     @Volatile var onMicrophoneData: ((Boolean, ByteArray) -> Unit)? = null
+ 
+@@ -346,6 +380,21 @@ class WebHub(
+         }
+     }
+ 
++    /**
++     * One fallback still to every page that asked for stills (2026-11-03). A page without WebCodecs sends
++     * `{"type":"stills","on":true}` over the control WebSocket; pages on the secure entry keep receiving H.264 and
++     * never see these. The frame is already coded: this method only fans it out and never touches the picture path.
++     */
++    fun broadcastImage(epoch: Long, sequence: Long, width: Int, height: Int, ageMs: Int, jpeg: ByteArray) {
++        val frame = Wire.image(epoch, sequence, width, height, ageMs, jpeg)
++        for (client in clients) {
++            if (client.stills.get()) client.offer(Frame.Binary(true, frame))
++        }
++    }
++
++    /** How many connected pages asked for stills: the producer stays off while nobody does. */
++    val stillsViewers: Int get() = clients.count { it.stills.get() }
++
+     fun broadcastScreenActive(type: Int, active: Boolean) {
+         broadcastBinary(Wire.screenActive(type, active))
+     }
+@@ -406,7 +455,16 @@ class WebHub(
+     }
+ 
+     /** Ktor module: WebSocket endpoint with token auth plus status API. */
+-    fun install(application: Application, webRoot: Path) {
++    fun install(application: Application, webRoot: Path) = install(application, webRoot, viewerOnly = false)
++
++    /**
++     * [viewerOnly] installs the viewer surface alone: the page, its WebSocket, status/display for a viewer.
++     *
++     * The plain-HTTP compatibility entry (2026-11-03) uses this so `/manage`, identity/TLS upload and the update
++     * routes — all of them in AndroidManagement — never exist on a port that encrypts nothing. The paired-phone list
++     * and switch stay out too: they reveal people's names and move CarPlay between phones, and both are management.
++     */
++    fun install(application: Application, webRoot: Path, viewerOnly: Boolean) {
+         application.install(WebSockets)
+         val wsReceived = AttributeKey<Long>("dashplayWsReceived")
+         application.intercept(ApplicationCallPipeline.Monitoring) {
+@@ -460,7 +518,8 @@ class WebHub(
+                 call.respondText(if (outcome.deferred) """{"ok":true,"deferred":true}""" else """{"ok":true}""",
+                     io.ktor.http.ContentType.Application.Json)
+             }
+-            get("/api/audio-routes") {
++            if (!viewerOnly) {
++                get("/api/audio-routes") {
+                 if (call.request.queryParameters["token"] != config.accessToken || !call.fromOwnPage()) {
+                     call.respondText("forbidden", status = io.ktor.http.HttpStatusCode.Forbidden)
+                     return@get
+@@ -468,7 +527,9 @@ class WebHub(
+                 val body = withContext(Dispatchers.IO) { onAudioRoutes?.invoke(null, null) }
+                 call.respondText(body ?: "{\"supported\":false}", io.ktor.http.ContentType.Application.Json)
+             }
+-            post("/api/audio-routes") {
++            }
++            if (!viewerOnly) {
++                post("/api/audio-routes") {
+                 if (call.request.queryParameters["token"] != config.accessToken || !call.fromOwnPage()) {
+                     call.respondText("forbidden", status = io.ktor.http.HttpStatusCode.Forbidden)
+                     return@post
+@@ -487,7 +548,9 @@ class WebHub(
+                 call.respondText(body ?: "{\"error\":\"save failed\"}", io.ktor.http.ContentType.Application.Json,
+                     if (body == null) io.ktor.http.HttpStatusCode.Conflict else io.ktor.http.HttpStatusCode.OK)
+             }
+-            get("/api/phones") {
++            }
++            if (!viewerOnly) {
++                get("/api/phones") {
+                 if (call.request.queryParameters["token"] != config.accessToken || !call.fromOwnPage()) {
+                     call.respondText(
+                         """{"error":"invalid token"}""",
+@@ -502,7 +565,9 @@ class WebHub(
+                     ?: PhoneList.body(supported = false, raw = null)
+                 call.respondText(body, io.ktor.http.ContentType.Application.Json)
+             }
+-            post("/api/phones/switch") {
++            }
++            if (!viewerOnly) {
++                post("/api/phones/switch") {
+                 if (call.request.queryParameters["token"] != config.accessToken || !call.fromOwnPage()) {
+                     call.respondText(
+                         """{"error":"invalid token"}""",
+@@ -545,6 +610,7 @@ class WebHub(
+                 }
+                 call.respondText("""{"ok":true}""", io.ktor.http.ContentType.Application.Json)
+             }
++            }
+             webSocket("/ws") {
+                 val token = call.request.queryParameters["token"]
+                 if (token != config.accessToken || !call.fromOwnPage()) {
+@@ -668,6 +734,17 @@ class WebHub(
+                         } else if (message.type == "stats") {
+                             log.info(statsLine(client.id, client.videoSent.get(), client.videoDropped.get(),
+                                 client.bytesSent.get(), message.stats.orEmpty()))
++                        } else if (message.type == "stills") {
++                            // A page on plain HTTP has no WebCodecs and cannot decode H.264 at all: it gets stills.
++                            client.stills.set(message.on == true)
++                            if (message.on == true) configByStream.keys.forEach { streamType -> requestKeyframe(streamType) }
++                            onStillsChange?.invoke()
++                        } else if (message.type == "rtc-start") {
++                            val start = onRtcStart
++                            if (start == null) rtcFailed(client.id, "unsupported")
++                            else start.invoke(client.id) { error -> if (error != null) rtcFailed(client.id, error) }
++                        } else if (message.type == "rtc") {
++                            onRtcMessage?.invoke(client.id, message.sdp, message.candidate, message.mid)
+                         } else if (message.type == "ping") {
+                             client.offer(Frame.Text("""{"type":"pong"}"""))
+                         } else {
+@@ -678,6 +755,7 @@ class WebHub(
+                     if (ending == "page closed") ending = "${error.javaClass.simpleName}: ${error.message}"
+                     throw error
+                 } finally {
++                    onRtcClosed?.invoke(client.id)
+                     clients.remove(client)
+                     client.channel.close()
+                     writer.cancel()
+@@ -688,6 +766,12 @@ class WebHub(
+             }
+             get("/{path...}") {
+                 val relative = call.request.uri.substringBefore('?').trimStart('/').ifEmpty { "index.html" }
++                // A page request must not quietly become the viewer page: an API path this entry does not serve
++                // (management on the compatibility entry) has to answer 404, never 200 with HTML (2026-11-03).
++                if (relative.startsWith("api/") || relative == "manage" || relative.startsWith("manage/")) {
++                    call.respondText("{}", io.ktor.http.ContentType.Application.Json, io.ktor.http.HttpStatusCode.NotFound)
++                    return@get
++                }
+                 if (relative == ACCESS_FILE) {
+                     // The viewer token for pages on this network: only to this box's own page, never cached.
+                     val file = webRoot.resolve(ACCESS_FILE)
+diff --git a/server/src/main/kotlin/com/playport/server/Wire.kt b/server/src/main/kotlin/com/playport/server/Wire.kt
+index 9e9c2af..917c342 100644
+--- a/server/src/main/kotlin/com/playport/server/Wire.kt
++++ b/server/src/main/kotlin/com/playport/server/Wire.kt
+@@ -23,6 +23,9 @@ object Wire {
+     const val AUDIO_PACKET: Byte = 4
+     const val SCREEN_ACTIVE: Byte = 5
+     const val AUDIO_STOPPED: Byte = 6
++    const val IMAGE: Byte = 7
++    /** type + epoch + sequence + width + height + age: the fields before the JPEG payload. */
++    const val IMAGE_HEADER_BYTES = 15
+ 
+     const val VIDEO_CODEC_H264: Byte = 1
+     const val VIDEO_CODEC_H265: Byte = 2
+@@ -104,6 +107,23 @@ object Wire {
+ 
+     fun audioStopped(streamType: Int): ByteArray = byteArrayOf(AUDIO_STOPPED, streamType.toByte())
+ 
++    /**
++     * One fallback still. [epoch] and [sequence] let a page drop pictures from a previous session or out of order;
++     * [ageMs] is how long the frame waited before it was coded, so a page can tell a lagging picture from a stalled
++     * one instead of showing a stale frame as if it were live.
++     */
++    fun image(epoch: Long, sequence: Long, width: Int, height: Int, ageMs: Int, jpeg: ByteArray): ByteArray {
++        val buffer = ByteBuffer.allocate(IMAGE_HEADER_BYTES + jpeg.size).order(ByteOrder.LITTLE_ENDIAN)
++        buffer.put(IMAGE)
++        buffer.putInt((epoch and 0xffff_ffffL).toInt())
++        buffer.putInt((sequence and 0xffff_ffffL).toInt())
++        buffer.putShort(width.coerceIn(0, 0xffff).toShort())
++        buffer.putShort(height.coerceIn(0, 0xffff).toShort())
++        buffer.putShort(ageMs.coerceIn(0, 0xffff).toShort())
++        buffer.put(jpeg)
++        return buffer.array()
++    }
++
+     /** MPEG-4 AudioSpecificConfig for AAC-LC: 5-bit object type, 4-bit rate index, 4-bit channels. */
+     fun audioSpecificConfig(sampleRate: Int, channels: Int): ByteArray {
+         val rateIndex = when (sampleRate) {
+diff --git a/server/src/test/kotlin/com/playport/server/CompatEntryApiTest.kt b/server/src/test/kotlin/com/playport/server/CompatEntryApiTest.kt
+new file mode 100644
+index 0000000..797b0cd
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/CompatEntryApiTest.kt
+@@ -0,0 +1,88 @@
++package com.playport.server
++
++import io.ktor.server.engine.embeddedServer
++import io.ktor.server.netty.Netty
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.runBlocking
++import org.junit.Assert.*
++import org.junit.Test
++import java.net.URI
++import java.net.http.HttpClient
++import java.net.http.HttpRequest
++import java.net.http.HttpResponse
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++import java.nio.file.Files
++
++/**
++ * The compatibility entry as a real server, not a unit of it (2026-11-03).
++ *
++ * What this proves without a device:
++ *  - `viewerOnly` installs the viewer surface and nothing else: the page, `/api/status`, `/api/display` and `/ws`
++ *    answer, while the paired-phone list and switch — management, in the receiver's own terms — are absent;
++ *  - an unknown API or `/manage` path answers 404 instead of quietly rendering the viewer page;
++ *  - the still-image frame (`Wire.image`) round-trips its epoch, sequence, size and age, so a page can drop stale
++ *    pictures.
++ *
++ * What it cannot prove: that a real client reaches the address (TeslaAddressProbe measures that), or that a browser
++ * decodes the JPEG (the web suite checks the page side).
++ */
++class CompatEntryApiTest {
++    @Test
++    fun `viewer only installs the viewer surface and no management route`() {
++        val dir = Files.createTempDirectory("compat-entry")
++        Files.writeString(dir.resolve("index.html"), "<!doctype html><title>viewer</title>")
++        val scope = CoroutineScope(Dispatchers.Default)
++        val token = "0123456789abcdef0123456789abcdef"
++        val hub = WebHub(ServerConfig(identityDir = dir, stateDir = dir, accessToken = token), DisplayState(640, 480, 30, 100), scope)
++        hub.onPhones = { """{"supported":true,"phones":[]}""" }
++        val running = embeddedServer(Netty, port = 0, host = "127.0.0.1") {
++            hub.install(this, dir, viewerOnly = true)
++        }.start(false)
++        try {
++            val port = runBlocking { running.engine.resolvedConnectors().first().port }
++            val client = HttpClient.newHttpClient()
++            fun get(path: String, withToken: Boolean = false): Int {
++                val url = "http://127.0.0.1:$port$path" + if (withToken) "?token=$token" else ""
++                return client.send(HttpRequest.newBuilder(URI(url)).GET().build(), HttpResponse.BodyHandlers.ofString()).statusCode()
++            }
++            assertEquals("the page itself", 200, get("/"))
++            assertEquals("viewer status", 200, get("/api/status"))
++            assertEquals("display state a viewer reads", 200, get("/api/display"))
++            assertEquals("paired phones are management: absent here", 404, get("/api/phones", withToken = true))
++            assertEquals("phone switching is management: absent here", 404,
++                client.send(HttpRequest.newBuilder(URI("http://127.0.0.1:$port/api/phones/switch?token=$token"))
++                    .header("Content-Type", "application/json")
++                    .POST(HttpRequest.BodyPublishers.ofString("""{"address":""}""")).build(),
++                    HttpResponse.BodyHandlers.ofString()).statusCode())
++            assertEquals("audio routes are management: absent here", 404, get("/api/audio-routes", withToken = true))
++            assertEquals("/manage never exists on this entry", 404, get("/manage"))
++        } finally { running.stop(0, 1000); scope.cancel(); dir.toFile().deleteRecursively() }
++    }
++
++    @Test
++    fun `a still frame carries the session identity a page needs to drop stale pictures`() {
++        val jpeg = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 1, 2, 3, 0xFF.toByte(), 0xD9.toByte())
++        val frame = Wire.image(epoch = 7, sequence = 42, width = 1280, height = 720, ageMs = 55, jpeg = jpeg)
++        assertEquals(Wire.IMAGE, frame[0])
++        assertEquals("type + epoch + sequence + width + height + age", 15, Wire.IMAGE_HEADER_BYTES)
++        val view = ByteBuffer.wrap(frame).order(ByteOrder.LITTLE_ENDIAN)
++        assertEquals(7, view.getInt(1))
++        assertEquals(42, view.getInt(5))
++        assertEquals(1280, view.getShort(9).toInt() and 0xffff)
++        assertEquals(720, view.getShort(11).toInt() and 0xffff)
++        assertEquals(55, view.getShort(13).toInt() and 0xffff)
++        assertArrayEquals(jpeg, frame.copyOfRange(Wire.IMAGE_HEADER_BYTES, frame.size))
++    }
++
++    @Test
++    fun `an extreme size is clamped instead of writing a corrupt frame`() {
++        val frame = Wire.image(0, 0, width = 100_000, height = -1, ageMs = 70_000, jpeg = ByteArray(1))
++        val view = ByteBuffer.wrap(frame).order(ByteOrder.LITTLE_ENDIAN)
++        assertEquals(65535, view.getShort(9).toInt() and 0xffff)
++        assertEquals(0, view.getShort(11).toInt() and 0xffff)
++        assertEquals(65535, view.getShort(13).toInt() and 0xffff)
++    }
++}
+diff --git a/web/src/boot.ts b/web/src/boot.ts
+index 89e6da3..4787787 100644
+--- a/web/src/boot.ts
++++ b/web/src/boot.ts
+@@ -13,7 +13,7 @@ async function access() {
+   try {
+     const response = await fetch('./receiver-access.json', { cache: 'no-store', credentials: 'same-origin' });
+     if (!response.ok) return;
+-    const value = await response.json() as { token?: string; settingsPort?: number; settingsPath?: string; carMusic?: boolean; carVoice?: boolean; tesla?: boolean; audioRoutes?: unknown };
++    const value = await response.json() as { token?: string; settingsPort?: number; settingsPath?: string; carMusic?: boolean; carVoice?: boolean; tesla?: boolean; audioRoutes?: unknown; videoTransport?: string };
+     if (typeof value.token === 'string' && /^[0-9a-f]{32}$/.test(value.token)) localStorage.setItem('playport-token', value.token);
+     if (Number.isInteger(value.settingsPort)) (window as unknown as { playportBoxSettingsPort?: number }).playportBoxSettingsPort = value.settingsPort;
+     if (value.settingsPath === "/manage") (window as unknown as { playportSettingsPath?: string }).playportSettingsPath = value.settingsPath;
+@@ -21,8 +21,10 @@ async function access() {
+     // carVoice: calls and Siri go over the car's Bluetooth (dashplay.main.car_voice, settings page).
+-    const flags = window as unknown as { playportCarMusic?: boolean; playportCarVoice?: boolean; playportTeslaMode?: boolean; playportAudioRoutes?: unknown };
++    const flags = window as unknown as { playportCarMusic?: boolean; playportCarVoice?: boolean; playportTeslaMode?: boolean; playportAudioRoutes?: unknown; playportVideoTransport?: string };
+     flags.playportAudioRoutes = value.audioRoutes;
+     flags.playportTeslaMode = value.tesla === true;
+     flags.playportCarMusic = value.carMusic === true || (value.carMusic === undefined && value.tesla === true);
+     flags.playportCarVoice = value.carVoice === true;
++    // The owner's picture-channel choice (AUTO/WEBCODECS/JPEG); the page reads it per feature (2026-11-03).
++    flags.playportVideoTransport = typeof value.videoTransport === 'string' ? value.videoTransport : '';
+   } catch { /* No box behind this page, or storage blocked: the page asks for a token as before. */ }
+ }
+ start();

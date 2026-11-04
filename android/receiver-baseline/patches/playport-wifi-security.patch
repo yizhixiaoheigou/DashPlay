@@ -1,0 +1,72 @@
+diff --git a/server/src/main/kotlin/com/playport/server/PersistentConfig.kt b/server/src/main/kotlin/com/playport/server/PersistentConfig.kt
+index a280efe..14c67a7 100644
+--- a/server/src/main/kotlin/com/playport/server/PersistentConfig.kt
++++ b/server/src/main/kotlin/com/playport/server/PersistentConfig.kt
+@@ -52,6 +52,7 @@ data class PersistentConfig(
+         wifiSecurity = when (wifiSecurity.lowercase()) {
+             "open" -> com.shilapi.xcertplay.transport.Iap2WirelessSecurity.NONE
+             "wpa3" -> com.shilapi.xcertplay.transport.Iap2WirelessSecurity.WPA3_ONLY
++            "wpa3-transition" -> com.shilapi.xcertplay.transport.Iap2WirelessSecurity.WPA3_TRANSITION
+             else -> com.shilapi.xcertplay.transport.Iap2WirelessSecurity.WPA_WPA2
+         },
+         bluetoothDeviceAddress = bluetoothDeviceAddress,
+@@ -81,6 +82,7 @@ data class PersistentConfig(
+             wifiSecurity = when (config.wifiSecurity) {
+                 com.shilapi.xcertplay.transport.Iap2WirelessSecurity.NONE -> "open"
+                 com.shilapi.xcertplay.transport.Iap2WirelessSecurity.WPA3_ONLY -> "wpa3"
++                com.shilapi.xcertplay.transport.Iap2WirelessSecurity.WPA3_TRANSITION -> "wpa3-transition"
+                 else -> "wpa2"
+             },
+             bluetoothDeviceAddress = config.bluetoothDeviceAddress,
+@@ -105,7 +107,17 @@ class ConfigStore(private val stateDir: Path) {
+         runCatching {
+             Files.createDirectories(stateDir)
+             val temporary = stateDir.resolve("$FILE_NAME.tmp")
+-            Files.writeString(temporary, json.encodeToString(PersistentConfig.serializer(), config))
++            // Flushed before the rename: a power cut right after saving left an empty config.json that
++            // stopped every later start (2026-10-11).
++            java.nio.channels.FileChannel.open(
++                temporary,
++                java.nio.file.StandardOpenOption.CREATE,
++                java.nio.file.StandardOpenOption.WRITE,
++                java.nio.file.StandardOpenOption.TRUNCATE_EXISTING,
++            ).use { channel ->
++                channel.write(java.nio.ByteBuffer.wrap(json.encodeToString(PersistentConfig.serializer(), config).toByteArray()))
++                channel.force(true)
++            }
+             restrictToOwner(temporary)
+             Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING)
+         }
+diff --git a/server/src/test/kotlin/com/playport/server/WifiSecurityTest.kt b/server/src/test/kotlin/com/playport/server/WifiSecurityTest.kt
+new file mode 100644
+index 0000000..daf74bc
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/WifiSecurityTest.kt
+@@ -0,0 +1,27 @@
++package com.playport.server
++
++import com.shilapi.xcertplay.transport.Iap2WirelessSecurity
++import org.junit.Assert.assertEquals
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++
++class WifiSecurityTest {
++    @get:Rule val temporary = TemporaryFolder()
++
++    @Test fun handsTheIphoneTheHotspotsRealSecurity() {
++        val root = temporary.root.toPath()
++        val expected = mapOf(
++            "open" to Iap2WirelessSecurity.NONE,
++            "wpa2" to Iap2WirelessSecurity.WPA_WPA2,
++            "wpa3-transition" to Iap2WirelessSecurity.WPA3_TRANSITION,
++            "wpa3" to Iap2WirelessSecurity.WPA3_ONLY,
++        )
++        for ((name, security) in expected) {
++            val config = PersistentConfig(wifiSecurity = name).toServerDefaults(root, root)
++            assertEquals(name, security, config.wifiSecurity)
++            val display = DisplayState(1280, 720, 30, 100)
++            assertEquals(name, PersistentConfig.of(config, display).wifiSecurity)
++        }
++    }
++}

@@ -20,7 +20,8 @@ object AndroidUsbAccess {
     class Reenumerating : IOException("等待 iPhone 重新连接 USB")
     internal class Opened(val pipe: Iap2UsbSession?, val ncm: UsbCarPlayWire?, val interfaceNumber: Int, val serial: String,
         private val connection: UsbDeviceConnection, private val manager: UsbManager,
-        private val device: UsbDevice, private val config: UsbConfiguration, val hostMac: ByteArray? = null) : Closeable {
+        private val device: UsbDevice, private val config: UsbConfiguration, val hostMac: ByteArray? = null,
+        val activateNcm: () -> Unit = {}) : Closeable {
         internal fun openInternet(): UsbTetherSession.Wire = IphethUsbTransport.open(manager, device, config)
         override fun close() {
             runCatching { ncm?.close() }
@@ -40,9 +41,13 @@ object AndroidUsbAccess {
                 if (count != 1) throw IOException("iPhone 未接受 CarPlay USB 模式，请解锁手机并重新插线")
                 throw Reenumerating()
             }
-            // Some Android USB stacks return false when this configuration is already selected.
-            // Interface claims and endpoint I/O below are the authoritative availability checks.
-            connection.setConfiguration(config)
+            // Re-selecting the active configuration can reset its interface/endpoint state.
+            val selection = UsbConfigurationSelection.ensure(config.id, current = {
+                val reply = ByteArray(1)
+                val count = connection.controlTransfer(0x80, 8, 0, 0, reply, 1, 1000)
+                if (count == 1) reply[0].toInt() and 0xff else null
+            }, select = { connection.setConfiguration(config) })
+            DriveLog.event("wired USB configuration desired=${config.id} before=${selection.before} after=${selection.after} selected=${selection.selectionResult} uptimeMs=${android.os.SystemClock.elapsedRealtime()}")
             val serial = runCatching { device.serialNumber }.getOrNull()
             if (serial.isNullOrBlank()) throw IOException("无法读取 iPhone 标识，请重新授权 USB")
             if (!carPlay) {
@@ -58,23 +63,35 @@ object AndroidUsbAccess {
             try {
                 for (function in functions) {
                     val ncmConnection = manager.openDevice(device) ?: throw IOException("无法打开 NCM 数据通道")
-                    bridges += NcmUsbBridge.open(ncmConnection, function)
+                    bridges += NcmUsbBridge.open(ncmConnection, function, config.id, deferActivation = true)
                 }
                 val ncm = UsbCarPlayWireGroup(bridges.mapIndexed { index, bridge -> object : UsbCarPlayWire {
                     private var loggedTcp = false
+                    private var rxTraces = 0
+                    private var txTraces = 0
                     override fun receive(timeoutMillis: Long) = bridge.recv(timeoutMillis)?.also { frame ->
+                        if (rxTraces < 8) UsbHandshakeTrace.describe(frame)?.let {
+                            rxTraces++
+                            DriveLog.event("wired ncm rx interface=${functions[index].control.id} uptimeMs=${android.os.SystemClock.elapsedRealtime()} $it")
+                        }
                         if (!loggedTcp && frame.size >= 74 && frame[12] == 0x86.toByte() &&
                             frame[13] == 0xdd.toByte() && frame[20] == 6.toByte()) {
                             loggedTcp = true
                             DriveLog.event("wired NCM TCP received on interface=${functions[index].control.id}")
                         }
                     }
-                    override fun send(frame: ByteArray) { bridge.send(frame, 500) }
+                    override fun send(frame: ByteArray) {
+                        if (txTraces < 8) UsbHandshakeTrace.describe(frame)?.let {
+                            txTraces++
+                            DriveLog.event("wired ncm tx-attempt interface=${functions[index].control.id} uptimeMs=${android.os.SystemClock.elapsedRealtime()} $it")
+                        }
+                        bridge.send(frame, 500)
+                    }
                     override fun close() = bridge.close()
                 } })
                 DriveLog.event("wired NCM functions=${functions.joinToString { "${it.control.id}/${it.data.id}" }}")
                 return Opened(pipe, ncm, functions.first().control.id, serial, connection, manager, device, config,
-                    bridges.first().hostMac)
+                    bridges.first().hostMac, activateNcm = { bridges.forEach { it.activate() } })
             } catch (error: Throwable) {
                 bridges.forEach { runCatching { it.close() } }
                 throw error

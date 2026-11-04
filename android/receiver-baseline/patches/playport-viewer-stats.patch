@@ -1,0 +1,149 @@
+diff --git a/server/src/main/kotlin/com/playport/server/WebHub.kt b/server/src/main/kotlin/com/playport/server/WebHub.kt
+index 3408ba4..48604d6 100644
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -49,6 +49,8 @@ data class ClientMessage(
+     val knob: KnobMessage? = null,
+     val night: Boolean? = null,
+     val telephony: Int? = null,
++    /** "stats": the viewer's own playback counters (frames drawn, decode delay, ...), numbers only. */
++    val stats: Map<String, Double>? = null,
+ )
+ 
+ @Serializable
+@@ -85,6 +87,14 @@ private class WsClient(
+ ) {
+     val imageReady = java.util.concurrent.atomic.AtomicBoolean(false)
+     val keyframeRequested = AtomicLong(0)
++    val id = nextClientId.incrementAndGet()
++    val videoSent = AtomicLong(0)
++    val videoDropped = AtomicLong(0)
++    val bytesSent = AtomicLong(0)
++
++    private companion object {
++        val nextClientId = AtomicLong(0)
++    }
+ }
+ 
+ /** Fan-out hub: browsers connect here and the media bridge pushes CarPlay frames to all of them. */
+@@ -192,7 +202,12 @@ class WebHub(
+                 maybeRequestKeyframe(client, type)
+                 continue
+             }
+-            client.channel.trySend(Frame.Binary(true, frame))
++            if (client.channel.trySend(Frame.Binary(true, frame)).isSuccess) {
++                client.videoSent.incrementAndGet()
++                client.bytesSent.addAndGet(frame.size.toLong())
++            } else {
++                client.videoDropped.incrementAndGet()   // send queue full: this viewer cannot keep up
++            }
+         }
+     }
+ 
+@@ -353,6 +368,9 @@ class WebHub(
+                         }
+                         if (message.type == "keyframe") {
+                             configByStream.keys.forEach { streamType -> onViewerJoined?.invoke(streamType) }
++                        } else if (message.type == "stats") {
++                            log.info(statsLine(client.id, client.videoSent.get(), client.videoDropped.get(),
++                                client.bytesSent.get(), message.stats.orEmpty()))
+                         } else if (message.type == "ping") {
+                             client.channel.trySend(Frame.Text("""{"type":"pong"}"""))
+                         } else {
+@@ -434,6 +452,22 @@ class WebHub(
+     }.toString()
+ 
+     companion object {
++        private val log = org.slf4j.LoggerFactory.getLogger("viewer")
++
++        /** One diagnostics line per viewer report: receiver-side totals, then the viewer's own numbers. */
++        internal fun statsLine(id: Long, sent: Long, dropped: Long, bytes: Long, stats: Map<String, Double>): String =
++            buildString {
++                append("viewer stats client=").append(id)
++                append(" sentFrames=").append(sent).append(" droppedFrames=").append(dropped)
++                append(" sentKB=").append(bytes / 1024)
++                stats.toSortedMap().forEach { (key, value) ->
++                    if (key.matches(Regex("[A-Za-z]{1,24}")) && value.isFinite()) {
++                        append(' ').append(key).append('=')
++                        append(if (value == Math.rint(value)) value.toLong().toString() else String.format(java.util.Locale.ROOT, "%.1f", value))
++                    }
++                }
++            }
++
+         const val MIC_FRAME_LPCM = 0x10
+         const val MIC_FRAME_OPUS = 0x11
+         private const val SEND_QUEUE_CAPACITY = 1024
+diff --git a/server/src/test/kotlin/com/playport/server/ViewerStatsTest.kt b/server/src/test/kotlin/com/playport/server/ViewerStatsTest.kt
+new file mode 100644
+index 0000000..8042392
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/ViewerStatsTest.kt
+@@ -0,0 +1,12 @@
++package com.playport.server
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++class ViewerStatsTest {
++    @Test fun formatsReceiverTotalsAndOnlySafeViewerNumbers() {
++        val line = WebHub.statsLine(3, 1200, 7, 5 * 1024 * 1024,
++            mapOf("fps" to 29.6, "decodeMs" to 12.0, "bad key!" to 1.0, "nan" to Double.NaN))
++        assertEquals("viewer stats client=3 sentFrames=1200 droppedFrames=7 sentKB=5120 decodeMs=12 fps=29.6", line)
++    }
++}
+diff --git a/web/src/main.ts b/web/src/main.ts
+index 540f7ce..8c98bb1 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -19,6 +19,8 @@ const fromUrl = url.searchParams.get('token');
+ if (fromUrl) { localStorage.setItem('playport-token', fromUrl); url.searchParams.delete('token'); history.replaceState(null, '', url); }
+ const token = fromUrl || localStorage.getItem('playport-token') || '';
+ let active = false, painted = false, frames = 0, lastStats = performance.now();
++// Reported to the box every 10 s for its persistent drive diagnostics (no personal data).
++let reportFrames = 0, reportBytes = 0, reportStart = performance.now();
+ let state: Key = token ? 'connecting' : 'access';
+ let hint: Key = token ? 'waitingHint' : 'accessHint';
+ let lastAutoTarget = '', autoTimer = 0, displayBusy = false;
+@@ -67,7 +69,7 @@ function error(message: string) { el('error-text').textContent = message; el('er
+ function send(message: ClientMessage) { if (active) connection.send(message); }
+ const video = new VideoPlayer(canvas, error, () => {
+   if (!active) return;
+-  frames++; painted = true; el('overlay').hidden = true; el('app').dataset.live = 'true';
++  frames++; reportFrames++; painted = true; el('overlay').hidden = true; el('app').dataset.live = 'true';
+ }, () => send({ type:'keyframe' }), fit);
+ const audio = new AudioEngine(error);
+ const media = new SystemMedia(send, () => { void audio.unlock().catch(error); }, () => audio.pauseMusic());
+@@ -85,6 +87,7 @@ const connection = new Connection(token, {
+     }
+   },
+   onServer: server,
++  onBytes(count) { reportBytes += count; },
+   onState(value) {
+     if (value === 'closed') { reset(); state = 'reconnecting'; }
+     else if (value === 'connecting') state = 'connecting';
+@@ -243,6 +246,13 @@ window.setInterval(()=>{
+   el('audio-unlock').hidden=!active||audio.isUnlocked;
+   el('audio-status').textContent=t(audio.isPlaying?'playing':'paused');media.setPlaying(audio.isPlaying);
+ },750);
++window.setInterval(()=>{
++  const now=performance.now(),seconds=Math.max(1,(now-reportStart)/1000);
++  send({type:'stats',stats:{fps:reportFrames/seconds,decodeMs:video.decodeLatencyMs,queue:video.decodeQueueSize,
++    kbps:reportBytes*8/1000/seconds,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,
++    width:canvas.width,height:canvas.height}});
++  reportFrames=0;reportBytes=0;reportStart=now;
++},10000);
+ render();fit();if(token) connection.connect();
+ 
+ nightSelect.onchange = () => { localStorage.setItem('f50-night-mode', nightSelect.value); syncNight(); render(); };
+diff --git a/web/src/protocol.ts b/web/src/protocol.ts
+index 937d79c..acf13ac 100644
+--- a/web/src/protocol.ts
++++ b/web/src/protocol.ts
+@@ -88,6 +88,7 @@ export type ClientMessage =
+   | { type: 'night'; night: boolean }
+   | { type: 'telephony'; telephony: number }
+   | { type: 'keyframe' }
++  | { type: 'stats'; stats: Record<string, number> }
+   | { type: 'ping' };
+ 
+ export interface NowPlaying { title: string; artist: string; album: string; durationMs?: number; positionMs?: number; speed?: number; revision?: number; }

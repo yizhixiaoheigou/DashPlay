@@ -29,7 +29,7 @@ fi
 "$adb" -s "$serial" shell am start -n com.dashplay.android/.MainActivity >/dev/null
 wait_for 90 "page" logged "page on"
 "$adb" -s "$serial" logcat -d -s DashPlay:I | grep "page on" | tail -1
-"$adb" -s "$serial" forward "tcp:$web" tcp:8080 >/dev/null
+"$adb" -s "$serial" forward "tcp:$web" tcp:18743 >/dev/null
 for attempt in 1 2 3 4; do
     echo "https attempt=$attempt $(curl -sk --max-time 15 -o "$out/index.html" -w 'code=%{http_code} connect=%{time_connect} tls=%{time_appconnect} total=%{time_total}' "https://127.0.0.1:$web/" ; echo " exit=$?")"
 done
@@ -58,7 +58,7 @@ if [ -n "$diplay" ]; then
         python3 "$here/scripts/check-automatic-tls.py" --adb "$adb" --serial "$serial" --base "https://127.0.0.1:$web" --screens "$out"
     fi
     python3 "$here/scripts/check-viewer.py" "https://127.0.0.1:$web"
-    python3 "$here/scripts/check-management.py" --adb "$adb" --serial "$serial" --base "https://127.0.0.1:$web" --screens "$out"
+    python3 "$here/scripts/check-management.py" --adb "$adb" --serial "$serial" --base "http://127.0.0.1:$web" --screens "$out"
     python3 "$here/scripts/check-usb-ui.py" --adb "$adb" --serial "$serial" --screens "$out"
     "$adb" -s "$serial" shell rm /data/local/tmp/diplay.apk
     sleep 2
@@ -84,7 +84,7 @@ if [ -n "$diplay" ]; then
         "$adb" -s "$serial" logcat -d -s DashPlay:I | tail -3
         exit 1
     fi
-    "$adb" -s "$serial" forward "tcp:$web" tcp:8080 >/dev/null
+    "$adb" -s "$serial" forward "tcp:$web" tcp:18743 >/dev/null
     curl -sk --fail --max-time 10 "https://127.0.0.1:$web/api/status" > "$out/status-after-reboot.json"
     python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["deviceName"]' "$out/status-after-reboot.json"
     echo "after_reboot_https=ok $("$adb" -s "$serial" logcat -d -s DashPlay:I | grep "$reboot_listener" | tail -1)"

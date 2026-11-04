@@ -1,0 +1,138 @@
+diff --git a/web/index.html b/web/index.html
+index 3898002..f50af0d 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -30,9 +30,8 @@
+     <p id="devices-status" class="foot" role="status"></p>
+   </div>
+   <p class="group-title" data-i18n="volume"></p>
+-  <div class="group"><div class="cell volume"><svg class="ico dim" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><path d="M4 9h3l5-4v14l-5-4H4z"/></svg><input id="volume" type="range" min="0" max="100" value="100"/><svg class="ico dim" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 9h3l5-4v14l-5-4H4z" fill="currentColor" stroke="none"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></svg><output id="volume-value">100%</output></div></div>
+-  <p class="group-title" data-i18n="audioMix"></p>
+   <div class="group" id="audio-mix">
++    <div class="cell volume audio-row"><span class="main"><b data-i18n="volumeAll"></b></span><input id="volume" type="range" min="0" max="100" value="100"/><output id="volume-value">100%</output></div>
+     <div class="cell volume audio-row"><span class="main"><b data-i18n="audioNav"></b><span id="audio-default-base"></span></span><input id="audio-default" type="range" min="0" max="300" step="5" value="100"/><output id="audio-default-value">100%</output></div>
+     <div class="cell volume audio-row"><span class="main"><b data-i18n="audioAlert"></b><span id="audio-alert-base"></span></span><input id="audio-alert" type="range" min="0" max="300" step="5" value="100"/><output id="audio-alert-value">100%</output></div>
+     <div class="cell volume audio-row"><span class="main"><b data-i18n="audioMedia"></b><span id="audio-media-base"></span></span><input id="audio-media" type="range" min="0" max="100" step="5" value="100"/><output id="audio-media-value">100%</output></div>
+@@ -49,7 +48,7 @@
+     <label class="cell"><span class="main"><b data-i18n="customSize"></b><span data-i18n="customSizeHint"></span></span><input id="custom-size" class="switch" type="checkbox"/></label>
+     <label class="cell"><span class="main"><b data-i18n="debugHud"></b><span data-i18n="debugHudHint"></span></span><input id="debug-hud-on" class="switch" type="checkbox"/></label>
+     <label class="cell"><span class="main"><b data-i18n="compatDisplay"></b><span data-i18n="compatDisplayHint"></span></span><input id="compat-display-on" class="switch" type="checkbox"/></label>
+-    <details><summary class="cell"><span class="main"><b data-i18n="displaySettings"></b></span><span id="display-status" class="value" role="status"></span><span class="chev"></span></summary>
++    <details id="display-details"><summary class="cell"><span class="main"><b data-i18n="displaySettings"></b></span><span id="display-status" class="value" role="status"></span><span class="chev"></span></summary>
+       <form id="display-form" class="inner"><fieldset id="display-fields"><div class="pair" id="size-row"><label><span data-i18n="width"></span><input id="width" type="number" min="480" max="3840" step="2" required/></label><label><span data-i18n="height"></span><input id="height" type="number" min="480" max="3840" step="2" required/></label></div><div class="pair"><label><span data-i18n="ui"></span><select id="ui-scale"><option value="75" data-i18n="smaller"></option><option value="85" data-i18n="small"></option><option value="100" data-i18n="standard"></option><option value="115" data-i18n="large"></option></select></label><label><span data-i18n="fps"></span><select id="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label></div><div class="pair"><label><span data-i18n="codec"></span><select id="codec"><option value="auto" data-i18n="codecAuto"></option><option value="h264">H.264</option><option value="h265">H.265</option></select></label></div></fieldset><button id="apply" class="btn" data-i18n="apply"></button></form></details>
+   </div>
+   <p class="foot" data-i18n="autoHint"></p>
+diff --git a/web/src/boot.ts b/web/src/boot.ts
+index c45ec79..83aa0da 100644
+--- a/web/src/boot.ts
++++ b/web/src/boot.ts
+@@ -13,15 +13,17 @@ async function access() {
+   try {
+     const response = await fetch('./receiver-access.json', { cache: 'no-store', credentials: 'same-origin' });
+     if (!response.ok) return;
+-    const value = await response.json() as { token?: string; settingsPort?: number; carMusic?: boolean; tesla?: boolean };
++    const value = await response.json() as { token?: string; settingsPort?: number; carMusic?: boolean; carVoice?: boolean; tesla?: boolean };
+     if (typeof value.token === 'string' && /^[0-9a-f]{32}$/.test(value.token)) localStorage.setItem('playport-token', value.token);
+     if (Number.isInteger(value.settingsPort)) (window as unknown as { playportBoxSettingsPort?: number }).playportBoxSettingsPort = value.settingsPort;
+     // Set on the box: carMusic, the music goes over the car's own Bluetooth (OpenWrt dashplay.main.car_music, settings
+     // page); tesla, the Tesla browser's ways (fullscreen through a listed video site, a quieter microphone). Tesla
+     // mode (dashplay.main.tesla_mode) sets both.
+-    const flags = window as unknown as { playportCarMusic?: boolean; playportTeslaMode?: boolean };
++    // carVoice: calls and Siri go over the car's Bluetooth (dashplay.main.car_voice, settings page).
++    const flags = window as unknown as { playportCarMusic?: boolean; playportCarVoice?: boolean; playportTeslaMode?: boolean };
+     flags.playportTeslaMode = value.tesla === true;
+     flags.playportCarMusic = value.carMusic === true || (value.carMusic === undefined && value.tesla === true);
++    flags.playportCarVoice = value.carVoice === true;
+   } catch { /* No box behind this page, or storage blocked: the page asks for a token as before. */ }
+ }
+ start();
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+index 9fa3222..b45be32 100644
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -10,18 +10,18 @@ const messages = {
+   deviceCable: ['现在用数据线连着 CarPlay，拔掉数据线后再切换。', 'CarPlay is using the cable; unplug it before switching.'],
+   deviceBusy: ['正在切换，请稍等。', 'A switch is already in progress.'], deviceFail: ['切换失败，请稍后重试。', 'Switch failed. Try again later.'],
+   deviceNoPhones: ['还没有配对的手机。', 'No paired phones yet.'],
+-  playerSettings: ['画面与声音', 'Display and sound'], displaySettings: ['画面参数', 'Display settings'], performanceMode: ['性能模式', 'Performance mode'], performanceModeHint: ['开：先按最高分辨率放大再缩回窗口，更清楚但更吃解码；关：按窗口实际尺寸（最小宽度 720），清晰度可能下降', 'On: upsize then shrink into the window, sharper but heavier; off: the window own size (min width 720), clarity may drop'], customSize: ['自定义分辨率', 'Custom resolution'], customSizeHint: ['关闭时跟随窗口', 'Off: follow the window'], language: ['语言', 'Language'],
++  playerSettings: ['画面与声音', 'Display and sound'], displaySettings: ['画面参数', 'Display settings'], performanceMode: ['高清画质', 'Sharper picture'], performanceModeHint: ['开：按 iPhone 能给的最清楚尺寸解码，再缩到窗口里，更清楚但更吃车机性能，画面卡就关掉；关：按窗口实际尺寸（最小宽度 720），更省但可能偏软', 'On: decode the sharpest size the iPhone offers and shrink it into the window, sharper but heavier (turn it off if the picture stutters); off: the window own size (min width 720), lighter but may look soft'], customSize: ['自定义分辨率', 'Custom resolution'], customSizeHint: ['关：跟随窗口。开：在下面「画面参数」里填宽度、高度，点「应用并重连」生效', 'Off: follow the window. On: enter width and height under Display settings below, then Apply and reconnect'], language: ['语言', 'Language'],
+   waiting: ['正在等待 iPhone', 'Waiting for iPhone'], waitingHint: ['已添加的 iPhone 打开蓝牙和 Wi-Fi 后会自动连接。第一次使用，请先添加 iPhone。', 'An added iPhone connects by itself with Bluetooth and Wi-Fi on. First time here? Add your iPhone.'],
+   connecting: ['正在连接盒子…', 'Connecting to receiver…'], reconnecting: ['连接中断，正在自动重连…', 'Disconnected. Reconnecting automatically…'],
+   starting: ['已连接，正在等待画面…', 'Connected. Waiting for video…'], live: ['已连接', 'Connected'],
+   access: ['需要首次登录链接', 'First-time access link required'], accessHint: ['请使用私有访问资料中的完整链接打开一次，此浏览器会记住登录。', 'Open the complete link from your private access file once. This browser will remember it.'],
+-  sound: ['轻点启用声音', 'Tap to enable sound'], volume: ['音量', 'Volume'],
+-  audioMix: ['各声音的音量', 'Sound levels'], audioNav: ['导航播报', 'Navigation'], audioAlert: ['提示音', 'Alerts'], audioMedia: ['媒体音乐', 'Media'], audioSiri: ['Siri', 'Siri'], audioCalls: ['通话', 'Calls'],
+-  audioBase: ['基准 {base}，现在 {now}', 'Base {base}, now {now}'],
+-  audioMixHint: ['100% 就是现在的设定。导航在媒体走车机蓝牙的用法里自带放大（默认 ×3），所以它的基准是那个倍数；调大后经过限幅，避免破音。媒体由本页播放时最高 100%，经车机蓝牙的音乐请用车机音量。设置保存在此浏览器。', '100% is today’s setting. Navigation carries its built-in boost when music goes over the car’s Bluetooth (×3 by default), so its base is that gain; higher levels pass a limiter to avoid clipping. Media played by this page tops out at 100%; use the car’s volume for music over Bluetooth. Saved in this browser.'],
++  sound: ['轻点启用声音', 'Tap to enable sound'], volume: ['声音', 'Sound'], volumeAll: ['总音量', 'All sounds'],
++  audioMix: ['各声音的音量', 'Each sound'], audioNav: ['导航播报', 'Navigation'], audioAlert: ['提示音', 'Alerts'], audioMedia: ['媒体音乐', 'Media'], audioSiri: ['Siri', 'Siri'], audioCalls: ['通话', 'Calls'],
++  audioOnCar: ['走车机蓝牙，请用车机音量调', 'Over the car’s Bluetooth: use the car’s volume'],
++  audioMixHint: ['总音量管全部；下面各项单独调：100% 是默认，往左小、往右大，调大时自动防破音，媒体最高 100%。走车机蓝牙的声音请用车机音量调。设置保存在此浏览器。', 'All sounds sets everything; each sound below on its own: 100% is the default, left is quieter, right is louder (kept from clipping), media tops out at 100%. Sounds over the car’s Bluetooth follow the car’s volume. Kept in this browser.'],
+   display: ['画面', 'Display'], fullscreen: ['全屏', 'Fullscreen'], exitFullscreen: ['退出全屏', 'Exit fullscreen'], fullscreenHint: ['已全屏。退出全屏：点 CarPlay 主屏幕上的「盒子设置」图标，再点「退出全屏」。', 'Fullscreen on. To exit, tap the Box settings icon on the CarPlay home screen, then Exit fullscreen.'], fullscreenFail: ['此浏览器不允许全屏，画面仍会自动适配窗口。', 'Fullscreen unavailable. The picture still fits this window.'], tapFullscreen: ['轻点画面恢复全屏', 'Tap the picture to go back to fullscreen'],
+   teslaFullscreenOffline: ['全屏要经腾讯视频跳转，特斯拉现在上不了网。画面照常可用。', 'Fullscreen goes through a video site and the car is offline. The picture keeps working.'],
+-  autoHint: ['关闭时跟随窗口：窗口多大就用多大，切到没见过的窗口会重连一次；打开后可自己填宽度、高度。只在一个显示端开启。', 'Off: follow the window; a new window size reconnects CarPlay once. On: set the width and height yourself. Turn it on for one display only.'],
++  autoHint: ['上面的开关改了立即生效，CarPlay 会重连一下；「画面参数」里的项要点「应用并重连」。自定义分辨率只在一个显示端开启。', 'The switches above take effect at once and reconnect CarPlay; Display settings need Apply and reconnect. Use a custom resolution on one display only.'],
+   width: ['宽度', 'Width'], height: ['高度', 'Height'], apply: ['应用并重连', 'Apply and reconnect'],
+   nightMode: ['夜间模式', 'Night mode'], nightSchedule: ['自动（18:30–06:30 为夜间）', 'Auto (night 18:30–06:30)'], nightSystem: ['跟随车机浏览器深色模式', 'Follow car browser dark mode'], nightDay: ['始终白天', 'Always day'], nightNight: ['始终夜间', 'Always night'],
+   nightNow: ['当前请求：', 'Requested now: '], nightOn: ['夜间', 'night'], nightOff: ['白天', 'day'], browserDark: ['车机浏览器报告深色模式', 'Car browser reports dark mode'], browserLight: ['车机浏览器报告浅色模式', 'Car browser reports light mode'],
+diff --git a/web/src/main.ts b/web/src/main.ts
+index 2a52ea9..b3daa1f 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -1,6 +1,6 @@
+ import { startup, startupStats } from './startup';
+ import { AudioEngine } from './audio';
+-import { AUDIO_CATEGORIES, STORAGE_KEY as AUDIO_MIX_KEY, baseGain, clampPercent, effectiveGain, maxPercent, mixPercent, parseMix, type AudioCategory } from './audio-mix';
++import { AUDIO_CATEGORIES, STORAGE_KEY as AUDIO_MIX_KEY, clampPercent, maxPercent, mixPercent, parseMix, type AudioCategory } from './audio-mix';
+ import { InputController } from './input';
+ import { MicrophoneUplink } from './mic';
+ import { VideoPlayer } from './video';
+@@ -259,9 +259,11 @@ const video = new VideoPlayer(canvas, error, () => {
+ // with the iPhone): the steering wheel, media card and volume are the car's own; this page plays prompts (boosted)
+ // and whatever else the iPhone still sends. ?promptgain=1..8 overrides the boost. Tesla mode sets it too, and adds
+ // the Tesla browser's ways (fullscreen below, microphone gain in mic.ts).
+-const boxFlags = window as unknown as { playportCarMusic?: boolean; playportTeslaMode?: boolean };
++const boxFlags = window as unknown as { playportCarMusic?: boolean; playportCarVoice?: boolean; playportTeslaMode?: boolean };
+ const carMusic = boxFlags.playportCarMusic === true;
+ const teslaMode = boxFlags.playportTeslaMode === true;
++// Calls and Siri over the car's Bluetooth (box: car_voice): their sound is the car's, not this page's.
++const carVoice = boxFlags.playportCarVoice === true;
+ const promptGain = Number(new URLSearchParams(location.search).get('promptgain')) || (carMusic ? 3 : 1);
+ // Music the iPhone still sends here is played: it sends music to one place at a time, and after Siri from the
+ // CarPlay screen it sent it here for ~27 s before going back to the car's Bluetooth, silent while it was dropped.
+@@ -274,7 +276,6 @@ const AUDIO_LABELS: Record<AudioCategory, Key> = {
+ };
+ let audioMix = parseMix(localStorage.getItem(AUDIO_MIX_KEY));
+ for (const category of AUDIO_CATEGORIES) audio.setCategoryPercent(category, mixPercent(audioMix, category));
+-const gainText = (value: number) => `×${value.toFixed(2).replace(/\.?0+$/, '')}`;
+ function renderAudioMix() {
+   for (const category of AUDIO_CATEGORIES) {
+     const percent = mixPercent(audioMix, category);
+@@ -282,9 +283,10 @@ function renderAudioMix() {
+     input.max = String(maxPercent(category));
+     if (Number(input.value) !== percent) input.value = String(percent);
+     input.setAttribute('aria-label', t(AUDIO_LABELS[category]));
+-    const base = baseGain(category, promptGain);
+-    el(`audio-${category}-base`).textContent = t('audioBase')
+-      .replace('{base}', gainText(base)).replace('{now}', gainText(effectiveGain(base, percent)));
++    // Over the car's Bluetooth this page plays none of it: the slider would change nothing (2026-10-29).
++    const onCar = category === 'media' ? carMusic : (category === 'telephony' || category === 'speechrecognition') && carVoice;
++    input.disabled = onCar;
++    el(`audio-${category}-base`).textContent = onCar ? t('audioOnCar') : '';
+     el(`audio-${category}-value`).textContent = `${percent}%`;
+   }
+ }
+@@ -584,7 +586,12 @@ function autoTarget() {
+ }
+ el<HTMLSelectElement>('codec').value = readFlag('f50-codec') || 'auto';
+ el<HTMLSelectElement>('codec').onchange=() => { saveFlag('f50-codec', el<HTMLSelectElement>('codec').value); lastAutoTarget=''; urgentChange='manual'; scheduleAuto(); };
+-customSize.onchange=() => { localStorage.setItem('f50-auto-fit',String(!customSize.checked)); lastAutoTarget=''; urgentChange='manual'; render(); scheduleAuto(); };
++customSize.onchange=() => {
++  localStorage.setItem('f50-auto-fit',String(!customSize.checked)); lastAutoTarget=''; urgentChange='manual';
++  // The width and height it asks for are in Display settings: open them.
++  if (customSize.checked) el<HTMLDetailsElement>('display-details').open = true;
++  render(); scheduleAuto();
++};
+ performanceMode.onchange=() => { saveFlag('f50-performance-mode',performanceMode.checked?'1':'0'); lastAutoTarget=''; urgentChange='manual'; scheduleAuto(); };
+ el<HTMLFormElement>('display-form').onsubmit=event => {
+   event.preventDefault();

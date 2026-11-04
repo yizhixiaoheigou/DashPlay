@@ -28,10 +28,28 @@ class UsbSharePlanTest {
             put("FAKE_FORWARDING", if (forwarding) "1" else "0")
             put("FAKE_LEGACY_WAIT", if (legacy) "1" else "0")
         }
-        val p = builder.start(); val output = p.inputStream.bufferedReader().readText()
-        val code = p.waitFor()
-        File(dir, "last-output").writeText(output)
-        return code
+        val p = builder.start()
+        // Drain the pipe while the process runs: reading to EOF first deadlocks whenever the script leaves a
+        // descendant holding stdout open (its EXIT trap re-enters sh), and the test then hangs for ever.
+        val output = StringBuilder()
+        val reader = Thread {
+            runCatching { p.inputStream.bufferedReader().use { input ->
+                val buffer = CharArray(8192)
+                while (true) {
+                    val n = input.read(buffer)
+                    if (n < 0) break
+                    synchronized(output) { output.append(buffer, 0, n) }
+                }
+            } }
+        }.apply { isDaemon = true; start() }
+        if (!p.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)) {
+            p.destroyForcibly(); reader.interrupt()
+            File(dir, "last-output").writeText(output.toString())
+            throw AssertionError("fixture script did not finish in 30 s")
+        }
+        reader.join(2000)
+        File(dir, "last-output").writeText(output.toString())
+        return p.exitValue()
     }
     private fun state(dir: File): Map<String, JsonElement> = Json.parseToJsonElement(File(dir, "state.json").readText()).jsonObject.filterKeys { it != "mutations" }
     private fun baseline(dir: File): Map<String, JsonElement> {

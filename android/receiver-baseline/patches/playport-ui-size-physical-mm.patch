@@ -1,0 +1,135 @@
+CarPlay's UI size is the stream's physical width in millimetres (2026-10-22).
+
+CarPlay lays out by the physical size it is told, not by pixels: at 200 mm, 1280x720 and 2560x1440 at
+every old UI-scale canvas showed the same two rows of five icons (checked on a box, 2026-10-22). The
+size setting now picks the stream's long side: 200/250/300/350 mm for 115/100/85/75, so saved values
+carry over; a portrait screen takes it on the long side too, so icons keep their size when the screen
+turns. CarPlayUiScale.apply (a larger canvas) is no longer used. The settings page offers "Smaller".
+
+--- a/server/src/main/kotlin/com/playport/server/DisplayState.kt
++++ b/server/src/main/kotlin/com/playport/server/DisplayState.kt
+@@ -5,8 +5,8 @@
+ /**
+  * Live display configuration advertised to the phone in AirPlay /info.
+  *
+- * Portrait orientation is simply `height > width`. [uiScale] maps to [CarPlayUiScale]: a larger
+- * canvas requests proportionally smaller CarPlay controls.
++ * Portrait orientation is simply `height > width`. [uiScale] is CarPlay's size: the physical width told to the
++ * phone ([physicalWidthMm]); a wider one gives smaller controls.
+  */
+ /** One view area: a width x height rectangle at the stream's top left (a browser window's shape). */
+ @kotlinx.serialization.Serializable
+@@ -80,13 +80,14 @@
+     }
+ 
+     /**
+-     * CarPlay sizes its icons by pixels per millimetre. With areas the stream is wider than the window shape it mostly
+-     * shows, and at the plain 200 mm the windowed area looked crowded (Tesla, 2026-10-14): the narrowest area keeps the
+-     * plain density, 200 mm per its width. null (the plain 200 mm) without areas.
++     * CarPlay lays out by the physical size it is told, not by pixels: at 200 mm, 1280x720 and 2560x1440 at every
++     * old UI-scale canvas (75-115 %) showed the same two rows of five icons (F50, 2026-10-22); DiPlay and WheelPlay
++     * dropped the canvas scale for millimetre presets too. [uiScale] picks the length of the stream's long side (its
++     * width in landscape; a portrait screen is the same screen turned, so its icons keep their size): the areas get
++     * their share at the same density, so a larger window shows more. (Before, the narrowest area had a fixed 200 mm:
++     * the icons changed with the shapes remembered, and the largest window showed less once a change dropped them.)
+      */
+-    fun physicalWidthMm(): Int? = areas.takeIf { it.size > 1 }?.minOf { it.width }?.let {
+-        com.shilapi.xcertplay.airplay.AirPlayDisplaySettings.DEFAULT_WIDTH_PHYSICAL_MM * width / it
+-    }
++    fun physicalWidthMm(): Int = (SIZE_MM[uiScale] ?: SIZE_MM.getValue(CarPlayUiScale.DEFAULT)) * width / maxOf(width, height, 1)
+ 
+     val orientation: String get() = if (height > width) "portrait" else "landscape"
+ 
+@@ -99,6 +100,11 @@
+         /** As many as the page declares (display-fit.ts MAX_AREAS; 4 until 2026-10-21). */
+         const val MAX_AREAS = 8
+ 
++        /** The size setting as the stream's physical width: large, standard, small, smaller. It keeps the old UI-scale
++         *  values (115/100/85/75), so saved settings carry over; standard is 250 mm (the plain 200 before, but the
++         *  windows with areas were already shown at about 230-270 mm). */
++        val SIZE_MM = mapOf(115 to 200, 100 to 250, 85 to 300, 75 to 350)
++
+         fun validateAreas(width: Int, height: Int, areas: List<ViewArea>, area: Int): String? = when {
+             areas.size > MAX_AREAS -> "at most $MAX_AREAS view areas"
+             areas.any { it.width !in 2..width || it.height !in 2..height || it.width % 2 != 0 || it.height % 2 != 0 } ->
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -155,16 +155,14 @@
+             deviceId = deviceId,
+             btMac = hostBluetoothMac,
+             sourceVersion = config.sourceVersion,
+-            main = com.shilapi.xcertplay.airplay.CarPlayUiScale.apply(
+-                AirPlayDisplayConfig(
+-                    widthPixels = display.width,
+-                    heightPixels = display.height,
+-                    fps = display.fps,
+-                    viewAreas = display.areas.takeIf { it.size > 1 }?.map { AirPlayViewArea(it.width, it.height) },
+-                    initialViewArea = display.area,
+-                    widthPhysicalMm = display.physicalWidthMm(),
+-                ),
+-                display.uiScale,
++            // The size setting is the physical width (DisplayState.physicalWidthMm), no longer a larger canvas.
++            main = AirPlayDisplayConfig(
++                widthPixels = display.width,
++                heightPixels = display.height,
++                fps = display.fps,
++                viewAreas = display.areas.takeIf { it.size > 1 }?.map { AirPlayViewArea(it.width, it.height) },
++                initialViewArea = display.area,
++                widthPhysicalMm = display.physicalWidthMm(),
+             ),
+             rightHandDrive = config.rightHandDrive,
+             port = config.airPlayPort,
+--- a/server/src/test/kotlin/com/playport/server/ViewAreaTest.kt
++++ b/server/src/test/kotlin/com/playport/server/ViewAreaTest.kt
+@@ -36,9 +36,12 @@
+     }
+ 
+     @Test
+-    fun theNarrowestAreaKeepsThePlainDensity() {
+-        assertEquals(300, DisplayState(1920, 1080, 30, 100, true, listOf(windowed, full), 0).physicalWidthMm())
+-        assertNull(DisplayState(1280, 996, 30, 100).physicalWidthMm())
++    fun theSizeIsTheStreamsPhysicalWidth() {
++        assertEquals("standard, with or without areas", 250, DisplayState(1920, 1080, 30, 100, true, listOf(windowed, full), 0).physicalWidthMm())
++        assertEquals(250, DisplayState(1280, 996, 30, 100).physicalWidthMm())
++        assertEquals(listOf(200, 250, 300, 350), listOf(115, 100, 85, 75).map { DisplayState(1280, 720, 30, it).physicalWidthMm() })
++        assertEquals("an unknown value is standard", 250, DisplayState(1280, 720, 30, 90).physicalWidthMm())
++        assertEquals("portrait: the long side has the size", 140, DisplayState(720, 1280, 30, 100).physicalWidthMm())
+     }
+ 
+     @Test
+--- a/web/index.html
++++ b/web/index.html
+@@ -35,7 +35,7 @@
+     <label class="cell"><span class="main"><b data-i18n="debugHud"></b><span data-i18n="debugHudHint"></span></span><input id="debug-hud-on" class="switch" type="checkbox"/></label>
+     <label class="cell"><span class="main"><b data-i18n="compatDisplay"></b><span data-i18n="compatDisplayHint"></span></span><input id="compat-display-on" class="switch" type="checkbox"/></label>
+     <details><summary class="cell"><span class="main"><b data-i18n="custom"></b></span><span id="display-status" class="value" role="status"></span><span class="chev"></span></summary>
+-      <form id="display-form" class="inner"><fieldset id="display-fields"><div class="pair"><label><span data-i18n="width"></span><input id="width" type="number" min="480" max="3840" step="2" required/></label><label><span data-i18n="height"></span><input id="height" type="number" min="480" max="3840" step="2" required/></label></div><div class="pair"><label><span data-i18n="ui"></span><select id="ui-scale"><option value="85" data-i18n="small"></option><option value="100" data-i18n="standard"></option><option value="115" data-i18n="large"></option></select></label><label><span data-i18n="fps"></span><select id="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label></div><div class="pair"><label><span data-i18n="codec"></span><select id="codec"><option value="auto" data-i18n="codecAuto"></option><option value="h264">H.264</option><option value="h265">H.265</option></select></label></div></fieldset><button id="apply" class="btn" data-i18n="apply"></button></form></details>
++      <form id="display-form" class="inner"><fieldset id="display-fields"><div class="pair"><label><span data-i18n="width"></span><input id="width" type="number" min="480" max="3840" step="2" required/></label><label><span data-i18n="height"></span><input id="height" type="number" min="480" max="3840" step="2" required/></label></div><div class="pair"><label><span data-i18n="ui"></span><select id="ui-scale"><option value="75" data-i18n="smaller"></option><option value="85" data-i18n="small"></option><option value="100" data-i18n="standard"></option><option value="115" data-i18n="large"></option></select></label><label><span data-i18n="fps"></span><select id="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label></div><div class="pair"><label><span data-i18n="codec"></span><select id="codec"><option value="auto" data-i18n="codecAuto"></option><option value="h264">H.264</option><option value="h265">H.265</option></select></label></div></fieldset><button id="apply" class="btn" data-i18n="apply"></button></form></details>
+   </div>
+   <p class="foot" data-i18n="autoHint"></p>
+   <div class="group"><label class="cell"><span class="main"><b data-i18n="language"></b></span><select id="language"><option value="zh">简体中文</option><option value="en">English</option></select></label></div>
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -19,7 +19,7 @@
+   cornerTop: ['右上角', 'Top right'], cornerBottom: ['右下角', 'Bottom right'], cornerOff: ['不显示', 'Hidden'],
+   debugHud: ['画面上显示调试信息', 'Debug info over the picture'], debugHudHint: ['帧率、分辨率、码率、声音，右下角', 'Frame rate, size, bitrate, sound; bottom right'],
+   compatDisplay: ['兼容显示', 'Compatible display'], compatDisplayHint: ['有声音但画面黑屏时打开（老车机浏览器默认打开）；切换后页面会刷新', 'Turn on if there is sound but no picture (on by default in older car browsers); the page reloads'],
+-  ui: ['界面大小', 'UI size'], fps: ['帧率', 'Frame rate'], codec: ['视频编码', 'Video codec'], codecAuto: ['自动', 'Automatic'], standard: ['标准', 'Standard'], large: ['大', 'Large'], small: ['小', 'Small'],
++  ui: ['界面大小', 'UI size'], fps: ['帧率', 'Frame rate'], codec: ['视频编码', 'Video codec'], codecAuto: ['自动', 'Automatic'], standard: ['标准', 'Standard'], large: ['大', 'Large'], small: ['小', 'Small'], smaller: ['更小', 'Smaller'],
+   loading: ['正在读取…', 'Loading…'], applying: ['正在应用…', 'Applying…'], applied: ['已保存，正在重新连接 CarPlay。', 'Saved. Reconnecting CarPlay.'],
+   deferred: ['已记下，下次连接 iPhone 时生效，不打断当前画面。', 'Saved for the next connection; the picture is not interrupted now.'],
+   nextSession: ['新画质下次连接生效', 'new quality on next connection'],
+--- a/README.md
++++ b/README.md
+@@ -216,8 +216,9 @@
+ 
+ - **Landscape presets** — 800×480, 1280×720, 1920×720, 1920×1080, 2560×1440, 3840×2160.
+ - **Portrait presets** — 720×1280, 1080×1920 (portrait is simply `height > width`).
+-- **CarPlay UI size** — Smaller/Small/Default/Large requests a proportionally larger canvas, so
+-  CarPlay draws finer controls (75–115%).
++- **CarPlay UI size** — Large/Standard/Small/Smaller tells the phone a screen 200/250/300/350 mm
++  wide; CarPlay lays out by that physical size (more icons on a wider one), not by pixel count. With
++  view areas the whole stream has that width and each window shape its share, so icons keep their size.
+ - **Video codec** — H.265/HEVC is sharper at the same bitrate and is offered when the browser can
+   decode it (probed with `VideoDecoder.isConfigSupported`). The phone makes the final call.
+ - **Frame rate** — 60 fps for smoothness, 30 fps to spend more bitrate on detail.

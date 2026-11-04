@@ -1,0 +1,338 @@
+Taken from the upstreams (docs/上游对照-20261016.md, 2026-10-16).
+
+Touches leave at once: the event channel, which carries them, now sets TCP_NODELAY. The iPhone does not answer
+touches there, so with Nagle's algorithm each waited for the delayed ACK of the previous one and moves arrived in
+bunches (DiPlay 4b5e0bb7; the control connection already had it).
+
+/feedback counts each stream in its own RTP clock. Opus decodes to 48 kHz, but navigation prompts come as 16 kHz
+Opus (audioFormat 0x10000000) and Siri as 24 kHz (0x20000000) (F50 drive 2026-10-13), so the position reported to
+the iPhone ran three and two times ahead; DiPlay saw a call 14.5 s ahead after 20 s, the other side hard to
+understand (DiPlay 817ff3fa, #473/#536). AudioFormat.rtpClockRate is now that clock; the microphone takes its RTP
+step from it as well (as before), and the browser's audio timestamps too (the page does not schedule by them).
+
+/info declares automatic UI and map appearance on every display (uiAppearanceMode/Setting, mapAppearanceMode/
+Setting = 0). On a BYD Tang CarPlay followed the runtime setNightMode only with these (DiPlay 4be0fa39); here
+"always day" had not brightened the picture (F50 2026-10-10). Needs a check in the car.
+
+View areas only of the window's orientation (xcertplay 1836c27): a landscape and a portrait shape together made the
+stream as large as both, a near-square frame. The other orientation's shapes stay remembered; turning the window is
+one reconnect.
+
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt
+@@ -185,6 +185,13 @@
+             "heightPhysical" to heightPhysical,
+             "features" to (display.features ?: (DISPLAY_FEATURE_HIGH_FIDELITY_TOUCH or DISPLAY_FEATURE_KNOBS)),
+             "primaryInputDevice" to display.primaryInputDevice,
++            // Automatic UI and map appearance (0), declared before any setNightMode. Without these a BYD Tang's
++            // CarPlay did not follow its runtime day/night commands; with them it did (DiPlay 4be0fa39,
++            // docs/TANG21_APPEARANCE.md). Our "always day" had not brightened the picture either (F50 2026-10-10).
++            "uiAppearanceMode" to 0,
++            "uiAppearanceSetting" to 0,
++            "mapAppearanceMode" to 0,
++            "mapAppearanceSetting" to 0,
+         )
+ 
+         // Several areas let the car move CarPlay between them (a browser window that changes shape) with
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt
+@@ -631,8 +631,8 @@
+     private fun acceptEvent(server: ServerSocket) {
+         try {
+             val socket = server.accept()
+-            socket.setSoLinger(true, 0)
+-            debugLog("airplay event connection accepted from ${socket.remoteSocketAddress}")
++            prepareEventSocket(socket)
++            debugLog("airplay event connection accepted from ${socket.remoteSocketAddress} noDelay=${socket.tcpNoDelay}")
+             eventSocket = socket
+             val shared = pairVerify.shared
+             if (shared == null) {
+@@ -741,6 +741,16 @@
+     }
+ }
+ 
++/**
++ * The event channel carries touches: small messages sent many times a second that the iPhone does not answer, so
++ * with Nagle's algorithm each one waited for the delayed ACK of the previous one and moves arrived in bunches
++ * (DiPlay 4b5e0bb7).
++ */
++internal fun prepareEventSocket(socket: Socket) {
++    socket.setSoLinger(true, 0)
++    socket.tcpNoDelay = true
++}
++
+ internal fun safeClose(closeable: Closeable?) {
+     try {
+         closeable?.close()
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AudioStream.kt b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AudioStream.kt
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AudioStream.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AudioStream.kt
+@@ -17,6 +17,9 @@
+     val channels: Int,
+     val payloadType: Int,
+     val audioType: String = "media",
++    /** The clock the stream's RTP timestamps count in. Opus decodes to 48 kHz, but its timestamps follow the
++     *  negotiated format: 16 kHz for calls and navigation prompts, 24 kHz for Siri (F50 drive 2026-10-13). */
++    val rtpClockRate: Int = sampleRate,
+ )
+ 
+ /**
+@@ -206,7 +209,7 @@
+         val isOpus = (bits and OPUS_MONO) != 0L
+         val pcm = PCM_FORMAT[bits]
+         return when {
+-            isOpus -> AudioFormat(AudioCodecKind.OPUS, 48_000, 1, payloadType, audioType)
++            isOpus -> AudioFormat(AudioCodecKind.OPUS, 48_000, 1, payloadType, audioType, opusClockRate(bits))
+             isAacLc -> AudioFormat(
+                 AudioCodecKind.AAC_LC,
+                 if ((bits and AAC_LC_48K_STEREO) != 0L) 48_000 else 44_100,
+@@ -219,9 +222,20 @@
+         }
+     }
+ 
++    /** RTP clock of an Opus format; only the 16 and 24 kHz bits have been seen alone, anything else counts 48 kHz. */
++    fun opusClockRate(bits: Long): Int = when {
++        bits and OPUS_48K != 0L -> 48_000
++        bits and OPUS_24K != 0L -> 24_000
++        bits and OPUS_16K != 0L -> 16_000
++        else -> 48_000
++    }
++
++    private const val OPUS_16K = 0x10000000L
++    private const val OPUS_24K = 0x20000000L
++    private const val OPUS_48K = 0x40000000L
+     private const val AAC_LC_44K_STEREO = 0x400000L
+     private const val AAC_LC_48K_STEREO = 0x800000L
+-    private const val OPUS_MONO = 0x10000000L or 0x20000000L or 0x40000000L
++    private const val OPUS_MONO = OPUS_16K or OPUS_24K or OPUS_48K
+ 
+     private val PCM_FORMAT = mapOf(
+         0x4L to (8_000 to 1),
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/airplay/CarPlayMediaEngine.kt b/protocol/src/main/java/com/shilapi/xcertplay/airplay/CarPlayMediaEngine.kt
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/CarPlayMediaEngine.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/CarPlayMediaEngine.kt
+@@ -255,7 +255,7 @@
+         val streams = active.map { meta ->
+             val entry = linkedMapOf<String, Any?>(
+                 "type" to meta.type,
+-                "sampleRate" to meta.format.sampleRate,
++                "sampleRate" to meta.format.rtpClockRate,
+             )
+             val firstSample = meta.firstSample
+             val originNs = meta.originNs
+@@ -265,9 +265,7 @@
+                     0.0,
+                     (nowNs - originNs) / 1e9 - meta.playoutLatencyMs / 1000.0,
+                 )
+-                val firstUnsigned = firstSample.toLong() and 0xffff_ffffL
+-                val sampleTime = (firstUnsigned + Math.round(elapsedSec * meta.format.sampleRate)) and
+-                    0xffff_ffffL
++                val sampleTime = feedbackSampleTime(firstSample, elapsedSec, meta.format)
+                 entry["streamConnectionID"] = unsignedPlistInteger(meta.connectionId ?: 0L)
+                 entry["timestamp"] = session.syncedNtp()
+                 entry["timestampRawNs"] = nowNs
+@@ -357,12 +355,7 @@
+             key = key,
+             codec = format.codec,
+             bitrate = if (format.codec == AudioCodecKind.OPUS) opusBitrate else null,
+-            clockRate = when {
+-                format.codec != AudioCodecKind.OPUS -> format.sampleRate
+-                formatBits and OPUS_16K != 0L -> 16_000
+-                formatBits and OPUS_24K != 0L -> 24_000
+-                else -> 48_000
+-            },
++            clockRate = format.rtpClockRate,
+         )
+     }
+ 
+@@ -393,12 +386,19 @@
+         const val DATASTREAM_OUTPUT_KEY = "DataStream-Output-Encryption-Key"
+         const val DATASTREAM_INPUT_KEY = "DataStream-Input-Encryption-Key"
+         const val IAP_DATASTREAM_UUID = "E9459FD0-BCAD-4C45-820F-1E72447EF2F2"
+-        const val OPUS_16K = 0x10000000L
+         const val OPUS_24K = 0x20000000L
+         const val OPUS_48K = 0x40000000L
+     }
+ }
+ 
++/**
++ * The RTP time a stream has played up to, as /feedback reports it: counted in the stream's own RTP clock. Counting
++ * 16 kHz calls and navigation prompts at their 48 kHz decode rate ran three times ahead of the received audio
++ * (DiPlay #473: 14.5 s ahead after 20 s of a call the driver could not understand).
++ */
++internal fun feedbackSampleTime(firstSample: Int, elapsedSec: Double, format: AudioFormat): Long =
++    ((firstSample.toLong() and 0xffff_ffffL) + Math.round(elapsedSec * format.rtpClockRate)) and 0xffff_ffffL
++
+ internal fun unsignedPlistDecimal(value: Any?): String? = when (value) {
+     is Long -> java.lang.Long.toUnsignedString(value)
+     is Int -> Integer.toUnsignedString(value)
+diff --git a/protocol/src/test/java/com/shilapi/xcertplay/airplay/AirPlayIapTunnelStreamTest.kt b/protocol/src/test/java/com/shilapi/xcertplay/airplay/AirPlayIapTunnelStreamTest.kt
+--- a/protocol/src/test/java/com/shilapi/xcertplay/airplay/AirPlayIapTunnelStreamTest.kt
++++ b/protocol/src/test/java/com/shilapi/xcertplay/airplay/AirPlayIapTunnelStreamTest.kt
+@@ -3,6 +3,7 @@
+ import java.net.InetAddress
+ import java.net.Socket
+ import org.junit.Assert.assertArrayEquals
++import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertTrue
+ import org.junit.Test
+ 
+@@ -54,6 +55,19 @@
+         }
+     }
+ 
++    @Test
++    fun eventChannelSendsTouchesWithoutNagleDelay() {
++        java.net.ServerSocket(0, 1, InetAddress.getLoopbackAddress()).use { server ->
++            Socket(InetAddress.getLoopbackAddress(), server.localPort).use {
++                server.accept().use { accepted ->
++                    assertFalse(accepted.tcpNoDelay)
++                    prepareEventSocket(accepted)
++                    assertTrue(accepted.tcpNoDelay)
++                }
++            }
++        }
++    }
++
+     private fun testSession(): AirPlaySession = AirPlaySession(
+         socket = Socket(),
+         config = AirPlayConfig(
+diff --git a/protocol/src/test/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlistTest.kt b/protocol/src/test/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlistTest.kt
+--- a/protocol/src/test/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlistTest.kt
++++ b/protocol/src/test/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlistTest.kt
+@@ -35,6 +35,28 @@
+     }
+ 
+     @Test
++    fun everyDisplayDeclaresAutomaticAppearance() {
++        val info = AirPlayInfoPlist.build(
++            AirPlayConfig(
++                deviceName = "test",
++                deviceId = "02:00:00:00:00:02",
++                btMac = "02:00:00:00:00:02",
++                sourceVersion = "366.0",
++                main = AirPlayDisplayConfig(widthPixels = 1280, heightPixels = 720),
++                cluster = AirPlayDisplayConfig(widthPixels = 800, heightPixels = 480),
++            ),
++        )
++
++        val displays = info["displays"] as List<*>
++        assertEquals(2, displays.size)
++        for (display in displays.map { it as Map<*, *> }) {
++            for (key in listOf("uiAppearanceMode", "uiAppearanceSetting", "mapAppearanceMode", "mapAppearanceSetting")) {
++                assertEquals(key, 0, display[key])
++            }
++        }
++    }
++
++    @Test
+     fun severalViewAreasAreDeclaredAndSwitchedWithoutReconnecting() {
+         // A browser whose window changes shape (a Tesla windowed 1280x996 and fullscreen 1920x1080): the stream
+         // covers both, each shape is an area at its top left, and the car switches with updateViewArea.
+diff --git a/protocol/src/test/java/com/shilapi/xcertplay/airplay/CarPlayMediaEngineTest.kt b/protocol/src/test/java/com/shilapi/xcertplay/airplay/CarPlayMediaEngineTest.kt
+--- a/protocol/src/test/java/com/shilapi/xcertplay/airplay/CarPlayMediaEngineTest.kt
++++ b/protocol/src/test/java/com/shilapi/xcertplay/airplay/CarPlayMediaEngineTest.kt
+@@ -18,6 +18,26 @@
+     }
+ 
+     @Test
++    fun feedbackCountsSpeechInItsOwnRtpClock() {
++        // audioFormat values from an F50 drive (2026-10-13): navigation prompts and Siri, both Opus decoded at 48 kHz.
++        val navigation = AudioStreamCodec.fromFormatBits(268_435_456L, 101, "default")
++        val siri = AudioStreamCodec.fromFormatBits(536_870_912L, 100, "speechrecognition")
++        assertEquals(48_000, navigation.sampleRate)
++        assertEquals(16_000, navigation.rtpClockRate)
++        assertEquals(24_000, siri.rtpClockRate)
++        assertEquals(1_000L + 320_000L, feedbackSampleTime(1_000, 20.0, navigation))
++        assertEquals(480_000L, feedbackSampleTime(0, 20.0, siri))
++    }
++
++    @Test
++    fun feedbackKeepsMusicAndWrapsLikeRtp() {
++        val music = AudioStreamCodec.fromFormatBits(0x800000L, 102, "media")
++        assertEquals(48_000, music.rtpClockRate)
++        assertEquals(96_000L - 1L, feedbackSampleTime(-1, 2.0, music))   // 0xffffffff + 96000 wraps
++        assertEquals(48_000, AudioStreamCodec.fromFormatBits(0x40000000L, 100).rtpClockRate)
++    }
++
++    @Test
+     fun screenStreamTeardownReportsInactive() {
+         val events = mutableListOf<Pair<Int, Boolean>>()
+         val sink = object : MediaSink {
+diff --git a/server/src/main/kotlin/com/playport/server/WebBridge.kt b/server/src/main/kotlin/com/playport/server/WebBridge.kt
+--- a/server/src/main/kotlin/com/playport/server/WebBridge.kt
++++ b/server/src/main/kotlin/com/playport/server/WebBridge.kt
+@@ -46,7 +46,7 @@
+ 
+     override fun onAudioRtp(type: Int, format: AudioFormat, rtp: ByteArray, sample: Int) {
+         if (rtp.size <= RTP_HEADER_BYTES) return
+-        val timestampUs = (sample.toLong() and 0xffff_ffffL) * 1_000_000L / format.sampleRate
++        val timestampUs = (sample.toLong() and 0xffff_ffffL) * 1_000_000L / format.rtpClockRate
+         val payload = when (format.codec) {
+             com.shilapi.xcertplay.airplay.AudioCodecKind.LPCM -> {
+                 val tail = rtp.copyOfRange(RTP_HEADER_BYTES, rtp.size)
+diff --git a/web/check-car.mjs b/web/check-car.mjs
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -198,8 +198,19 @@
+   const s=areaSize(1920,1080,windowed,773,601);
+   assert.ok(Math.abs(s.width-773*1920/1280)<1e-6 && Math.abs(s.height-601*1080/996)<1e-6,'the area fills the view');
+   assert.deepEqual(areaSize(1280,996,undefined,773,601),{width:773,height:601},'without areas as before');
+-  const four=areaPlan(start,{width:800,height:1280},true,[{width:1280,height:720},{width:1280,height:996},{width:1920,height:1080},{width:1280,height:640}]);
++  const four=areaPlan(start,{width:1280,height:400},true,[{width:1280,height:720},{width:1280,height:996},{width:1920,height:1080},{width:1280,height:640}]);
+   assert.equal(four.display.areas.length,4,'at most four areas');
++  // Turning the window (xcertplay 1836c27): only the window's orientation is declared, so the stream is never the
++  // near-square envelope of a landscape and a portrait shape; the other orientation's shapes stay remembered.
++  const portrait={width:1082,height:1280};
++  const turned=areaPlan(learn.display,portrait,true,learn.shapes);
++  assert.deepEqual([turned.display.width,turned.display.height,turned.display.areas.length],[1082,1280,0],'portrait alone, not 1920x1280');
++  assert.deepEqual(turned.shapes,[windowed,full,portrait],'the landscape shapes are kept');
++  const again=areaPlan(turned.display,full,true,turned.shapes);
++  assert.deepEqual([again.display.width,again.display.height],[1920,1080],'turning back is landscape only');
++  assert.deepEqual(again.display.areas,[windowed,full],'with the shapes learned before');
++  assert.equal(again.display.area,1);
++  assert.deepEqual(again.shapes,[portrait,windowed,full],'and the portrait one is kept in turn');
+ }
+ console.log('View areas: shapes learned once, switched without reconnecting.');
+ { // Tesla fullscreen leaves the page only when its video sites answer (offline Tesla, simulated 2026-10-14).
+diff --git a/web/src/display-fit.ts b/web/src/display-fit.ts
+--- a/web/src/display-fit.ts
++++ b/web/src/display-fit.ts
+@@ -21,14 +21,20 @@
+ 
+ export interface Area { width: number; height: number }
+ export interface AreaDisplay { width: number; height: number; hevc: boolean; areas?: Area[]; area?: number }
+-/** Window shapes kept per browser as CarPlay view areas (protocol: at most 4). */
++/** Window shapes kept per browser and orientation as CarPlay view areas (protocol: at most 4). */
+ export const MAX_AREAS = 4;
+-/** View areas (2026-10-14): each window shape this browser has shown (normal, fullscreen, the car's dock shown or not)
++/** View areas (2026-10-14): each window shape of this orientation the browser has shown (normal, fullscreen, the car's dock shown or not)
+  *  becomes an area at the stream's top left, the stream as large as all of them. A shape seen before is reached by
+  *  switching area, without reconnecting CarPlay; a new shape, or one that wants a clearly sharper size, declares the
+  *  areas again (one reconnect). Returns what to send and the shapes to keep, or null when nothing changes. */
+ export function areaPlan<T extends AreaDisplay>(display: T, target: Area, hevc: boolean, known: Area[]): { display: T; shapes: Area[] } | null {
+-  const shapes = known.filter(s => s.width > 0 && s.height > 0).slice(-MAX_AREAS).map(s => ({ width: s.width, height: s.height }));
++  // Only shapes of the target's orientation are declared: a landscape and a portrait shape together make the stream
++  // as large as both, a near-square frame the iPhone has to encode (xcertplay 1836c27). Shapes of the other
++  // orientation stay remembered for when the window turns back; turning is one reconnect.
++  const landscape = (s: Area) => s.width >= s.height, wide = landscape(target);
++  const valid = known.filter(s => s.width > 0 && s.height > 0).map(s => ({ width: s.width, height: s.height }));
++  const other = valid.filter(s => landscape(s) !== wide).slice(-MAX_AREAS);
++  const shapes = valid.filter(s => landscape(s) === wide).slice(-MAX_AREAS);
+   let at = shapes.findIndex(s => !aspectChanged(s, target));
+   if (at < 0) {
+     shapes.push({ ...target });
+@@ -42,8 +48,9 @@
+   const declared = display.areas ?? [];
+   const same = display.width === width && display.height === height && display.hevc === hevc &&
+     declared.length === areas.length && declared.every((a, i) => a.width === areas[i].width && a.height === areas[i].height);
+-  if (same) return areas.length && (display.area ?? 0) !== at ? { display: { ...display, area: at }, shapes } : null;
+-  return { display: { ...display, width, height, hevc, areas, area: areas.length ? at : 0 }, shapes };
++  const kept = [...other, ...shapes];
++  if (same) return areas.length && (display.area ?? 0) !== at ? { display: { ...display, area: at }, shapes: kept } : null;
++  return { display: { ...display, width, height, hevc, areas, area: areas.length ? at : 0 }, shapes: kept };
+ }
+ /** The picture element's size so that the area in use fills the view (the rest of the stream lies outside it, to the
+  *  right and below; touches, normalized over the element, stay in stream coordinates). Without areas: shownSize. */

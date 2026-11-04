@@ -14,6 +14,8 @@ TESLA_SOUND_TITLE = '导航播报从哪里出声？'
 
 
 def title(step, draft):
+    if step == 'uplink' and draft.get('car_internet') == 'usb_tether':
+        return '备用 WiFi（可选）'
     return TESLA_SOUND_TITLE if step == 'sound' and draft.get('tesla') else TITLES[step]
 # Asked by the owner (2026-10-29): CarPlay itself must not be read as eating the phone's data.
 DATA_USE = ('CarPlay 的画面和声音只在盒子与 iPhone 之间传，不经外网、不耗流量；在 CarPlay 里听音乐、导航时，'
@@ -27,7 +29,7 @@ def sequence(draft):
     steps += ['network']
     if draft.get('mode') == 'box_hotspot':
         steps += ['internet']
-        if draft.get('car_internet') == 'phone_hotspot':
+        if draft.get('car_internet') in ('phone_hotspot', 'usb_tether'):
             steps += ['uplink']
     return steps + ['sound', 'iphone', 'summary']
 
@@ -62,6 +64,9 @@ def limitations(draft, capable=False):
     if draft.get('mode') == 'box_hotspot':
         if draft.get('car_internet') == 'phone_hotspot':
             result.append('手机要一直开着个人热点；找不到热点或掉线时退回不上网。' + DATA_USE)
+        elif draft.get('car_internet') == 'usb_tether':
+            result.append('优先用 USB 上网；' + ('USB 不可用时改连备用 WiFi。' if draft.get('uplink') else
+                                              '未设置备用 WiFi，USB 不可用时保持局域网，车机自带应用暂时不能联网。'))
         elif draft.get('tesla'):
             result.append('连着 DashPlay 时，特斯拉自带的音乐、地图等不能联网，CarPlay 正常。')
         else:
@@ -101,7 +106,7 @@ class FirstSetup:
         return next((s for s in sequence(draft) if s not in draft.get('answered', [])), 'summary')
 
     def apply(self, form):
-        from settings_page import _hotspot_credentials, _car_credentials, _load
+        from settings_page import _hotspot_credentials, _car_credentials, _load, uplink_credentials
         _save = wizard.save_json
         draft = self.load()
         step = self.current(draft)
@@ -163,8 +168,12 @@ class FirstSetup:
                 raise ValueError('请选择车机上网方式。')
             draft['car_internet'] = value
         elif step == 'uplink':
-            ssid, password = _hotspot_credentials(form, draft.get('uplink') or {})
-            draft.update(uplink={'ssid': ssid, 'passphrase': password})
+            optional = draft.get('car_internet') == 'usb_tether'
+            if value == 'skip' and optional:
+                draft['uplink'] = {}
+            else:
+                old = draft.get('uplink', _load(self.page.state / 'uplink-hotspot.json') or {})
+                draft['uplink'] = uplink_credentials(form, old, optional)
         elif step == 'sound':
             if value not in ('yes', 'no'):
                 raise ValueError('请选择声音去向。')
@@ -193,17 +202,19 @@ class FirstSetup:
                 options.pop('car_music', None); options.pop('car_voice', None)
             if draft['mode'] == 'car_hotspot' and draft.get('iphone') != 'wired' and self.page.direct_capable():
                 options['direct_phone'] = True   # wireless on the car hotspot is the direct hotspot
-            _save(self.page.options_file, options)
-            _save(self.page.hotspot_file, draft['hotspot'])
+            updates = {self.page.hotspot_file: draft['hotspot']}
             if draft['mode'] in wizard.JOINS:
-                _save(self.page.car_file, draft['car'])
-            if draft.get('car_internet') == 'phone_hotspot':
-                _save(self.page.state / 'uplink-hotspot.json', draft['uplink'])
+                updates[self.page.car_file] = draft['car']
+            if draft.get('car_internet') in ('phone_hotspot', 'usb_tether'):
+                updates[self.page.state / 'uplink-hotspot.json'] = draft['uplink']
+            updates[self.page.options_file] = options
             setup = {'done': False, 'wizard_version': 2, 'confirmed': True, 'mode': draft['mode'],
                      'iphone': draft['iphone'], 'box': draft['mode'] == 'box_hotspot'}
             if draft['mode'] in wizard.JOINS:
                 setup['car'] = draft['car']['ssid']
-            wizard.save(self.page.state, setup)
+            updates[self.page.state / 'setup.json'] = setup
+            wizard.save_json_many(updates)
+            print('settings: setup saved mode=' + draft['mode'] + ' fallback=' + str(bool(draft.get('uplink'))), flush=True)
             self.path.unlink(missing_ok=True)
             self.page.apply_later('setup confirmed')
             if draft['mode'] in wizard.JOINS:
@@ -265,12 +276,18 @@ class FirstSetup:
                             ('phone_hotspot', '需要，连接 WiFi 热点', '盒子连手机热点或随身 WiFi，转给车机上网；车机自带的应用用它的流量，CarPlay 本身不耗流量。热点要一直开着，找不到时退回不上网。')]
             if self.page.wired_capable():
                 options_list.append(('usb_tether', '需要，USB 共享网络',
-                                     '手机或随身 WiFi 用数据线插盒子，转给车机上网。iPhone 打开个人热点，可以就是做有线 CarPlay 的那根线；安卓手机打开 USB 网络共享。拔线后自动改连设置里保存过的热点。'))
+                                     '手机或随身 WiFi 用数据线插盒子，转给车机上网。iPhone 打开个人热点，可以就是做有线 CarPlay 的那根线；安卓手机打开 USB 网络共享。下一步可设置备用 WiFi，拔线后自动改连；也可只用 USB。'))
             options_list.append(('mifi', '需要，我有随身 WiFi', '返回网络来源，改用随身 WiFi。'))
             form += choices(options_list, draft.get('car_internet', 'none'))
         elif step == 'uplink':
-            form += self.credentials(draft.get('uplink', {}).get('ssid', ''), bool(draft.get('uplink')))
+            from settings_page import _load, uplink_security_field
+            old = draft.get('uplink', _load(self.page.state / 'uplink-hotspot.json') or {})
+            optional = draft.get('car_internet') == 'usb_tether'
+            form += uplink_security_field(old)
+            form += self.credentials(old.get('ssid', ''), bool(old.get('passphrase')), optional=optional, uplink=True)
             form += '<p class=foot>可以是手机热点（跑 CarPlay 的同一部 iPhone 或另一部手机），也可以是随身 WiFi。</p>'
+            if optional:
+                form += '<p class=foot>USB 不可用时才连接备用 WiFi。跳过会取消原有备用热点，只用 USB 上网。</p>'
         elif step == 'sound':
             if draft.get('tesla'):
                 form += choices([('no', 'CarPlay 网页（推荐）', '音乐、Siri、通话走特斯拉蓝牙，导航播报在 CarPlay 画面里放。'),
@@ -294,6 +311,10 @@ class FirstSetup:
                      '不走 CarPlay（车机蓝牙）' if draft.get('audio_route_navigation') == 'bluetooth' else '留在 CarPlay')]
             if draft.get('uplink') and draft.get('car_internet') == 'phone_hotspot':
                 rows += [('手机热点', draft['uplink']['ssid'])]
+            if draft.get('car_internet') == 'usb_tether':
+                rows += [('备用 WiFi', draft['uplink']['ssid'] if draft.get('uplink') else '未设置备用 WiFi，只用 USB')]
+            if draft.get('uplink') and draft.get('car_internet') in ('phone_hotspot', 'usb_tether'):
+                rows += [('热点类型', '开放网络（无密码）' if draft['uplink'].get('security') == 'open' else '加密网络')]
             if draft['mode'] == 'box_hotspot':
                 rows += [('网段', '100.96.0.1/24（冲突时使用共享空间备用网段）' if draft['tesla'] else '盒子默认网段'),
                          ('联网检查', '不上网或退回时替特斯拉回答' if draft['tesla'] else '不代答')]
@@ -303,6 +324,9 @@ class FirstSetup:
         if step != 'network' or draft['mode'] == 'box_hotspot':
             form += f'<button class=btn>{"确认并应用" if step == "summary" else "下一步"}</button></form>'
         body += form
+        if step == 'uplink' and draft.get('car_internet') == 'usb_tether':
+            # A separate form keeps Enter in the credential fields on "Next", never on "Skip".
+            body += f'<form method=post action=/setup-flow>{ui.hidden(nonce, action="uplink", value="skip")}<button class="btn plain">跳过，只用 USB</button></form>'
         if steps.index(step):
             body += f'<form method=post action=/setup-flow>{ui.hidden(nonce, action="back")}<button class="btn plain">返回修改</button></form>'
         if step == 'summary':
@@ -312,10 +336,11 @@ class FirstSetup:
                        and self.page.scanner and scanning else False)
 
     @staticmethod
-    def credentials(ssid, saved=False):
+    def credentials(ssid, saved=False, optional=False, uplink=False):
         return (f'<label class=cell><span class=main><b>热点名称</b></span><input type=text name=ssid value="{escape(ssid)}" '
-                'maxlength=32 required placeholder=热点名称 autocapitalize=off style="text-align:right" aria-label=热点名称></label>'
+                f'maxlength=32 {"" if optional else "required "}placeholder=热点名称 autocapitalize=off style="text-align:right" aria-label=热点名称></label>'
                 '<label class=cell><span class=main><b>热点密码</b></span><input type=password name=password minlength=8 maxlength=63 '
-                f'placeholder="{"留空沿用已保存的密码" if saved else "至少 8 位"}" {"" if saved else "required "}'
+                f'placeholder="{"留空沿用已保存的密码" if saved else "至少 8 位"}" {"" if saved or optional or uplink else "required "}'
                 'autocomplete=new-password style="text-align:right" aria-label=热点密码></label>'
-                + ('<p class=foot>密码留空沿用已保存的密码。</p>' if saved else ''))
+                + ('<p class=foot>开放网络无需密码；加密网络留空沿用同名热点密码，改名需填写密码。</p>' if uplink else
+                   '<p class=foot>密码留空沿用已保存的密码。</p>' if saved else ''))

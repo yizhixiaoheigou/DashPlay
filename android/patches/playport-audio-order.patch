@@ -1,0 +1,110 @@
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AudioStream.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AudioStream.kt
+@@ -6,6 +6,7 @@
+ import java.net.DatagramSocket
+ import java.net.InetAddress
+ import java.net.InetSocketAddress
++import java.net.SocketTimeoutException
+ import java.util.concurrent.atomic.AtomicBoolean
+ import java.util.concurrent.atomic.AtomicInteger
+ 
+@@ -82,12 +83,31 @@
+     private fun runData(socket: DatagramSocket, listener: Listener) {
+         val stats = StreamReceiveStats("audio type=$streamType", onDiagnostic)
+         val buffer = ByteArray(DATAGRAM_BYTES)
++        socket.soTimeout = 20
++        val ordered = RtpAudioOrder<Pair<ByteArray, Int>>(emit = { (rtp, sample) ->
++            if (!started) {
++                started = true
++                listener.onStarted(sample)
++            }
++            listener.onRtp(rtp, sample)
++        })
++        var orderReportNs = System.nanoTime()
++        fun reportOrder(ended: Boolean = false) {
++            if (!ended && System.nanoTime() - orderReportNs < 5_000_000_000L) return
++            orderReportNs = System.nanoTime()
++            onDiagnostic("Audio order type=$streamType reordered=${ordered.reordered} lateDropped=${ordered.lateDropped} missing=${ordered.missing} queued=${ordered.queued} ended=$ended")
++        }
+         try {
+             while (!closed.get()) {
+                 val packet = DatagramPacket(buffer, buffer.size)
+                 try {
+                     stats.reading()
+                     socket.receive(packet)
++                } catch (_: SocketTimeoutException) {
++                    if (closed.get()) return
++                    ordered.flush()
++                    reportOrder()
++                    continue
+                 } catch (_: Exception) {
+                     if (closed.get()) return else continue
+                 }
+@@ -153,14 +173,12 @@
+                     )
+                 }
+                 listener.onPacket(wire, rtp, sample, null)
+-                if (!started) {
+-                    started = true
+-                    listener.onStarted(sample)
+-                }
+-                listener.onRtp(rtp, sample)
++                val sequence = ((rtp[2].toInt() and 0xff) shl 8) or (rtp[3].toInt() and 0xff)
++                ordered.offer(sequence, rtp to sample)
++                reportOrder()
+                 stats.processed()
+             }
+-        } finally { stats.flush(ended = true) }
++        } finally { stats.flush(ended = true); reportOrder(ended = true) }
+     }
+ 
+     private fun runControl(socket: DatagramSocket) {
+--- /dev/null
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/RtpAudioOrder.kt
+@@ -0,0 +1,46 @@
++package com.shilapi.xcertplay.airplay
++
++/** Bounded UDP reordering before decoding; contiguous traffic is delivered without waiting. */
++internal class RtpAudioOrder<T>(
++    private val emit: (T) -> Unit,
++    private val nowNs: () -> Long = System::nanoTime,
++    private val maxWaitNs: Long = 80_000_000L,
++    private val maxPackets: Int = 64,
++) {
++    private data class Pending<T>(val value: T, val arrived: Long, val held: Boolean)
++    private val pending = mutableMapOf<Int, Pending<T>>()
++    private var expected: Int? = null
++    var reordered = 0L; private set
++    var lateDropped = 0L; private set
++    var missing = 0L; private set
++    val queued: Int get() = pending.size
++
++    fun offer(sequence: Int, value: T) {
++        val seq = sequence and 0xffff
++        val next = expected ?: seq.also { expected = it }
++        val delta = (seq - next) and 0xffff
++        if (delta >= 0x8000 || pending.containsKey(seq)) { lateDropped++; return }
++        pending[seq] = Pending(value, nowNs(), delta != 0)
++        flush()
++    }
++
++    /** Also called on socket timeout, so one missing packet cannot hold the end of a prompt forever. */
++    fun flush() {
++        while (pending.isNotEmpty()) {
++            val next = expected ?: return
++            val ready = pending.remove(next)
++            if (ready != null) {
++                expected = (next + 1) and 0xffff
++                if (ready.held) reordered++
++                emit(ready.value)
++                continue
++            }
++            val first = pending.keys.minByOrNull { (it - next) and 0xffff } ?: return
++            val distance = (first - next) and 0xffff
++            val oldest = pending.values.minOf { it.arrived }
++            if (pending.size < maxPackets && distance < maxPackets && nowNs() - oldest < maxWaitNs) return
++            missing += distance.toLong()
++            expected = first
++        }
++    }
++}

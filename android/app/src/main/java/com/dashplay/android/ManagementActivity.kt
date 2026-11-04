@@ -20,14 +20,15 @@ class ManagementActivity : Activity() {
         root.addView(ui.button(R.style.Button_Text, getString(R.string.back)) { finish() })
         root.addView(ui.text(R.style.Text_Title, getString(R.string.manage_title)))
         root.addView(ui.text(R.style.Text_Small, getString(R.string.manage_help)))
-        val address = DashPlayService.snapshot().address
+        root.addView(ui.text(R.style.Text_Small, getString(R.string.browser_scheme_hint)))
+        val address = DashPlayService.snapshot().directAddress
         if (address == null) {
             root.addView(ui.text(R.style.Text_Name, getString(R.string.manage_no_network)))
             root.addView(ui.button(R.style.Button_Secondary, getString(R.string.wifi_open_settings)) { Intents.openHotspotSettings(this) })
             root.addView(ui.button(R.style.Button_Primary, getString(R.string.manage_refresh)) { recreate() })
         } else {
-            val link = "https://$address/manage#token=${Settings(this).adminToken}"
-            root.addView(ui.text(R.style.Text_Name, "https://$address/manage").apply { setTextIsSelectable(true) })
+            val link = "http://$address/manage"
+            root.addView(ui.text(R.style.Text_Name, link).apply { setTextIsSelectable(true) })
             root.addView(ImageView(this).apply {
                 setImageBitmap(ui.qr(link, ui.dp(240)))
                 contentDescription = getString(R.string.manage_qr)
@@ -43,11 +44,11 @@ class ManagementActivity : Activity() {
             })
             val direct = DashPlayService.snapshot().directAddress
             if (direct != null && direct != address) {
-                root.addView(ui.text(R.style.Text_Small, "域名无法打开时，可用本地管理地址恢复；浏览器可能提示证书不匹配。"))
-                root.addView(ui.text(R.style.Text_Name, "https://$direct/manage").apply { setTextIsSelectable(true) })
+                root.addView(ui.text(R.style.Text_Small, "可用本地 HTTP 管理地址恢复，无需域名或证书。"))
+                root.addView(ui.text(R.style.Text_Name, "http://$direct/manage").apply { setTextIsSelectable(true) })
                 root.addView(ui.button(R.style.Button_Secondary, "复制本地管理入口") {
                     (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(
-                        ClipData.newPlainText("DashPlay", "https://$direct/manage#token=${Settings(this).adminToken}"))
+                        ClipData.newPlainText("DashPlay", "http://$direct/manage"))
                     Toast.makeText(this, R.string.manage_copied, Toast.LENGTH_SHORT).show()
                 })
             }

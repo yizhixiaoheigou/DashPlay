@@ -11,7 +11,7 @@ import android.os.UserManager
 
 /**
  * Receives USB_DEVICE_ATTACHED so Android remembers "Always open DashPlay" across plug-ins and 0x52
- * CarPlay re-enumerations. Dynamically enabled only while wired USB is enabled and DashPlay has not
+ * CarPlay re-enumerations. Enabled for initial USB setup, then while wired USB is enabled and DashPlay has not
  * been explicitly stopped, so stopping DashPlay or turning off USB leaves normal photo/MTP transfer untouched.
  */
 class UsbAttachActivity : Activity() {
@@ -27,14 +27,19 @@ class UsbAttachActivity : Activity() {
             return
         }
         val settings = Settings(this)
-        if (!DashPlayService.userStopped && settings.usesUsb) {
-            if (DashPlayService.status == Status.STOPPED) DashPlayService.start(this)
+        if (!DashPlayService.userStopped) {
+            if (settings.usesUsb) {
+                if (DashPlayService.status == Status.STOPPED) DashPlayService.start(this)
+            } else if (settings.wiredCarPlaySupported && !settings.usbChoiceMade) {
+                // First attach leads to visible local setup, never silently grants VPN/Internet consent.
+                startActivity(Intent(this, if (settings.setupDone) UsbActivity::class.java else MainActivity::class.java))
+            }
         }
         finish()
     }
 
     companion object {
-        fun sync(context: Context, active: Boolean = !DashPlayService.userStopped && Settings(context).usesUsb) {
+        fun sync(context: Context, active: Boolean = !DashPlayService.userStopped && Settings(context).let { it.usesUsb || it.wiredCarPlaySupported && !it.usbChoiceMade }) {
             runCatching {
                 val component = ComponentName(context.applicationContext, UsbAttachActivity::class.java)
                 val state = if (active) PackageManager.COMPONENT_ENABLED_STATE_ENABLED

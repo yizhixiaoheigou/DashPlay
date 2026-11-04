@@ -1,0 +1,832 @@
+Viewer: fixes from the F50 drive of 2026-10-13 (XPeng, Chrome 120, wireless CarPlay), most tried in the car the
+same evening by swapping the page over Tailscale.
+
+Media card: the car's card reads only the Media Session position state and runs it on by its own clock, which put
+the bar at the end all the time (without a position state it showed no bar; with the music element on the song's
+timeline the bar still stood full). The position now goes out on every 750 ms tick at a near-zero rate (0 is
+refused): the bar follows the song. Its play/pause state follows the iPhone's own.
+
+Music keeps its own timeline again. Moving the element onto the song (playport-media-element-timeline,
+playport-music-seamless-align) seeked on every song change, a short hiccup each time; when the next song was
+shorter Chrome 120 removed buffered audio on the smaller duration, so the next appendBuffer threw "This
+SourceBuffer is still processing" into the error banner; and while the iPhone's now-playing reports stalled over
+Bluetooth (93 s without one) it pulled the music back every 5 s. How far behind the newest audio it plays is
+logged (musicLeadMaxMs/MinMs, 0.8 to 1.5 s), not drained by playing faster: 1.03x crackled at song changes.
+
+The car pauses the iPhone over its Bluetooth for its own video app and does not resume it; the page plays on the
+iPhone's silence, so the car turns its play/pause key into pause. A pause key while the iPhone is paused now means
+play: one press of the steering wheel or the card plays again. (Pausing the element with the iPhone instead made
+the car's video app fall silent after a second or two.)
+
+Fullscreen: #app is pinned to the window's edges instead of 100dvh, which Chrome 120 left at 641 px after
+fullscreen changes while the window was 579, so CarPlay's bottom row (home button) went below the screen; the
+renegotiations to 1280x936 came from that same stale height. Fullscreen is renegotiated once per browser, not on
+every entry, a close shape only stretching. A tap goes back to fullscreen only after the car covered the page
+(reverse camera), not in the 2 s after leaving fullscreen with the car's back button, when it never reached
+CarPlay.
+
+Calls (same evening, iPhone not on the car's own Bluetooth): the other side heard crackle. Opus input streams
+count their RTP timestamps in the stream's own rate, 16 kHz for telephony and 24 kHz for Siri (audioFormat bits),
+while every 20 ms packet advanced them by 960 (48 kHz); now 320 and 480 (MicrophoneConfig.clockRate), and the
+call was heard. The XPeng's microphone reaches the browser very quiet (speech peaking at 1% of full scale), so the
+page raises it 16 times with a limiter (?micgain=1..64), the owner's choice: the voice is heard best, though the
+other side also hears the echo of the car's speakers the browser leaves (open). Ducking the microphone while the
+far end played did not remove it and made the voice rough, so it is not used.
+
+For the next drive's log: the page build, the window/viewport/screen sizes with each page event (ev 5 on resize),
+the car's media keys that reached the page (keyPlay/keyPause/keyPauseAsPlay/keyNext/keyPrev), play() refused by
+the browser (musicBlocked), the microphone (micState/micPackets/micFrames/micPeak/micGain, mic context, track
+and encoder), the far end's queue and output latency (farQueueMaxMs/outLatMs), and each media key the receiver sends to the iPhone ("viewer media key").
+
+--- a/web/src/music-output.ts
++++ b/web/src/music-output.ts
+@@ -3,17 +3,19 @@
+ import type { AudioConfigMessage } from './protocol';
+ /** aac: stream 102's AAC as sent. flac: the wired iPhone's LPCM, losslessly framed (flac-mp4.ts). */
+ export type MusicKind = 'aac' | 'flac';
+-/** The song as the iPhone reports it: position and duration in seconds, and what identifies the song. */
+-export interface SongTimeline { position: number; duration: number; key: string; playing: boolean; }
+ const MIMES: Record<MusicKind,string> = { aac: 'audio/mp4; codecs="mp4a.40.2"', flac: FLAC_MIME };
+ /** How far behind the newest audio the element plays. Over Wi-Fi (AAC) the iPhone's packets come with gaps of
+  *  about 400 ms every few seconds (F50, 2026-10-12): 0.65 s ran dry and the music stuttered. */
+ const CUSHION: Record<MusicKind,number> = { aac: 1, flac: .65 };
+ /** AAC frames (1024 samples, 21 ms) per MP4 fragment: small, so audio reaches the element as it arrives. */
+ const AAC_FRAGMENT = 4;
+-/** Fragments (85 ms each, AAC and FLAC alike) that may wait for the buffer: more than a realignment replays (5 s). */
++/** Fragments (85 ms each, AAC and FLAC alike) that may wait for a busy buffer before it counts as stuck (6.8 s). */
+ const MAX_PENDING = 80;
+-/** A real HTML media timeline makes received music eligible for OS media controls. */
++/** A real HTML media timeline makes received music eligible for OS media controls. Its timeline is its own and is
++ *  never moved onto the song: the song position reaches the car's media card through the Media Session position
++ *  state (media-session.ts), the only one the car's card reads (F50 drive 2026-10-13). Moving it (2026-10-13) seeked on every song change, a hiccup and on Chrome 120 an
++ *  appendBuffer error (a shorter duration removes buffered audio), and pulled the music back every 5 s while
++ *  the iPhone's position reports stalled over Bluetooth (F50 drive 2026-10-13, 93 s without one). */
+ export class MusicOutput {
+   static supported(kind: MusicKind = 'aac') { return typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(MIMES[kind]); }
+   static key(config: AudioConfigMessage, kind: MusicKind) { return JSON.stringify([kind,config.sampleRate,config.channels,Array.from(config.description)]); }
+@@ -31,15 +33,12 @@
+   private pcm:Uint8Array[]=[];
+   private pcmBytes=0;
+   private block=0;
+-  private song:(SongTimeline&{at:number})|null=null;
+-  private alignedKey='';
+-  private alignedAt=-Infinity;
+   private started=false;
+-  /** Fragments of the last seconds, so a realignment replays what was not heard yet instead of dropping it. */
+-  private recent:{sample:number;length:number;data:Uint8Array}[]=[];
+-  private realign:{offset:number;from:number;duration:number}|null=null;
+-  /** For the viewer log: the element waited for audio, skipped ahead, moved onto the song's timeline. */
+-  private counts={musicWaits:0,musicSkips:0,musicAligns:0,musicSysPauses:0};
++  /** For the viewer log: the element waited for audio, skipped ahead, was paused by the car, or the browser refused
++   *  to play it (no user gesture). */
++  private counts={musicWaits:0,musicSkips:0,musicSysPauses:0,musicBlocked:0};
++  /** For the viewer log: how far behind the newest audio the element played, most and least in this report. */
++  private lead={max:0,min:Infinity};
+   private pausing=false;
+   private readonly rate:number;
+   private readonly channels:number;
+@@ -75,7 +74,7 @@
+       if(target>this.element.currentTime)this.element.currentTime=Math.max(b.buffered.start(0),target);
+       else{this.holding=true;this.pump();return Promise.resolve();}
+     }
+-    return this.element.play();
++    return this.element.play().catch(error=>{if((error as Error)?.name==='NotAllowedError')this.counts.musicBlocked++;throw error;});
+   }
+   volume(value:number){this.element.volume=Math.max(0,Math.min(1,value));}
+   packet(data:Uint8Array){
+@@ -105,55 +104,26 @@
+     this.pump();
+   }
+   private queue(data:Uint8Array,length:number){
+-    this.pending.push(data);this.recent.push({sample:this.samples,length,data});this.samples+=length;
+-    while(this.recent.length&&this.recent[0].sample<this.samples-5*this.rate)this.recent.shift();
++    this.pending.push(data);this.samples+=length;
+   }
+-  report():Record<string,number>{const counts=this.counts;this.counts={musicWaits:0,musicSkips:0,musicAligns:0,musicSysPauses:0};return counts;}
+-  /** A car's media card may show this element's own timeline instead of the song's (2026-10-12 drive: it ran on
+-   *  from the start of the music, 0 to 671 s, duration unknown, while the song was at 8 of 269 s). */
+-  follow(song:SongTimeline|null){
+-    this.song=song&&song.duration>0?{...song,at:performance.now()}:null;
+-    this.pump();
+-  }
+-  /** Moves the element onto the song's timeline: on a new song, or when it is more than 3 s off. The audio not
+-   *  heard yet is appended again on the new timeline, so the music goes on with its cushion (dropping it left a
+-   *  second of silence and then nothing in hand for the next Wi-Fi gap, F50 2026-10-12). */
+-  private align(b:SourceBuffer):boolean{
+-    if(this.realign){
+-      const {offset,from,duration}=this.realign;this.realign=null;
+-      b.timestampOffset=offset;
+-      this.pending=this.recent.filter(f=>f.sample+f.length>from).map(f=>f.data);
+-      this.source.duration=Math.max(duration,from/this.rate+offset);
+-      this.element.currentTime=from/this.rate+offset;
+-      return false;
+-    }
+-    // Paused (by the car for another app, or not unlocked yet): aligned when it plays again.
+-    const song=this.song;if(!song||!this.started||this.element.paused)return false;
+-    const position=Math.min(song.duration,song.position+(song.playing?(performance.now()-song.at)/1000:0));
+-    const now=performance.now();
+-    if(song.key===this.alignedKey&&(Math.abs(this.element.currentTime-position)<=3||now-this.alignedAt<5000))return false;
+-    this.alignedKey=song.key;this.alignedAt=now;this.counts.musicAligns++;
+-    if(!b.buffered.length){
+-      const queued=this.recent.find(f=>this.pending.includes(f.data));   // nothing appended yet: the next fragment starts the song
+-      b.timestampOffset=position-(queued?queued.sample:this.samples)/this.rate;
+-      this.source.duration=Math.max(song.duration,position);this.element.currentTime=position;
+-      return false;
+-    }
+-    // The sample being heard now becomes the song position.
+-    const from=Math.max(0,Math.round((this.element.currentTime-b.timestampOffset)*this.rate));
+-    this.realign={offset:position-from/this.rate,from,duration:song.duration};
+-    b.remove(0,Infinity);
+-    return true;
++  report():Record<string,number>{
++    const counts:Record<string,number>=this.counts;this.counts={musicWaits:0,musicSkips:0,musicSysPauses:0,musicBlocked:0};
++    if(this.lead.max>0)Object.assign(counts,{musicLeadMaxMs:Math.round(this.lead.max*1000),musicLeadMinMs:Math.round(this.lead.min*1000)});
++    this.lead={max:0,min:Infinity};return counts;
+   }
+   private pump(){
+     const b=this.buffer;if(this.closed||!b||b.updating||this.source.readyState!=='open')return;
+     try {
+-      if(this.align(b))return;
+       if(b.buffered.length){
+         const end=b.buffered.end(b.buffered.length-1),now=this.element.currentTime;
+         if(end-now>CUSHION[this.kind]+1.35){this.element.currentTime=Math.max(b.buffered.start(0),end-CUSHION[this.kind]);this.counts.musicSkips++;}
++        else if(!this.element.paused){
++          // Not drained by playing faster: switching to 1.03 at song changes (the iPhone sends the new song in a
++          // burst) crackled in the XPeng's Chrome (F50 drive 2026-10-13).
++          const lead=end-now;this.lead.max=Math.max(this.lead.max,lead);this.lead.min=Math.min(this.lead.min,lead);
++        }
+         if(now-b.buffered.start(0)>15){b.remove(0,now-10);return;}
+-        if(this.holding&&end-now>=CUSHION[this.kind]){this.holding=false;void this.element.play().catch(()=>{});}
++        if(this.holding&&end-now>=CUSHION[this.kind]){this.holding=false;void this.element.play().catch(error=>{if((error as Error)?.name==='NotAllowedError')this.counts.musicBlocked++;});}
+       }
+       const next=this.pending.shift();if(next){b.appendBuffer(next as Uint8Array<ArrayBuffer>);this.started=true;}
+     }catch(error){this.onError(String(error));}
+--- a/web/src/audio.ts
++++ b/web/src/audio.ts
+@@ -1,4 +1,4 @@
+-import { MusicOutput, type SongTimeline } from './music-output';
++import { MusicOutput } from './music-output';
+ import { audioStartTime } from './audio-timing';
+ import { AudioCodec, type AudioConfigMessage, type AudioPacketMessage } from './protocol';
+ 
+@@ -173,11 +173,6 @@
+     this.closeStream(streamType);
+   }
+ 
+-  /** Keeps the music element's timeline on the song (music-output.ts). */
+-  followMusic(song: SongTimeline | null): void {
+-    for (const state of this.streams.values()) state.music?.follow(song);
+-  }
+-
+   /** Music element counters for the viewer log (music-output.ts). */
+   musicReport(): Record<string, number> {
+     const total: Record<string, number> = {};
+@@ -210,6 +205,15 @@
+     }
+   }
+ 
++  /** For the viewer log: how far ahead the far end (a call, Siri) is queued, and the reported output latency
++   *  (F50 drive 2026-10-13: about 160 ms and 200 ms, so the car's speakers play a call about 0.4 s late). */
++  private farQueueMaxMs = 0;
++  farReport(): Record<string, number> {
++    if (!this.farQueueMaxMs) return {};
++    const out = { farQueueMaxMs: Math.round(this.farQueueMaxMs), outLatMs: Math.round(((this.context as AudioContext & {outputLatency?: number}).outputLatency ?? this.context.baseLatency ?? 0) * 1000) };
++    this.farQueueMaxMs = 0; return out;
++  }
++
+   private playAudioData(state: StreamState, data: AudioData): void {
+     if (!this.unlocked) return;
+     const numberOfChannels = Math.max(1, data.numberOfChannels);
+@@ -219,7 +223,9 @@
+       data.copyTo(plane, { planeIndex: channel, format: 'f32-planar' });
+       buffer.copyToChannel(plane, channel);
+     }
+-    this.schedule(state, buffer);
++    const start = this.schedule(state, buffer);
++    if (start === null || state.name === 'media') return;
++    this.farQueueMaxMs = Math.max(this.farQueueMaxMs, (start - this.context.currentTime) * 1000);
+   }
+ 
+   private playPcm(state: StreamState, payload: Uint8Array): void {
+@@ -240,10 +246,10 @@
+     this.schedule(state, buffer);
+   }
+ 
+-  private schedule(state: StreamState, buffer: AudioBuffer): void {
++  private schedule(state: StreamState, buffer: AudioBuffer): number | null {
+     const now = this.context.currentTime;
+     const start = audioStartTime(now, state.nextPlayTime, state.name === 'media');
+-    if (start === null) return;
++    if (start === null) return null;
+     state.nextPlayTime = start;
+     const source = this.context.createBufferSource();
+     source.buffer = buffer;
+@@ -252,6 +258,7 @@
+     source.start(state.nextPlayTime);
+     this.lastAudioAt = performance.now();
+     state.nextPlayTime += buffer.duration;
++    return start;
+   }
+ }
+ 
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -5,7 +5,7 @@
+ import { Connection } from './ws';
+ import { SystemMedia } from './media-session';
+ import { LagProbe } from './lag';
+-import { shownSize, suggestedResolution, aspectChanged, closeShape } from './display-fit';
++import { shownSize, suggestedResolution, renegotiate } from './display-fit';
+ import { t, language, setLanguage, type Key } from './i18n';
+ import { isNight, parseNightMode } from './night';
+ import type { ServerMessage, ClientMessage } from './protocol';
+@@ -128,7 +128,7 @@
+   // Straight back, also before CarPlay starts: the box pauses the picture while this page lags behind.
+   if (message.type === 'mark') { connection.send({ type: 'ack', mark: message.mark ?? 0 }); return; }
+   if(message.type === 'artwork' && message.artwork) { media.setArtwork(message.revision ?? 0,message.artwork); return; }
+-  if (message.type === 'now-playing' && message.nowPlaying) { media.setMetadata(message.nowPlaying); audio.followMusic(media.timeline()); return; }
++  if (message.type === 'now-playing' && message.nowPlaying) { media.setMetadata(message.nowPlaying); return; }
+   if (message.type === 'host-ui' && active) {
+     openPanel(); return;
+   }
+@@ -184,7 +184,11 @@
+  *  fullscreen (Xpeng G6, 2026-10-12). Such an exit keeps the picture as negotiated, and the next tap on the
+  *  picture goes back to fullscreen; a browser enters fullscreen only on a tap, never by itself. */
+ let wantFullscreen = false, hiddenAt = -Infinity, shownAt = -Infinity, coveredInFullscreen = false, fullscreenSeq = 0;
+-const restoring = () => wantFullscreen && !document.fullscreenElement && !document.hidden;
++/** A tap goes back to fullscreen only when the car covered the page (reverse camera), not after leaving fullscreen on
++ *  purpose (the car's back button or gesture): in the 2 s that tells the two apart, a tap went back to fullscreen
++ *  and never reached CarPlay (2026-10-13). */
++let restoreArmed = false;
++const restoring = () => restoreArmed && wantFullscreen && !document.fullscreenElement && !document.hidden;
+ async function toggleFullscreen() {
+   try {
+     if (document.fullscreenElement) { wantFullscreen = false; await document.exitFullscreen(); }
+@@ -204,11 +208,11 @@
+ document.addEventListener('fullscreenchange', () => {
+   updateFullscreen(); fit(); pageEvent(document.fullscreenElement ? 3 : 4);
+   const seq = ++fullscreenSeq;
+-  if (document.fullscreenElement) { wantFullscreen = true; coveredInFullscreen = false; toast(t('fullscreenHint')); return; }
++  if (document.fullscreenElement) { wantFullscreen = true; coveredInFullscreen = false; restoreArmed = false; toast(t('fullscreenHint')); return; }
+   el('toast').hidden = true;
+   // The car covered the page: the browser leaves fullscreen while it is hidden, and may tell the page only once it
+   // is shown again (Chrome, 2026-10-12: hidden, shown, then out of fullscreen). Fullscreen comes back on a tap.
+-  if (wantFullscreen && (document.hidden || (coveredInFullscreen && performance.now() - shownAt < 2000))) { showRestoreHint(); return; }
++  if (wantFullscreen && (document.hidden || (coveredInFullscreen && performance.now() - shownAt < 2000))) { restoreArmed = true; showRestoreHint(); return; }
+   // Left while shown: on purpose, unless the page is hidden within 2 s; then fit the window as usual.
+   const exitedAt = performance.now();
+   window.setTimeout(() => { if (seq !== fullscreenSeq || hiddenAt >= exitedAt) return; wantFullscreen = false; scheduleAuto(); }, 2000);
+@@ -261,18 +265,20 @@
+   // Not for a hidden page (a covered page reports a small window) nor while fullscreen waits for its tap; a timer
+   // set just before the car covered the page fired anyway and renegotiated to 800x400 (Chrome, 2026-10-12).
+   if (!display || !autoFit.checked || displayBusy || document.hidden || (wantFullscreen && !document.fullscreenElement)) return;
+-  const target=autoTarget();
+-  if (!document.fullscreenElement && closeShape(display,target)) return;
++  const target=autoTarget(),fullscreen=!!document.fullscreenElement;
++  if (!renegotiate(display,target,fullscreen,storedFullscreenSize())) return;
+   const key=`${target.width}x${target.height}`;
+-  if (!aspectChanged(display,target) || key===lastAutoTarget) return;
++  if (key===lastAutoTarget) return;
+   // Avoid a reconnect loop even when another viewer has a different screen shape.
+   lastAutoTarget=key;
+-  if (!(await saveDisplay({...display,...target,hevc:false}))) error(t('autoFail'));
++  if (!(await saveDisplay({...display,...target,hevc:false}))) { error(t('autoFail')); return; }
++  if (fullscreen) try { localStorage.setItem('f50-fullscreen-shape',key); } catch { /* Then fullscreen may renegotiate once more. */ }
+ }
+-/** A close shape is renegotiated only in fullscreen: opening the page or leaving fullscreen shows the
+- *  current picture stretched (shownSize, never black bars) instead of a black reconnect right after
+- *  opening. A clearly different shape (portrait, split screen) is renegotiated at once, as before
+- *  (user 2026-10-12, replacing 2026-10-11's reconnect on every window change). */
++function storedFullscreenSize() { try { return localStorage.getItem('f50-fullscreen-shape') ?? ''; } catch { return ''; } }
++/** A close shape is renegotiated only in fullscreen, and there only once (renegotiate, display-fit.ts): opening
++ *  the page or leaving fullscreen shows the current picture stretched (shownSize, never black bars) instead of a
++ *  black reconnect right after opening. A clearly different shape (portrait, split screen) is renegotiated at
++ *  once, as before (user 2026-10-12, replacing 2026-10-11's reconnect on every window change). */
+ function autoTarget() {
+   return suggestedResolution(screen.clientWidth,screen.clientHeight);
+ }
+@@ -289,17 +295,31 @@
+   if (document.hidden) { hiddenAt = performance.now(); if (document.fullscreenElement || wantFullscreen) coveredInFullscreen = true; return; }
+   shownAt = performance.now();
+   // The picture at once instead of the phone's next keyframe; then the sound.
++  if (wantFullscreen && !document.fullscreenElement) restoreArmed = true;   // covered: left fullscreen while hidden
+   send({ type:'keyframe' }); fit(); scheduleAuto(); void unlock(); showRestoreHint();
+ });
+-/** Straight into the viewer log, not only every 10 s: ev 1 hidden, 2 shown, 3 fullscreen, 4 out of fullscreen. */
++/** Straight into the viewer log, not only every 10 s: ev 1 hidden, 2 shown, 3 fullscreen, 4 out of fullscreen, 5 resized. */
+ function pageEvent(ev: number) {
+-  send({type:'stats',stats:{ev,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,width:screen.clientWidth,height:screen.clientHeight,want:wantFullscreen?1:0}});
++  send({type:'stats',stats:{ev,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,width:screen.clientWidth,height:screen.clientHeight,want:wantFullscreen?1:0,...viewport()}});
+ }
++/** Which page build runs (raised with each build tried in the car). */
++const BUILD = 202610132400;
++/** What the browser says of the space it gives the page, to find the car's bar over a fullscreen page (2026-10-13):
++ *  window, visual viewport (and its offset), screen, available screen, outer window, pixel ratio. */
++function viewport(): Record<string, number> {
++  const v = window.visualViewport, d = window.screen;
++  return { build:BUILD, iw:window.innerWidth, ih:window.innerHeight, vw:Math.round(v?.width ?? -1), vh:Math.round(v?.height ?? -1),
++    vt:Math.round(v?.offsetTop ?? -1), sw:d.width, sh:d.height, sah:d.availHeight, oh:window.outerHeight,
++    dpr:Math.round(window.devicePixelRatio*100) };
++}
++// ev 5: the window changed size (debounced), with what the browser says of it.
++let resizeTimer = 0;
++window.addEventListener('resize', () => { window.clearTimeout(resizeTimer); resizeTimer = window.setTimeout(() => pageEvent(5), 400); });
+ window.setInterval(()=>{
+   const now=performance.now(),fps=frames*1000/Math.max(1,now-lastStats);frames=0;lastStats=now;
+   el('stats').textContent=painted?`${canvas.width} × ${canvas.height} / ${fps.toFixed(0)} fps / ${t('latency')} ${video.decodeLatencyMs.toFixed(0)} ms`:t('noStream');
+   el('audio-unlock').hidden=!active||audio.isUnlocked;
+-  el('audio-status').textContent=t(audio.isPlaying?'playing':'paused');media.setPlaying(audio.isPlaying);audio.followMusic(media.timeline());
++  el('audio-status').textContent=t(audio.isPlaying?'playing':'paused');media.setPlaying(audio.isPlaying);media.tick();
+ },750);
+ // Which browser the car runs and the music element's own timeline, which an OS media card may show instead of the song's.
+ const chromeMajor=Number(/Chrome\/(\d+)/.exec(navigator.userAgent)?.[1] ?? 0),webView=/; wv\)/.test(navigator.userAgent)?1:0;
+@@ -315,7 +335,7 @@
+   send({type:'stats',stats:{fps:reportFrames/seconds,decodeMs:video.decodeLatencyMs,queue:video.decodeQueueSize,
+     kbps:reportBytes*8/1000/seconds,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,
+     width:canvas.width,height:canvas.height,...(touchCount?{touchMs:touchSum/touchCount,touches:touchCount}:{}),...(musicBytes?{musicKbps:musicBytes*8/1000/seconds}:{}),
+-    chrome:chromeMajor,webView,...media.report(),...musicTimeline(),...audio.musicReport(),...video.takeStalls(),...lag.take(performance.now())}});
++    chrome:chromeMajor,build:BUILD,webView,...microphone.report(),...audio.farReport(),...media.report(),...musicTimeline(),...audio.musicReport(),...video.takeStalls(),...lag.take(performance.now())}});
+   reportFrames=0;reportBytes=0;reportStart=now;touchSum=0;touchCount=0;musicBytes=0;
+ },10000);
+ render();fit();if(token) connection.connect();
+--- a/web/src/media-session.ts
++++ b/web/src/media-session.ts
+@@ -1,4 +1,6 @@
+ import type { ClientMessage, NowPlaying } from './protocol';
++/** The position state's rate: the card is told the position, not left to work it out. */
++const STILL_RATE = 1e-6;
+ /** Real receiver audio owns the media element. No silent loop or invented song metadata. */
+ export class SystemMedia {
+   private active = false;
+@@ -9,6 +11,8 @@
+   private position = 0;
+   private speed = 1;
+   private at = 0;
++  /** For the viewer log: the car's media buttons (card, steering wheel) as they reach this page. */
++  private actions: Record<string, number> = {};
+   /** The iPhone's own playing state; what the browser hears (navigation prompts, locked sound) only stands in when it is unknown. */
+   private phonePlaying: boolean | undefined;
+   private positionNow() { return Math.min(this.duration, this.position + ((this.phonePlaying ?? this.playing) ? (performance.now()-this.at)/1000*this.speed : 0)); }
+@@ -24,42 +28,50 @@
+     if (!Number.isFinite(this.speed)) this.speed = 1;
+     this.at = performance.now();
+     if(changed) this.refreshMetadata();
+-    this.updatePosition();
++    this.update(); this.updatePosition();
+   }
+   setArtwork(revision: number, src: string) {
+     if(revision !== this.revision || !src.startsWith('data:image/jpeg;base64,')) return;
+     this.info = {...this.info, artwork:[{src,type:'image/jpeg'}]};this.refreshMetadata();
+   }
++  /** The position goes out on every tick with a near-zero rate (0 is refused): an OS card that runs the position on
++   *  by its own clock showed the XPeng's bar always full (F50 drive 2026-10-13); with this it follows the song. The
++   *  card reads only this, not the music element: without a position state it showed no bar at all. */
++  /** Called by the page's 750 ms tick: the card gets the running position at least once a second. */
++  tick() { if (this.active && this.duration > 0) this.updatePosition(); }
+   private updatePosition() {
+     if(!this.supported || !navigator.mediaSession.setPositionState) return;
+-    try { navigator.mediaSession.setPositionState(this.active && this.duration > 0 ? { duration:this.duration, position:this.positionNow(), playbackRate:this.speed } : undefined); } catch { /* Older browsers may not support a position state. */ }
++    try { navigator.mediaSession.setPositionState(this.active && this.duration > 0 ? { duration:this.duration, position:this.positionNow(), playbackRate:STILL_RATE } : undefined); } catch { /* Older browsers may not support a position state. */ }
+   }
+   private refreshMetadata() {
+     if (this.supported) navigator.mediaSession.metadata = this.active && typeof MediaMetadata !== "undefined" ? new MediaMetadata(this.info) : null;
+   }
+   readonly supported = 'mediaSession' in navigator;
+-  /** The song for the music element's own timeline; null while no song with a duration plays. */
+-  timeline(): { position: number; duration: number; key: string; playing: boolean } | null {
+-    if (!this.active || this.duration <= 0) return null;
+-    return { position: this.positionNow(), duration: this.duration, playing: (this.phonePlaying ?? this.playing),
+-      key: [this.info.title, this.info.artist, this.info.album, this.duration].join('|') };
+-  }
++  /** Whether the iPhone says it plays; undefined while it has not said. */
++  get phoneState() { return this.phonePlaying; }
+   /** For the box's viewer log: can the OS media card take our song position at all, and which one we give it. */
+   report(): Record<string, number> {
+     const positionState = this.supported && typeof navigator.mediaSession.setPositionState === 'function' ? 1 : 0;
+     const art = this.info.artwork && (this.info.artwork as MediaImage[]).length ? 1 : 0;
+-    return this.duration > 0 ? { positionState, songPos: Math.round(this.positionNow()), songDur: Math.round(this.duration), art } : { positionState };
++    const actions = this.actions; this.actions = {};
++    return this.duration > 0 ? { positionState, songPos: Math.round(this.positionNow()), songDur: Math.round(this.duration), art, ...actions } : { positionState, ...actions };
+   }
+   constructor(private readonly send: (message: ClientMessage) => void, unlock: () => void, pause: () => void = () => {}) {
+     if (!this.supported) return;
+     const handlers: Partial<Record<MediaSessionAction, () => void>> = {
+       play: () => { unlock(); this.command(1); },
+-      pause: () => { pause(); this.setPlaying(false); this.command(2); },
++      // The car turns its play/pause key into pause while the page plays, also when the car itself paused the
++      // iPhone for its own video app and the page goes on with the iPhone's silence: then it means play (F50 drive
++      // 2026-10-13: the first press paused again; pausing the page instead silenced the car's video app).
++      pause: () => { if (this.phonePlaying === false) { this.actions.keyPauseAsPlay = (this.actions.keyPauseAsPlay ?? 0) + 1; unlock(); this.command(1); return; }
++        pause(); this.setPlaying(false); this.command(2); },
+       previoustrack: () => this.command(5),
+       nexttrack: () => this.command(4),
+     };
++    const counted: Record<string, string> = { play: 'keyPlay', pause: 'keyPause', previoustrack: 'keyPrev', nexttrack: 'keyNext' };
+     for (const [name, handler] of Object.entries(handlers)) {
+-      try { navigator.mediaSession.setActionHandler(name as MediaSessionAction, handler); } catch { /* Partial browser support. */ }
++      const count = () => { this.actions[counted[name]] = (this.actions[counted[name]] ?? 0) + 1; handler(); };
++      try { navigator.mediaSession.setActionHandler(name as MediaSessionAction, count); } catch { /* Partial browser support. */ }
+     }
+   }
+   private command(index: number) { if (this.active) this.send({ type: 'media', media: index }); }
+@@ -75,7 +87,10 @@
+     if(playing === this.playing) return;
+     this.position=this.positionNow();this.at=performance.now();this.playing=playing;this.update();this.updatePosition();
+   }
++  /** The iPhone's own state when it reports one: the car paused the iPhone (over its Bluetooth) for its own video
++   *  app while the page went on playing the iPhone's silence, so the card showed "pause" and its first press paused
++   *  again (F50 drive 2026-10-13: media key 2, then 1). */
+   private update() {
+-    if (this.supported) navigator.mediaSession.playbackState = this.active ? (this.playing ? 'playing' : 'paused') : 'none';
++    if (this.supported) navigator.mediaSession.playbackState = this.active ? ((this.phonePlaying ?? this.playing) ? 'playing' : 'paused') : 'none';
+   }
+ }
+--- a/web/src/display-fit.ts
++++ b/web/src/display-fit.ts
+@@ -17,6 +17,14 @@
+   return a.width > 0 && a.height > 0 && b.width > 0 && b.height > 0 &&
+     Math.abs((a.width / a.height) / (b.width / b.height) - 1) <= 0.2;
+ }
++/** Whether to renegotiate CarPlay to `target`. A close shape is renegotiated in fullscreen only once: when the
++ *  current size was not itself set for fullscreen on this browser (`fullscreenSize`). The car's fullscreen is not
++ *  always the same height (XPeng, 2026-10-13: 876x579 or 876x641 CSS px, its dock shown or not), and switching
++ *  between 1280x846 and 1280x936 reconnected CarPlay, a crackle and seconds without a picture, on most entries. */
++export function renegotiate(display: {width: number; height: number}, target: {width: number; height: number}, fullscreen: boolean, fullscreenSize: string) {
++  if (!aspectChanged(display, target)) return false;
++  return !(closeShape(display, target) && (!fullscreen || fullscreenSize === `${display.width}x${display.height}`));
++}
+ /** The picture always fills the view, stretched per axis: no black bars (user 2026-10-12). A close shape
+  *  stays stretched; a clearly different one is shown stretched only until CarPlay is renegotiated.
+  *  Touch input is normalized per axis, so it stays exact. */
+--- a/web/src/style.css
++++ b/web/src/style.css
+@@ -16,7 +16,9 @@
+ .ico { width:22px; height:22px; flex:none; display:block; }
+ .ico.dim { color:var(--secondary); }
+ 
+-#app { width:100vw; height:100vh; height:100dvh; position:relative; background:#000; }
++/* Pinned to the window's edges, not 100vh/100dvh: the XPeng's Chrome 120 kept 100dvh at 641 px after fullscreen
++   changes while the window was 579, and CarPlay's bottom row (home button) went below the screen (2026-10-13). */
++#app { position:fixed; top:0; right:0; bottom:0; left:0; background:#000; }
+ #screen-container { position:absolute; top:0; right:0; bottom:0; left:0; inset:0; display:flex; justify-content:center; align-items:center; }
+ #surface { flex:none; }
+ #screen { display:block; width:100%; height:100%; touch-action:none; user-select:none; -webkit-user-select:none; }
+--- a/web/src/mic.ts
++++ b/web/src/mic.ts
+@@ -43,6 +43,23 @@
+   private encoderTimestampUs = 0;
+   private active = false;
+   private workletUrl: string | null = null;
++  /** For the viewer log (a call on the F50 drive of 2026-10-13: the other side heard nothing, nothing told why):
++   *  how the last start ended (1 live, 2 refused, 3 no microphone, 4 busy, 5 no API, 6 other) and packets sent. */
++  private micState = 0;
++  private micPackets = 0;
++  /** Blocks of samples from the microphone, encoder errors: where a live microphone that sends nothing stops. */
++  private micFrames = 0;
++  private micEncErrors = 0;
++  /** Loudest sample from the microphone in this report, in thousandths of full scale (0: silence). */
++  private micPeak = 0;
++  report(): Record<string, number> {
++    if (!this.micState && !this.micPackets) return {};
++    const track = this.stream?.getAudioTracks()[0];
++    const out: Record<string, number> = { micState: this.micState, micPackets: this.micPackets, micFrames: this.micFrames, micEncErrors: this.micEncErrors, micPeak: this.micPeak, micGain: micGain(),
++      micContext: !this.context ? 0 : this.context.state === 'running' ? 1 : this.context.state === 'suspended' ? 2 : 3,
++      micTrack: !track ? 0 : track.readyState === 'ended' ? 3 : track.muted ? 2 : 1, micEncoder: this.encoder ? 1 : 0 };
++    this.micPackets = 0; this.micFrames = 0; this.micEncErrors = 0; this.micPeak = 0; return out;
++  }
+ 
+   constructor(
+     private readonly send: (payload: Uint8Array, opus: boolean) => void,
+@@ -56,6 +73,7 @@
+   async start(request: MicRequest): Promise<void> {
+     await this.stop();
+     try {
++      if (!navigator.mediaDevices?.getUserMedia) { this.micState = 5; throw new Error('getUserMedia is not available'); }
+       const stream = await navigator.mediaDevices.getUserMedia({
+         audio: {
+           channelCount: Math.max(1, Math.min(2, request.channels)),
+@@ -74,8 +92,17 @@
+         processorOptions: { packetSamples: Math.max(1, request.samplesPerPacket) },
+       });
+       const source = context.createMediaStreamSource(stream);
+-      source.connect(node);
++      // The XPeng's microphone reaches the browser very quiet (speech peaking at 1% of full scale on the F50 drive of
++      // 2026-10-13; the other side of a call heard it faint): raised (micGain), with a limiter against clipping.
++      const gain = context.createGain();
++      gain.gain.value = micGain();
++      const limiter = context.createDynamicsCompressor();
++      limiter.threshold.value = -6; limiter.knee.value = 0; limiter.ratio.value = 20; limiter.attack.value = 0.003; limiter.release.value = 0.1;
++      source.connect(gain); gain.connect(limiter); limiter.connect(node);
+       node.port.onmessage = (event: MessageEvent<Float32Array>) => {
++        this.micFrames++;
++        let peak = 0; for (const v of event.data) peak = Math.max(peak, Math.abs(v));
++        this.micPeak = Math.max(this.micPeak, Math.round(peak * 1000));
+         this.onSamples(event.data);
+       };
+       if (request.codec === 'opus' && typeof AudioEncoder !== 'undefined') {
+@@ -83,9 +110,9 @@
+           output: (chunk) => {
+             const payload = new Uint8Array(chunk.byteLength);
+             chunk.copyTo(payload);
+-            this.send(payload, true);
++            this.micPackets++; this.send(payload, true);
+           },
+-          error: (error) => this.onStatus(`Microphone encoder error: ${error.message}`),
++          error: (error) => { this.micEncErrors++; this.onStatus(`Microphone encoder error: ${error.message}`); },
+         });
+         encoder.configure({
+           codec: 'opus',
+@@ -99,9 +126,11 @@
+       this.stream = stream;
+       this.context = context;
+       this.node = node;
+-      this.active = true;
++      this.active = true; this.micState = 1;
+       this.onStatus(`Microphone live (${request.sampleRate} Hz, ${request.codec})`);
+     } catch (error) {
++      const name = (error as Error)?.name;
++      if (this.micState !== 5) this.micState = name === 'NotAllowedError' ? 2 : name === 'NotFoundError' ? 3 : name === 'NotReadableError' ? 4 : 6;
+       this.onStatus(`Microphone unavailable: ${describeError(error)}`);
+       await this.stop();
+     }
+@@ -157,7 +186,7 @@
+       this.encoderTimestampUs += Math.round((samples.length / context.sampleRate) * 1_000_000);
+       try {
+         this.encoder.encode(data);
+-      } finally {
++      } catch { this.micEncErrors++; } finally {
+         data.close();
+       }
+       return;
+@@ -168,7 +197,7 @@
+       const clamped = Math.max(-1, Math.min(1, samples[index]));
+       view.setInt16(index * 2, Math.round(clamped * 32767), true);
+     }
+-    this.send(pcm, false);
++    this.micPackets++; this.send(pcm, false);
+   }
+ 
+   private workletSourceUrl(): string {
+@@ -179,6 +208,14 @@
+   }
+ }
+ 
++/** Microphone gain: 16 (24 dB) unless the page address sets ?micgain= (1 to 64). The owner's choice after the F50
++ *  drive of 2026-10-13: at 16 the other side heard the voice best, though also the speakers' echo the browser had
++ *  not cancelled (open); ducking the microphone while the far end played only made it rough; at 1 it was faint. */
++function micGain(): number {
++  const value = Number(new URLSearchParams(location.search).get('micgain'));
++  return Number.isFinite(value) && value >= 1 && value <= 64 ? value : 16;
++}
++
+ function describeError(error: unknown): string {
+   if (error instanceof Error) return error.message;
+   return String(error);
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -6,7 +6,17 @@
+   const {outputText}=ts.transpileModule(source,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ESNext}});
+   return import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
+ }
+-const {suggestedResolution,aspectChanged,shownSize,closeShape}=await load('display-fit');
++const {suggestedResolution,aspectChanged,shownSize,closeShape,renegotiate}=await load('display-fit');
++{ // XPeng fullscreen is 876x579 or 876x641 CSS px (dock shown or not): 1280x846 or 1280x936 (F50 drive 2026-10-13).
++  const s846=suggestedResolution(876,579),s936=suggestedResolution(876,641),page=suggestedResolution(876,518);
++  assert.deepEqual([s846,s936],[{width:1280,height:846},{width:1280,height:936}]);
++  assert.equal(renegotiate({width:1280,height:756},s846,true,''),true,'Fullscreen gets its own size once');
++  assert.equal(renegotiate({width:1280,height:846},s936,true,'1280x846'),false,'then the other fullscreen height only stretches');
++  assert.equal(renegotiate({width:1280,height:936},s846,true,'1280x936'),false,'either way round');
++  assert.equal(renegotiate({width:1280,height:846},page,false,'1280x846'),false,'leaving fullscreen keeps it too');
++  assert.equal(renegotiate({width:1280,height:602},s846,true,'1280x846'),true,'a size far off (a test window) is renegotiated');
++  assert.equal(renegotiate({width:1280,height:846},{width:1372,height:686},false,'1280x846'),true,'split screen at once');
++  assert.equal(renegotiate({width:1280,height:846},s846,true,''),false,'the same shape never'); }
+ assert.equal(closeShape({width:1280,height:846},{width:1280,height:756}),true,'page vs fullscreen: no renegotiation outside fullscreen');
+ assert.equal(closeShape({width:1280,height:846},{width:1082,height:1280}),false,'portrait renegotiates at once');
+ assert.equal(closeShape({width:1280,height:846},{width:1372,height:686}),false,'split screen renegotiates at once');
+@@ -27,13 +37,18 @@
+ const {SystemMedia}=await load('media-session');
+ const media=new SystemMedia(m=>sent.push(m),()=>{});
+ actions.nexttrack();assert.equal(sent.length,0,'No commands before phone connection');
+-media.setActive(true);actions.play();actions.pause();actions.previoustrack();actions.nexttrack();
+-assert.deepEqual(sent.map(x=>x.media),[1,2,5,4],'Use distinct play and pause HID commands, not toggle');
++media.report();
++media.setActive(true);actions.play();actions.pause();actions.previoustrack();actions.nexttrack();actions.pause();
++assert.deepEqual(sent.map(x=>x.media),[1,2,5,4,2],'Use distinct play and pause HID commands, not toggle');
++assert.deepEqual(media.report(),{positionState:1,keyPlay:1,keyPause:2,keyPrev:1,keyNext:1},'The car media keys that reached the page, for the viewer log');
++assert.deepEqual(media.report(),{positionState:1},'counted afresh each report');
+ media.setPlaying(true);assert.equal(navigator.mediaSession.playbackState,'playing');
+ media.setMetadata({title:'Test song',artist:'Test artist',album:'Test album'});
+ media.setPlaying(false);assert.equal(navigator.mediaSession.metadata.title,'Test song');assert.equal(navigator.mediaSession.playbackState,'paused');
+ media.setMetadata({title:'Next',artist:'Artist',album:'Album',durationMs:200000,positionMs:50000,revision:1});
+ assert.equal(positions.at(-1).duration,200);assert.equal(positions.at(-1).position,50);
++assert.ok(positions.at(-1).playbackRate>0&&positions.at(-1).playbackRate<1e-3,'The card is told the position, not left to run it on by its own clock (XPeng: the bar stood full)');
++{ const before=positions.length;media.tick();assert.equal(positions.length,before+1,'and is told it again on every tick'); }
+ media.setArtwork(0,'data:image/jpeg;base64,/9j/');assert.equal(navigator.mediaSession.metadata.artwork.length,0,'Reject old-track cover');
+ media.setArtwork(1,'data:image/jpeg;base64,/9j/');assert.equal(navigator.mediaSession.metadata.artwork.length,1);
+ media.setMetadata({title:'Another',artist:'',album:'',revision:2});assert.equal(navigator.mediaSession.metadata.artwork.length,0,'Clear old cover on track change');
+@@ -44,9 +59,14 @@
+   clock=10000;media.setPlaying(true);assert.equal(positions.at(-1).position,60,"The iPhone's playing state moves the clock, not what the browser hears");
+   clock=12000;media.setMetadata({title:'Run',artist:'',album:'',durationMs:200000,positionMs:62000,playing:false,revision:3});
+   clock=20000;media.setPlaying(false);assert.equal(positions.at(-1).position,62,'Paused on the iPhone: the clock stands');
++  media.setPlaying(true);assert.equal(navigator.mediaSession.playbackState,'paused','Paused on the iPhone: the card offers play, even while the page plays its silence');
++  sent.length=0;actions.pause();assert.deepEqual(sent.map(x=>x.media),[1],"The car's pause key while the iPhone is paused plays (the car toggles by the page)");
++  assert.equal(media.report().keyPauseAsPlay,1,'counted for the viewer log');
++  media.setMetadata({title:'Run',artist:'',album:'',durationMs:200000,positionMs:62000,playing:true,revision:3});
++  assert.equal(navigator.mediaSession.playbackState,'playing','and pause once it plays again');
++  media.setMetadata({title:'Run',artist:'',album:'',durationMs:200000,positionMs:62000,playing:false,revision:3});
+   Object.defineProperty(performance,'now',{value:realNow,configurable:true,writable:true}); }
+ assert.deepEqual(media.report(),{positionState:1,songPos:62,songDur:200,art:0},'The viewer log tells whether the OS card can take our song position, and whether a cover is shown');
+-assert.equal(media.timeline().key,'Run|||200');assert.equal(media.timeline().position,62);
+ { // Hiccups for the viewer log: a gap in a flowing stream (network/box) apart from frames the car's decoder held long.
+   let clock=0;const realNow=performance.now;Object.defineProperty(performance,'now',{value:()=>clock,configurable:true,writable:true});
+   globalThis.EncodedVideoChunk=class {constructor(v){Object.assign(this,v);}};
+@@ -77,39 +97,40 @@
+   assert.equal(sizeWrites,writes,'but a canvas of the same size keeps showing the last picture');
+   player.configure(config(1082,1280,0x41));await Promise.resolve();
+   assert.equal(canvas.width,1082,'A new size resizes the canvas');assert.equal(canvas.height,1280); }
+-{ // The music element's own timeline follows the song, which a car's media card may show instead of ours.
++{ // The music element keeps its own timeline: nothing moves it onto the song (F50 drive 2026-10-13: moving it seeked
++  // on every song change, threw appendBuffer errors on Chrome 120 and pulled the music back while the iPhone's
++  // position reports stalled). The song position reaches the car's card through the Media Session position state.
+   let clock=0;const realNow=performance.now;Object.defineProperty(performance,'now',{value:()=>clock,configurable:true,writable:true});
+   const log=[];
+   class Ranges {constructor(r){this.r=r;}get length(){return this.r.length;}start(i){return this.r[i][0];}end(i){return this.r[i][1];}}
+   const buffer={updating:false,ranges:[],timestampOffset:0,listeners:{},addEventListener(n,h){this.listeners[n]=h;},
+-    get buffered(){return new Ranges(this.ranges);},appendBuffer(){log.push('append');},remove(a,b){log.push(`remove ${a}-${b}`);this.ranges=[];}};
+-  const source={readyState:'open',duration:Infinity,addEventListener(n,h){h();},addSourceBuffer(){return buffer;}};
++    get buffered(){return new Ranges(this.ranges);},appendBuffer(){if(this.updating)throw new Error('InvalidStateError: still processing');log.push('append');},remove(a,b){log.push(`remove ${a}-${b}`);this.ranges=[];}};
++  const source={readyState:'open',get duration(){return Infinity;},set duration(v){log.push(`duration ${v}`);},addEventListener(n,h){h();},addSourceBuffer(){return buffer;}};
+   globalThis.MediaSource=class {constructor(){return source;}};globalThis.URL.createObjectURL=()=>'blob:x';
+   const element={currentTime:0,paused:true,plays:0,setAttribute(){},removeAttribute(){},load(){},remove(){},addEventListener(){},play(){this.plays++;this.paused=false;return Promise.resolve();},pause(){this.paused=true;}};
+   globalThis.document={createElement:()=>element,body:{append(){}}};
+   const {MusicOutput}=await load('music-output',s=>'const FLAC_BLOCK=4096,FLAC_MIME="audio/mp4";function flacInit(){return new Uint8Array(1);}function aacInit(){return new Uint8Array(1);}function flacFrame(){return new Uint8Array(1);}function flacFragment(){return new Uint8Array(1);}\n'+s.replace(/^import .*?;$/gm,''));
+-  const music=new MusicOutput({sampleRate:48000,channels:2,description:new Uint8Array()},()=>{},'flac');
++  const errors=[];const music=new MusicOutput({sampleRate:48000,channels:2,description:new Uint8Array()},m=>errors.push(m),'flac');
+   assert.deepEqual(log,['append'],'init segment');
+-  element.currentTime=600;buffer.ranges=[[599,600.6]];
+-  music.follow({position:8,duration:269,key:'A',playing:true});
+-  assert.deepEqual(log.slice(1),[],'Nothing moves while the element is paused (not unlocked, or the car gave the sound to another app)');
+-  element.paused=false;music.follow({position:8,duration:269,key:'A',playing:true});
+-  assert.deepEqual(log.slice(1),['remove 0-Infinity'],'A new song first drops the old timeline');
+-  clock=100;buffer.listeners.updateend();
+-  assert.equal(element.currentTime,8,'then what was being heard is the song position');assert.equal(source.duration,269,'with the song duration');
+-  assert.equal(buffer.timestampOffset,8-600,'and the audio not heard yet is replayed on that timeline');
+-  assert.deepEqual(music.report(),{musicWaits:0,musicSkips:0,musicAligns:1,musicSysPauses:0},'Counted for the viewer log');
+-  log.length=0;element.currentTime=9;buffer.ranges=[[8.1,9.6]];
+-  clock=1000;music.follow({position:9,duration:269,key:'A',playing:true});
+-  assert.ok(!log.some(x=>x.startsWith('remove')),'Following the same song moves nothing');
+-  clock=10000;music.follow({position:60,duration:269,key:'A',playing:true});
+-  assert.ok(log.includes('remove 0-Infinity'),'A seek on the iPhone (more than 3 s off) realigns');
+-  // A realignment queues the unheard seconds again (up to 5 s): that is not a stuck buffer.
+-  const errors=[];const flac=new MusicOutput({sampleRate:48000,channels:2,description:new Uint8Array()},m=>errors.push(m),'flac');
++  assert.equal(music.follow,undefined,'No song timeline to follow');
++  element.paused=false;element.currentTime=600;buffer.ranges=[[599,600.6]];
++  for(let i=0;i<20;i++){clock+=85;music.packet(new Uint8Array(4096*4));}
++  assert.ok(!log.some(x=>x.startsWith('remove 0-')||x.startsWith('duration')),'Playing on moves neither the timeline nor the duration');
++  assert.equal(element.currentTime,600,'and seeks nothing');assert.deepEqual(errors,[]);
++  // Behind the cushion: no faster playback (it crackled at song changes), only measured for the viewer log.
++  element.playbackRate=1;music.report();buffer.ranges=[[590,601.5]];music.packet(new Uint8Array(4096*4));
++  assert.equal(element.playbackRate,1,'1.5 s behind: still normal speed');assert.equal(element.currentTime,600,'and no jump');
++  assert.deepEqual([music.report().musicLeadMaxMs,music.report().musicLeadMaxMs],[1500,undefined],'How far behind it played, for the viewer log');
++  element.plays=0;element.play=function(){this.plays++;return Promise.reject(Object.assign(new Error('blocked'),{name:'NotAllowedError'}));};
++  element.paused=true;element.currentTime=599;await music.unlock().catch(()=>{});
++  assert.equal(music.report().musicBlocked,1,'A play() the browser refused (no gesture) is counted for the viewer log');
++  element.play=function(){this.plays++;this.paused=false;return Promise.resolve();};
++  // A buffer busy for a few seconds is not a stuck one.
++  const stuck=[];const flac=new MusicOutput({sampleRate:48000,channels:2,description:new Uint8Array()},m=>stuck.push(m),'flac');
+   buffer.updating=true;for(let i=0;i<40;i++)flac.packet(new Uint8Array(4096*4));
+-  assert.deepEqual(errors,[],'Forty fragments (3.4 s) waiting on a busy buffer close nothing');
++  assert.deepEqual(stuck,[],'Forty fragments (3.4 s) waiting on a busy buffer close nothing');
+   for(let i=0;i<60;i++)flac.packet(new Uint8Array(4096*4));
+-  assert.deepEqual(errors,['Music buffer is not advancing'],'but a buffer stuck for good still does');buffer.updating=false;
++  assert.deepEqual(stuck,['Music buffer is not advancing'],'but a buffer stuck for good still does');buffer.updating=false;
+   // Resuming after a pause whose buffer was played out: no step back (that replayed a second already heard).
+   const resumed=new MusicOutput({sampleRate:48000,channels:2,description:new Uint8Array()},()=>{},'aac');
+   element.paused=true;element.plays=0;element.currentTime=10;buffer.ranges=[[5,10]];
+@@ -125,7 +146,7 @@
+ const edges=[];let music;let packets=0;
+ class Node {gain={value:1};connect(to){edges.push(to);}disconnect(){}}
+ globalThis.AudioContext=class {state='running';destination={speaker:true};createGain(){return new Node();}resume(){return Promise.resolve();}};
+-globalThis.TestMusic=class {static supported(){return true;}constructor(config){music=this;this.configKey=JSON.stringify([config.sampleRate,config.channels,Array.from(config.description)]);}unlocked=false;playing=false;configKey="";pause(){this.playing=false;this.paused=true;}volume(){}unlock(){this.unlocked=true;return Promise.resolve();}packet(){packets++;}close(){this.closed=true;}};
++globalThis.TestMusic=class {static supported(){return true;}static key(c){return JSON.stringify([c.sampleRate,c.channels,Array.from(c.description)]);}constructor(config){music=this;this.configKey=JSON.stringify([config.sampleRate,config.channels,Array.from(config.description)]);}unlocked=false;playing=false;configKey="";pause(){this.playing=false;this.paused=true;}volume(){}unlock(){this.unlocked=true;this.unlocks=(this.unlocks??0)+1;return Promise.resolve();}packet(){packets++;}close(){this.closed=true;}};
+ const {AudioEngine}=await load('audio',s=>s.replace(/^import .*?;$/gm,'')+'\nconst MusicOutput=globalThis.TestMusic;const AudioCodec={AacLc:1,Opus:2,Lpcm:3};\nfunction audioStartTime(){return 0;}');
+ const audio=new AudioEngine(()=>{});assert.equal(edges.length,1);assert.equal(edges[0].speaker,true);
+ audio.handleConfig({streamType:102,codec:1,name:'media',sampleRate:48000,channels:2,description:new Uint8Array([0x11,0x90])});
+@@ -135,7 +156,7 @@
+ audio.stopStream(102);assert.equal(music.closed,undefined,"Pause retains native media element");assert.equal(music.paused,true);
+ const pausedMusic=music;
+ audio.handleConfig({streamType:102,codec:1,name:'media',sampleRate:48000,channels:2,description:new Uint8Array([0x11,0x90])});
+-assert.equal(music,pausedMusic,'Resume reuses the native media element');
++assert.equal(music,pausedMusic,'Resume reuses the native media element');assert.equal(audio.streams.get(102).music,pausedMusic,'as the stream\'s music');
+ audio.stopAll();assert.equal(music.closed,true);assert.equal(audio.isPlaying,false);
+ const {aacInit,aacFragment}=await load('aac-mp4');
+ const init=aacInit(48000,2,new Uint8Array([0x11,0x90]));
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -392,7 +392,12 @@
+                 "touch" -> session.sendTouch(
+                     message.contacts.map { AirPlayContact(it.id, it.x, it.y, it.down) },
+                 )
+-                "media" -> message.media?.let(session::sendMedia)
++                "media" -> message.media?.let {
++                    // Media keys from the page (1 play, 2 pause, 3 toggle, 4 next, 5 previous): the log then tells a
++                    // pause from the car's media card or steering wheel apart from one made on the CarPlay screen.
++                    log.info("viewer media key {}", it)
++                    session.sendMedia(it)
++                }
+                 "knob" -> message.knob?.let {
+                     session.sendKnob(
+                         AirPlayKnobState(
+--- a/server/src/main/kotlin/com/playport/server/MicUplink.kt
++++ b/server/src/main/kotlin/com/playport/server/MicUplink.kt
+@@ -21,6 +21,7 @@
+     val sampleRate: Int get() = config.sampleRate
+     val channels: Int get() = config.channels
+     val samplesPerPacket: Int get() = config.samplesPerPacket
++    val rtpSamplesPerPacket: Int get() = config.rtpSamplesPerPacket
+     val codec: String get() = config.codec.name.lowercase()
+     val bitrate: Int? get() = config.bitrate
+ 
+--- a/server/src/main/kotlin/com/playport/server/WebBridge.kt
++++ b/server/src/main/kotlin/com/playport/server/WebBridge.kt
+@@ -88,7 +88,7 @@
+     /** Routes browser microphone payloads (raw PCM or Opus) to the phone. */
+     fun sendMicrophonePayload(payload: ByteArray, opus: Boolean): Boolean {
+         val uplink = microphone ?: return false
+-        val samples = if (opus) 960 else payload.size / (2 * maxOf(1, uplink.channels))
++        val samples = if (opus) uplink.rtpSamplesPerPacket else payload.size / (2 * maxOf(1, uplink.channels))
+         uplink.send(payload, samples)
+         return true
+     }
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/CarPlayMediaEngine.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/CarPlayMediaEngine.kt
+@@ -357,6 +357,12 @@
+             key = key,
+             codec = format.codec,
+             bitrate = if (format.codec == AudioCodecKind.OPUS) opusBitrate else null,
++            clockRate = when {
++                format.codec != AudioCodecKind.OPUS -> format.sampleRate
++                formatBits and OPUS_16K != 0L -> 16_000
++                formatBits and OPUS_24K != 0L -> 24_000
++                else -> 48_000
++            },
+         )
+     }
+ 
+@@ -387,6 +393,7 @@
+         const val DATASTREAM_OUTPUT_KEY = "DataStream-Output-Encryption-Key"
+         const val DATASTREAM_INPUT_KEY = "DataStream-Input-Encryption-Key"
+         const val IAP_DATASTREAM_UUID = "E9459FD0-BCAD-4C45-820F-1E72447EF2F2"
++        const val OPUS_16K = 0x10000000L
+         const val OPUS_24K = 0x20000000L
+         const val OPUS_48K = 0x40000000L
+     }
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/MicrophonePacketizer.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/MicrophonePacketizer.kt
+@@ -14,6 +14,10 @@
+     val key: ByteArray,
+     val codec: AudioCodecKind = AudioCodecKind.LPCM,
+     val bitrate: Int? = null,
++    /** The stream's own rate, which its RTP timestamps count in: Opus is 16 kHz for telephony and 24 kHz for Siri
++     *  (audioFormat bits), though encoded and announced as 48 kHz. Counting a call's 20 ms packets in 48 kHz
++     *  steps (960 instead of 320) made the other side hear crackle (F50 drive 2026-10-13); Siri coped. */
++    val clockRate: Int = sampleRate,
+ ) {
+     val samplesPerPacket: Int
+         get() = if (codec == AudioCodecKind.OPUS) {
+@@ -22,11 +26,16 @@
+             maxOf(1, sampleRate * frameMillis / 1000)
+         }
+ 
++    /** RTP timestamp step per packet. */
++    val rtpSamplesPerPacket: Int
++        get() = if (codec == AudioCodecKind.OPUS) maxOf(1, clockRate * OPUS_PACKET_MILLIS / 1000) else samplesPerPacket
++
+     val frameBytes: Int
+         get() = samplesPerPacket * channels * 2
+ 
+     private companion object {
+         const val OPUS_SAMPLES_PER_PACKET = 960
++        const val OPUS_PACKET_MILLIS = 20
+     }
+ }
+ 
+--- a/protocol/src/test/java/com/shilapi/xcertplay/airplay/MicrophonePacketizerTest.kt
++++ b/protocol/src/test/java/com/shilapi/xcertplay/airplay/MicrophonePacketizerTest.kt
+@@ -41,6 +41,16 @@
+     }
+ 
+     @Test
++    fun opusTimestampsCountInTheStreamsOwnRate() {
++        fun config(clockRate: Int) = MicrophoneConfig("telephony", 48_000, 1, 100, 20,
++            java.net.InetAddress.getLoopbackAddress(), 1, ByteArray(32), AudioCodecKind.OPUS, 48_000, clockRate)
++        assertEquals("a call (OPUS_16000_1): 20 ms is 320", 320, config(16_000).rtpSamplesPerPacket)
++        assertEquals("Siri (OPUS_24000_1)", 480, config(24_000).rtpSamplesPerPacket)
++        assertEquals(960, config(48_000).rtpSamplesPerPacket)
++        assertEquals("the page still encodes 48 kHz in 960-sample blocks", 960, config(16_000).samplesPerPacket)
++    }
++
++    @Test
+     fun pcmIsConvertedToBigEndian() {
+         assertArrayEquals(
+             byteArrayOf(0x12, 0x34, 0x56, 0x78),

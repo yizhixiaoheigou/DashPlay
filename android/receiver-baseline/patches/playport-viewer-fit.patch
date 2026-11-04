@@ -1,0 +1,95 @@
+Viewer: no black bars and no reconnect when the page opens (2026-10-12).
+
+The picture always fills the page, stretched per axis (touch is normalized per axis). A close shape
+(within 20%: the car page 1280x756 vs fullscreen 1280x846) is renegotiated only on entering
+fullscreen; a clearly different shape (portrait, split screen) is renegotiated at once, as before.
+
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -6,9 +6,16 @@
+   const {outputText}=ts.transpileModule(source,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ESNext}});
+   return import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
+ }
+-const {fittedSize,suggestedResolution,aspectChanged}=await load('display-fit');
++const {suggestedResolution,aspectChanged,shownSize,closeShape}=await load('display-fit');
++assert.equal(closeShape({width:1280,height:846},{width:1280,height:756}),true,'page vs fullscreen: no renegotiation outside fullscreen');
++assert.equal(closeShape({width:1280,height:846},{width:1082,height:1280}),false,'portrait renegotiates at once');
++assert.equal(closeShape({width:1280,height:846},{width:1372,height:686}),false,'split screen renegotiates at once');
++assert.deepEqual(shownSize(1280,846,1280,756),{width:1280,height:756},'fullscreen picture fills the normal page without bars');
++assert.deepEqual(shownSize(1280,756,1280,846),{width:1280,height:846},'and the other way round');
++assert.deepEqual(shownSize(1280,846,1082,1280),{width:1082,height:1280},'no black bars even before a portrait renegotiation');
++assert.deepEqual(shownSize(0,0,1280,756),{width:0,height:0},'no picture yet');
+ for(const [w,h] of [[1920,1080],[2560,1440],[1920,720],[720,1280],[800,480],[320,700]]){
+- const size=fittedSize(1280,720,w,h); assert.ok(size.width<=w+.01&&size.height<=h+.01);assert.ok(Math.abs(size.width/size.height-16/9)<.0001);
++ assert.deepEqual(shownSize(1280,720,w,h),{width:w,height:h},'always fills the view');
+  const target=suggestedResolution(w,h);assert.ok(Object.values(target).every(v=>v>=480&&v<=1920&&v%2===0));
+  assert.ok(!aspectChanged(target,target));
+ }
+--- a/web/src/display-fit.ts
++++ b/web/src/display-fit.ts
+@@ -1,8 +1,3 @@
+-/** Keep the full CarPlay picture visible. Never stretch or crop input coordinates. */
+-export function fittedSize(width: number, height: number, viewWidth: number, viewHeight: number) {
+-  const scale = Math.min(viewWidth / Math.max(1, width), viewHeight / Math.max(1, height));
+-  return { width: Math.max(0, width * scale), height: Math.max(0, height * scale) };
+-}
+ /** Match aspect rather than blindly multiplying by DPR (a 4K car panel need not decode 4K). */
+ export function suggestedResolution(width: number, height: number) {
+   const ratio = Math.min(4, Math.max(0.25, width / Math.max(1, height)));
+@@ -16,3 +11,16 @@
+ export function aspectChanged(a: {width: number; height: number}, b: {width: number; height: number}) {
+   return Math.abs((a.width / a.height) / (b.width / b.height) - 1) > 0.025;
+ }
++/** Shapes within 20% of each other (the car's page 1280x756 vs fullscreen 1280x846) are not renegotiated
++ *  outside fullscreen; clearly different ones (portrait, split screen) are, at once. */
++export function closeShape(a: {width: number; height: number}, b: {width: number; height: number}) {
++  return a.width > 0 && a.height > 0 && b.width > 0 && b.height > 0 &&
++    Math.abs((a.width / a.height) / (b.width / b.height) - 1) <= 0.2;
++}
++/** The picture always fills the view, stretched per axis: no black bars (user 2026-10-12). A close shape
++ *  stays stretched; a clearly different one is shown stretched only until CarPlay is renegotiated.
++ *  Touch input is normalized per axis, so it stays exact. */
++export function shownSize(width: number, height: number, viewWidth: number, viewHeight: number) {
++  if (width <= 0 || height <= 0) return { width: 0, height: 0 };
++  return { width: viewWidth, height: viewHeight };
++}
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -4,7 +4,7 @@
+ import { VideoPlayer } from './video';
+ import { Connection } from './ws';
+ import { SystemMedia } from './media-session';
+-import { fittedSize, suggestedResolution, aspectChanged } from './display-fit';
++import { shownSize, suggestedResolution, aspectChanged, closeShape } from './display-fit';
+ import { t, language, setLanguage, type Key } from './i18n';
+ import { isNight, parseNightMode } from './night';
+ import type { ServerMessage, ClientMessage } from './protocol';
+@@ -68,7 +68,7 @@
+   el('night-status').title = t(darkQuery.matches ? 'browserDark' : 'browserLight');
+ }
+ function fit() {
+-  const size = fittedSize(canvas.width, canvas.height, screen.clientWidth, screen.clientHeight);
++  const size = shownSize(canvas.width, canvas.height, screen.clientWidth, screen.clientHeight);
+   surface.style.width = `${size.width}px`; surface.style.height = `${size.height}px`;
+ }
+ function error(message: string) { el('error-text').textContent = message; el('error-banner').hidden = !message; }
+@@ -232,14 +232,17 @@
+ async function adapt() {
+   if (!display || !autoFit.checked || displayBusy) return;
+   const target=autoTarget();
++  if (!document.fullscreenElement && closeShape(display,target)) return;
+   const key=`${target.width}x${target.height}`;
+   if (!aspectChanged(display,target) || key===lastAutoTarget) return;
+   // Avoid a reconnect loop even when another viewer has a different screen shape.
+   lastAutoTarget=key;
+   if (!(await saveDisplay({...display,...target,hevc:false}))) error(t('autoFail'));
+ }
+-/** The current window sets the resolution, so neither fullscreen nor the normal window shows black bars;
+- *  switching between them renegotiates CarPlay once (user's choice 2026-10-11 over bars without a reconnect). */
++/** A close shape is renegotiated only in fullscreen: opening the page or leaving fullscreen shows the
++ *  current picture stretched (shownSize, never black bars) instead of a black reconnect right after
++ *  opening. A clearly different shape (portrait, split screen) is renegotiated at once, as before
++ *  (user 2026-10-12, replacing 2026-10-11's reconnect on every window change). */
+ function autoTarget() {
+   return suggestedResolution(screen.clientWidth,screen.clientHeight);
+ }

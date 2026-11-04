@@ -30,6 +30,8 @@ class PhonePolicyTest {
     @Test fun removedPhoneCannotReturnThroughAutomaticDiscoveryOrAnotherSelection() {
         val p = policy(); assertTrue(p.authorize("controller-b", b, true, bonded))
         p.pause(b, remove = true); p.discover(b, "Second renamed")
+        assertNull(p.state.preferred)
+        assertNull(p.state.last)
         assertFalse(p.choose(b, bonded))
         assertFalse(p.authorize("controller-b", a, true, bonded))
         assertEquals(a, p.select(bonded, 0))

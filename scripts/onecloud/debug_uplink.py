@@ -31,11 +31,17 @@ def hotspot(state, filename=HOTSPOT):
         return None
     if not isinstance(value, dict) or not isinstance(value.get("ssid"), str) or not isinstance(value.get("passphrase"), str):
         return None
-    if not 1 <= len(value["ssid"].encode()) <= 32 or not 8 <= len(value["passphrase"]) <= 63:
+    opened = value.get('security') == 'open'
+    if not 1 <= len(value["ssid"].encode()) <= 32:
+        return None
+    if (value['passphrase'] != '' if opened else not 8 <= len(value['passphrase']) <= 63):
         return None
     if any(ord(c) < 32 or ord(c) == 127 for c in value['ssid'] + value['passphrase']):
         return None
-    return {"ssid": value["ssid"], "passphrase": value["passphrase"]}
+    result = {"ssid": value["ssid"], "passphrase": value["passphrase"]}
+    if opened:
+        result['security'] = 'open'
+    return result
 
 
 def remaining(run, now=None):

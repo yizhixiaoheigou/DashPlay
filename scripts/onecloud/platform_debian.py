@@ -83,6 +83,14 @@ def wpa_network_lines(ssid, passphrase):
     return [f" ssid={ssid.encode().hex()}", f" psk={psk}"]
 
 
+def station_network_lines(hotspot):
+    if hotspot.get('security') == 'open':
+        if hotspot.get('passphrase'):
+            raise ValueError('open hotspot cannot contain a password')
+        return [f" ssid={hotspot['ssid'].encode().hex()}", ' key_mgmt=NONE']
+    return wpa_network_lines(hotspot['ssid'], hotspot['passphrase']) + [' key_mgmt=WPA-PSK SAE', ' ieee80211w=1']
+
+
 def hostapd_config(interface, channel, width, ssid, passphrase, country="CN"):
     """passphrase None: an open network (first-run setup only). country None: leave the regulatory
     domain to the driver."""
@@ -433,7 +441,7 @@ class DebianPlatform:
     def join_wifi(self, car, lease, wait_for, seconds):
         """Associate with the car hotspot and get a DHCP lease; returns True on success, False after timeout cleanup."""
         conf = self.run / "wpa.conf"
-        network = "\n".join(wpa_network_lines(car["ssid"], car["passphrase"]))
+        network = "\n".join(station_network_lines(car))
         # Last time's frequency first: a full 2.4 + 5 GHz scan is ~2.7 s on rtw88, longer while the JVM
         # starts, and the box sat ~10 s between the dongle appearing and authenticating (2026-10-11 cold
         # boot). If the car moved channel, everything is scanned again after JOIN_KNOWN_FREQ_SECONDS.
@@ -442,7 +450,6 @@ class DebianPlatform:
         def write_conf(scan_freq):
             # Car hotspots run WPA2, WPA3 or the transition mode; accept either.
             conf.write_text(f'ctrl_interface={self.run}/wpa\nnetwork={{\n{network}\n'
-                            ' key_mgmt=WPA-PSK SAE\n ieee80211w=1\n'
                             + (f' scan_freq={int(scan_freq)}\n' if scan_freq else '') + '}\n')
 
         write_conf(known)
@@ -797,10 +804,10 @@ class DebianPlatform:
         """
         self.stop_phone_station()
         frequency = int(frequency)
-        network = '\n'.join(wpa_network_lines(hotspot['ssid'], hotspot['passphrase']))
+        network = '\n'.join(station_network_lines(hotspot))
         conf = self.run / 'wpa.conf'
         conf.write_text(f'ctrl_interface={self.run}/wpa\nnetwork={{\n{network}\n'
-                        f' key_mgmt=WPA-PSK SAE\n ieee80211w=1\n scan_freq={frequency}\n'
+                        f' scan_freq={frequency}\n'
                         f' freq_list={frequency}\n}}\n')
         conf.chmod(0o600)
         self.sta_network.write_text(f'[Match]\nName={self.interface}\n[Network]\nDHCP=ipv4\n'

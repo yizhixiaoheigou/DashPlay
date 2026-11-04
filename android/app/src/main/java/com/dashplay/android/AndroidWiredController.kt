@@ -27,9 +27,12 @@ class AndroidWiredController(private val context: Context, private val server: C
     private val manager = context.getSystemService(Context.USB_SERVICE) as UsbManager
     private val main = android.os.Handler(android.os.Looper.getMainLooper())
     private val resources = Any()
+    private val usbChanges = UsbChangeSignal()
     private var opened: AndroidUsbAccess.Opened? = null
     private var mux: Iap2UsbMuxHost? = null
     private var session: Iap2Session? = null
+    private var phoneDiagnostics: WiredPhoneDiagnostics? = null
+    private val displayRestart = java.util.concurrent.atomic.AtomicReference<Iap2Session?>(null)
     private var lease: UsbVpnService.Lease? = null
     private val permissionRequested = mutableMapOf<String, Long>()
     @Volatile private var bound = CountDownLatch(1)
@@ -44,35 +47,51 @@ class AndroidWiredController(private val context: Context, private val server: C
     }
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action != UsbManager.ACTION_USB_DEVICE_DETACHED) return
-            @Suppress("DEPRECATION") val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
-            if (device?.deviceName == selectedDevice) Thread({ closeLink() }, "usb-detach").start()
+            if (intent?.action == UsbManager.ACTION_USB_DEVICE_DETACHED) {
+                @Suppress("DEPRECATION") val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
+                val detached = synchronized(resources) { opened?.takeIf { device?.deviceName == selectedDevice } }
+                if (detached != null) Thread({ closeLink(detached) }, "usb-detach").start()
+            }
+            usbChanges.changed()
         }
     }
 
     fun start() {
-        server.platformWiredRestart = { Thread({ closeLink() }, "usb-restart").start() }
+        server.platformWiredRestart = {
+            // A display change needs another AirPlay session, not a new USB network.
+            // Keep iAP2/NCM/TUN and ask the phone again; the watcher falls back if needed.
+            synchronized(resources) { session?.let { displayRestart.set(it) } }
+        }
         server.platformWiredReselect = { Thread({ closeLink() }, "usb-reselect").start() }
-        val filter = IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED)
-        if (Build.VERSION.SDK_INT >= 33) context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        else context.registerReceiver(receiver, filter)
+        val filter = IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED).apply {
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+        }
+        if (Build.VERSION.SDK_INT >= 33) {
+            val permissionFilter = IntentFilter(filter).apply { addAction(PERMISSION) }
+            context.registerReceiver(receiver, permissionFilter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            // Only protected system USB broadcasts on legacy Android. Permission grants are
+            // still detected by the bounded 500 ms poll; do not expose an app-action receiver.
+            context.registerReceiver(receiver, filter)
+        }
         registered = true
         Thread(::run, "android-wired-carplay").apply { isDaemon = true; start() }
     }
 
     private fun state(phase: String, message: String) {
         if (stopped) return
-        if (phase != status || message != detail) DriveLog.event("wired $phase: $message")
+        if (phase != status || message != detail) DriveLog.event("wired $phase: $message uptimeMs=${android.os.SystemClock.elapsedRealtime()}")
         status = phase; detail = message
     }
 
     private fun run() {
         try {
             while (!stopped) {
+                val observedUsb = usbChanges.snapshot()
                 if (VpnService.prepare(context) != null) {
                     server.cableUnplugged()
                     state("CONSENT", "请在数据线连接设置中允许本地 VPN 通道")
-                    Thread.sleep(1000); continue
+                    usbChanges.awaitChange(observedUsb, 1000); continue
                 }
                 val devices = AndroidUsbAccess.candidates(manager)
                 val now = android.os.SystemClock.elapsedRealtime()
@@ -80,12 +99,12 @@ class AndroidWiredController(private val context: Context, private val server: C
                 if (devices.size != 1) {
                     server.cableUnplugged(); transitions = 0
                     state("CABLE", if (devices.isEmpty()) "请用 OTG 数据线连接 iPhone" else "请只连接一部 iPhone")
-                    Thread.sleep(1000); continue
+                    usbChanges.awaitChange(observedUsb, 1000); continue
                 }
                 val device = devices.single()
                 selectedDevice = device.deviceName
                 if (!manager.hasPermission(device)) {
-                    state("PERMISSION", "请允许 DashPlay 访问 USB iPhone（勾选「始终打开」可免去后续弹窗）")
+                    state("PERMISSION", "请允许 DashPlay 访问 iPhone；可勾选「始终打开」，部分系统仍会要求再次确认")
                     if (device.deviceName !in permissionRequested) {
                         permissionRequested[device.deviceName] = now
                         main.post {
@@ -97,19 +116,25 @@ class AndroidWiredController(private val context: Context, private val server: C
                             }
                         }
                     }
-                    Thread.sleep(500); continue
+                    usbChanges.awaitChange(observedUsb, 500); continue
                 }
                 if (transitions >= 3) {
                     state("FAILED", "iPhone 未切换到 CarPlay 模式，请重新插线或重试")
-                    Thread.sleep(1000); continue
+                    usbChanges.awaitChange(observedUsb, 1000); continue
                 }
+                var reenumerating = false
+                var openingUsb = false
                 try {
-                    val carPlay = server.cableRole.carPlayOnCable()
+                    // Decide before open() changes the phone's USB mode, as on the 11.02 receiver.
+                    // A live wireless session keeps the cable for power/internet; an explicit wired
+                    // selection has already set cablePhone and overrides that temporary choice.
+                    val carPlay = Settings(context).wiredCarPlaySupported && server.cableRole.carPlayOnCable() && server.prepareCablePhone()
                     state("STARTING", if (carPlay) "正在建立数据线连接" else "正在准备 USB 网络通道")
+                    openingUsb = true
                     val usb = AndroidUsbAccess.open(manager, device, carPlay = carPlay)
+                    openingUsb = false
                     synchronized(resources) { if (stopped) { usb.close(); return }; opened = usb }
                     if (carPlay) {
-                        server.setCablePhone(true)
                         runSession(usb)
                     } else {
                         server.cableWithoutCarPlay()
@@ -118,11 +143,23 @@ class AndroidWiredController(private val context: Context, private val server: C
                 } catch (_: AndroidUsbAccess.Reenumerating) {
                     transitions++
                     state("REENUMERATING", "等待 iPhone 重新连接 USB，出现授权提示时请允许")
-                    Thread.sleep(2000)
+                    reenumerating = true
                 } catch (error: Exception) {
-                    DriveLog.event("wired failure: ${error.javaClass.simpleName}: ${error.message}")
-                    state("FAILED", "数据线连接中断，请确认 iPhone 已解锁并信任此设备")
+                    DriveLog.event("wired failure stage=${if (openingUsb) "USB_SETUP" else "CARPLAY"}: ${error.javaClass.simpleName}: ${error.message}")
+                    state("FAILED", if (openingUsb) "iPhone USB 通道初始化失败，正在重试；持续失败时请重新插线"
+                        else if (status == "TRUST") "iPhone 信任授权未完成，请解锁并在 iPhone 上确认"
+                        else "CarPlay 数据线连接中断，正在重试；请确认 iPhone 已解锁")
                 } finally { closeLink(); releaseVpn() }
+                if (reenumerating && !stopped) {
+                    val started = android.os.SystemClock.elapsedRealtime()
+                    val ready = usbChanges.awaitReady(3500) {
+                        val next = AndroidUsbAccess.candidates(manager)
+                        next.size == 1 && next.single().deviceName != device.deviceName
+                    }
+                    DriveLog.event("wired USB reenumeration ${if (ready) "ready" else "timeout"} after ${android.os.SystemClock.elapsedRealtime() - started} ms")
+                    if (ready) continue
+                }
+                // Genuine failures still back off; broadcasts must not turn errors into a busy loop.
                 if (!stopped) Thread.sleep(1500)
             }
         } finally {
@@ -173,6 +210,12 @@ class AndroidWiredController(private val context: Context, private val server: C
         }
         val link = Iap2Session.open(carkit, traceContext = "wired")
         synchronized(resources) { if (stopped || opened !== usb) { link.close(); return }; session = link }
+        if (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0 &&
+            context.resources.getBoolean(R.bool.usb_phone_diagnostics)) {
+            synchronized(resources) {
+                if (!stopped && opened === usb) phoneDiagnostics = WiredPhoneDiagnostics(host, record)
+            }
+        }
         if (!binding) {
             binding = context.bindService(Intent(context, UsbVpnService::class.java).setAction(UsbVpnService.LOCAL_BIND), connection, Context.BIND_AUTO_CREATE)
             if (!binding) throw IOException("USB VPN 服务无法启动")
@@ -201,11 +244,27 @@ class AndroidWiredController(private val context: Context, private val server: C
                 DriveLog.event("wired control: ${it.substringBefore(" usbTransport=")}")
             },
             onReady = {
+                // Keep NCM data inactive until authentication and our TUN/listener are ready.
+                // This callback runs before the control client handles CarPlay availability.
+                usb.activateNcm()
+                DriveLog.event("wired NCM activated after authentication uptimeMs=${android.os.SystemClock.elapsedRealtime()}")
                 state("AVAILABLE", "CarPlay 已就绪，等待 iPhone 连接")
                 Thread({
                     // Keeps watching after LIVE: see WiredSessionWatch for why a session that ends is started over.
-                    val watch = WiredSessionWatch(System.nanoTime())
+                    var watch = WiredSessionWatch(System.nanoTime())
                     while (!stopped && synchronized(resources) { opened === usb }) {
+                        if (displayRestart.compareAndSet(link, null)) {
+                            try {
+                                link.send(Iap2WiredControlClient.carPlayStartSession(endpoint), 2000)
+                                startSent.set(true)
+                                watch = WiredSessionWatch(System.nanoTime(), startWaitNanos = 10_000_000_000L)
+                                state("AVAILABLE", "正在重新协商 CarPlay 画面")
+                                DriveLog.event("wired display start requested on existing USB network")
+                            } catch (error: Exception) {
+                                DriveLog.event("wired display start failed: ${error.javaClass.simpleName}")
+                                closeLink(usb); return@Thread
+                            }
+                        }
                         when (watch.step(server.wiredSessionActive(), System.nanoTime(), startSent.get())) {
                             WiredSessionWatch.Step.RETRY_START -> {
                                 try {
@@ -240,7 +299,9 @@ class AndroidWiredController(private val context: Context, private val server: C
     private fun closeLink(expected: AndroidUsbAccess.Opened? = null) {
         val close = synchronized(resources) {
             if (expected != null && opened !== expected) return
-            val close = listOfNotNull(session, mux, lease, opened)
+            val close = listOfNotNull(phoneDiagnostics, session, mux, lease, opened)
+            phoneDiagnostics = null
+            displayRestart.set(null)
             session = null; mux = null; lease = null; opened = null
             if (close.isNotEmpty()) server.stopWired()
             close
@@ -250,6 +311,7 @@ class AndroidWiredController(private val context: Context, private val server: C
 
     override fun close() {
         stopped = true; server.platformWiredRestart = null; server.platformWiredReselect = null
+        usbChanges.close()
         main.removeCallbacksAndMessages(null)
         if (registered) { runCatching { context.unregisterReceiver(receiver) }; registered = false }
         closeLink(); status = "OFF"; detail = "数据线连接未启用"

@@ -77,7 +77,11 @@ class SettingsActivity : Activity() {
             tagged(ui.settingRow("本地热点", if (settings.usesLocalHotspot) "由应用自动创建" else "系统热点或外部 Wi-Fi") {
                 startActivity(Intent(this, HotspotActivity::class.java))
             }.apply { id = R.id.row_hotspot }, "hotspot"),
-            tagged(ui.settingRow("特斯拉访问地址", if (settings.teslaRootAccess) TeslaRootAccess.message else "Root 热点访问与外部网络") {
+            tagged(ui.settingRow("特斯拉访问入口", when {
+                settings.teslaRootAccess -> TeslaRootAccess.message
+                settings.compatHttp -> "已开启免 Root HTTP 兼容入口（实验性）"
+                else -> "免 Root HTTP 兼容入口、Root 热点与外部网络"
+            }) {
                 startActivity(Intent(this, TeslaAccessActivity::class.java))
             }.apply { id = R.id.row_tesla_access }, "tesla_access"),
             tagged(ui.settingRow("自己的网址与证书", "导入证书、切换与本地访问恢复") {
@@ -94,7 +98,7 @@ class SettingsActivity : Activity() {
                 IphoneLink.WIRELESS -> R.string.iphone_wireless
                 IphoneLink.WIRED -> R.string.iphone_wired
             })) { edit(SetupActivity.STEP_IPHONE) }, "link"),
-            tagged(ui.settingRow("数据线连接", if (settings.usesUsb) AndroidWiredController.detail else "连接 iPhone，设置 USB 与 VPN 权限") {
+            tagged(ui.settingRow(if (settings.wiredCarPlaySupported) "数据线连接" else "USB 上网（可选）", if (settings.usesUsb) AndroidWiredController.detail else if (settings.wiredCarPlaySupported) "连接 iPhone，设置 USB 与 VPN 权限" else "仅使用 iPhone 网络，不传输 CarPlay；默认关闭") {
                 startActivity(Intent(this, UsbActivity::class.java))
             }.apply { id = R.id.row_usb }, "usb"),
             tagged(ui.settingRow(getString(R.string.set_iphone_added), settings.iphoneName ?: getString(R.string.set_iphone_none)) {

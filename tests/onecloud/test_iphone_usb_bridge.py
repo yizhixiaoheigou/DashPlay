@@ -3,6 +3,7 @@ import importlib.util
 from pathlib import Path
 import struct
 import unittest
+import tempfile
 from unittest.mock import patch
 
 PATH = Path(__file__).resolve().parents[2] / 'scripts/onecloud/iphone-usb-bridge.py'
@@ -12,6 +13,66 @@ spec.loader.exec_module(bridge)
 
 
 class UsbRequestTests(unittest.TestCase):
+    def test_tether_unplug_reports_waiting_even_if_phone_returns_before_next_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            device = Path(directory) / '1-1'
+            device.mkdir()
+            (device / 'devnum').write_text('8')
+            def replug(_):
+                (device / 'devnum').write_text('10')
+            with patch.object(bridge, 'apple_device', side_effect=[device, device, None]), \
+                    patch.object(bridge.time, 'sleep', side_effect=replug) as sleep, \
+                    patch.object(bridge, 'log') as log:
+                bridge.wait_for_unplug(device)
+            self.assertEqual(sleep.call_count, 1)
+            log.assert_any_call('usb waiting')
+
+    def test_tether_unplug_reports_waiting_when_device_node_disappears(self):
+        with tempfile.TemporaryDirectory() as directory:
+            device = Path(directory) / '1-1'
+            with patch.object(bridge, 'apple_device', return_value=None), patch.object(bridge, 'log') as log:
+                bridge.wait_for_unplug(device)
+            log.assert_any_call('usb waiting')
+
+    def test_tether_mux_claims_only_usbmux_and_never_starts_carplay_ncm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            device = root / '1-1'
+            device.mkdir()
+            (device / 'serial').write_text('test-phone')
+            interface = root / '1-1:6.0'
+            interface.mkdir()
+            for name, value in [('bInterfaceClass', 'ff'), ('bInterfaceSubClass', 'fe'),
+                                ('bInterfaceProtocol', '02'), ('bInterfaceNumber', '00')]:
+                (interface / name).write_text(value)
+            for address in ['01', '81']:
+                endpoint = interface / ('ep_' + address)
+                endpoint.mkdir()
+                (endpoint / 'bEndpointAddress').write_text(address)
+                (endpoint / 'type').write_text('Bulk')
+            mark = root / 'tether'
+            mark.touch()
+            with patch.object(bridge, 'ROLE', root / 'no-role'), \
+                    patch.object(bridge, 'USB_TETHER_MARK', mark), \
+                    patch.dict(bridge.os.environ, {'CARPLAY_USB_TETHER_MUX': '1'}), \
+                    patch.object(bridge, 'apple_device', return_value=device), \
+                    patch.object(bridge, 'wait_device', return_value=device), \
+                    patch.object(bridge, 'cable_carplay_off', return_value=True), \
+                    patch.object(bridge, 'prepare_carplay', return_value=True), \
+                    patch.object(bridge, 'carplay_configuration', return_value=device), \
+                    patch.object(bridge, 'release_tethering'), patch.object(bridge, 'release_carplay_ncm'), \
+                    patch.object(bridge, 'report_tether_interface'), patch.object(bridge, 'node', return_value='test-node'), \
+                    patch.object(bridge.os, 'open', return_value=7), patch.object(bridge, 'claim') as claim, \
+                    patch.object(bridge, 'ncm_functions') as ncm, patch.object(bridge, 'open_tap') as tap, \
+                    patch.object(bridge.threading, 'Thread'), patch.object(bridge, 'log') as log, \
+                    patch.object(bridge, 'relay_usbmux') as relay:
+                bridge.main()
+                claim.assert_called_once_with(7, device, 0)
+                relay.assert_called_once_with(7, (0, 1, 129))
+                ncm.assert_not_called()
+                tap.assert_not_called()
+                log.assert_any_call('tethermux ready')
+
     def test_large_ntb_is_read_whole_with_all_datagrams(self):
         frames = [bytes([i]) * 1400 for i in range(22)]
         offset = 128
@@ -109,8 +170,8 @@ class CableCarPlayOffTests(unittest.TestCase):
     after "car internet" was changed in the settings page, which had nothing to do with it.
 
     Configuration 4 (the iPhone's own hotspot configuration) has ipheth binding with the carrier stuck at 0
-    (dp-0017, measured); configuration 6 with only ipheth bound comes up. So the bridge still selects the
-    CarPlay configuration and then stays out of usbmux/NCM instead of failing when they are absent.
+    (dp-0017, measured). Later replug reports also found configuration 6 without USB trust stuck at 0.
+    The sharing-only path now authenticates through USBMUX, while leaving CarPlay NCM closed.
     """
 
     def test_the_receivers_marker_turns_the_cables_carplay_off(self):
@@ -123,20 +184,40 @@ class CableCarPlayOffTests(unittest.TestCase):
             self.assertTrue(bridge.cable_carplay_off(env))
             self.assertFalse(bridge.cable_carplay_off({}), 'no marker path: the cable always carries CarPlay')
 
-    def test_without_carplay_the_bridge_says_tether_and_waits_for_the_unplug(self):
-        # "usb tether" keeps the receiver from pausing wireless; returning after the unplug keeps it out of
-        # usbmux/NCM (it used to fall through and fail with "CarPlay configuration incomplete").
-        source = PATH.read_text()
-        with patch.object(bridge, 'log') as log:
-            bridge.prepare_carplay('test-phone', True, environ={'CARPLAY_USB_STATE_ACK': '1'})
-            log.assert_called_once_with('usb tether test-phone')
-        self.assertIn('        wait_for_unplug(device)\n        return\n', source)
+    def test_charging_or_old_receiver_waits_for_unplug_without_claiming_usbmux(self):
+        for share, capability in [(False, '1'), (True, '0')]:
+            with self.subTest(share=share, capability=capability), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                device = root / '1-1'
+                device.mkdir()
+                (device / 'serial').write_text('test-phone')
+                mark = root / 'tether'
+                if share:
+                    mark.touch()
+                with patch.object(bridge, 'ROLE', root / 'no-role'), \
+                        patch.object(bridge, 'USB_TETHER_MARK', mark), \
+                        patch.dict(bridge.os.environ, {'CARPLAY_USB_TETHER_MUX': capability}), \
+                        patch.object(bridge, 'apple_device', return_value=device), \
+                        patch.object(bridge, 'wait_device', return_value=device), \
+                        patch.object(bridge, 'cable_carplay_off', return_value=True), \
+                        patch.object(bridge, 'carplay_configuration', return_value=device), \
+                        patch.object(bridge, 'release_tethering') as tethering, \
+                        patch.object(bridge, 'release_carplay_ncm') as release_ncm, \
+                        patch.object(bridge, 'report_tether_interface'), \
+                        patch.object(bridge, 'wait_for_unplug') as wait, \
+                        patch.object(bridge, 'claim') as claim, patch.object(bridge, 'log') as log:
+                    bridge.main()
+                    log.assert_any_call('usb tether test-phone')
+                    tethering.assert_called_once_with(device)
+                    release_ncm.assert_called_once_with(device)
+                    wait.assert_called_once_with(device)
+                    claim.assert_not_called()
 
     def test_the_cables_carplay_does_not_decide_the_usb_internet(self):
         # The iPhone's USB internet interface is kept or released by release_tethering alone, before the
         # CarPlay question; without USB internet chosen, the cable only charges the iPhone.
         source = PATH.read_text()
-        self.assertLess(source.index('    release_tethering(device)'), source.index('report_tether_interface(device)\n        wait_for_unplug'))
+        self.assertLess(source.index('    release_tethering(device)'), source.index('        report_tether_interface(device)'))
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(bridge, 'USB_TETHER_MARK', Path(tmp) / 'usb-tether'), \

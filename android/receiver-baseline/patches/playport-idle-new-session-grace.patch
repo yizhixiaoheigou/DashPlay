@@ -1,0 +1,126 @@
+Give every accepted AirPlay connection its own idle grace, including late first pairing.
+
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -38,6 +38,27 @@
+ /** What the supervisor does about a wireless session nobody watches (CarPlayServer.idleAction). */
+ enum class IdleAction { NONE, RELEASE, WAIT, RESUME }
+ 
++/** Supervisor-owned idle clock: every accepted connection gets a full grace period, including authentication. */
++internal class IdleReleaseTimer(startedAt: Long, private val releaseMs: Long) {
++    private var viewerSeenAt = startedAt
++    private var parked = false
++    private var observedSession: Any? = null
++
++    fun action(now: Long, viewerPresent: Boolean, session: Any?): IdleAction {
++        if (session != null && session !== observedSession) {
++            // Startup or the previous phone's idle time must not cut off a new pairing/authentication.
++            viewerSeenAt = now
++            parked = false
++        }
++        observedSession = session
++        if (viewerPresent) viewerSeenAt = now
++        val action = CarPlayServer.idleAction(now, viewerSeenAt, session != null, parked, releaseMs)
++        if (action == IdleAction.RELEASE) parked = true
++        if (action == IdleAction.RESUME) parked = false
++        return action
++    }
++}
++
+ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigStore? = null) : Closeable {
+     private val log = LoggerFactory.getLogger("playport")
+ 
+@@ -633,19 +654,17 @@
+         if (!config.wireless) return
+         Thread({
+             var absentChecks = 0
+-            var viewerSeenAt = System.nanoTime() / 1_000_000   // the boot invitation has the full wait for a page
+             val releaseMs = System.getenv("CARPLAY_IDLE_RELEASE_SECONDS")?.toLongOrNull()?.coerceAtLeast(0)?.times(1000)
+                 ?: IDLE_RELEASE_MS
+             if (releaseMs == 0L) log.info("idle release off: CarPlay stays connected without a viewer")
+-            var parked = false
++            val idleTimer = IdleReleaseTimer(System.nanoTime() / 1_000_000, releaseMs)
+             while (!closed.get()) {
+                 try {
+                     Thread.sleep(SUPERVISOR_INTERVAL_MS)
+                     if (closed.get()) return@Thread
+                     val now = System.nanoTime() / 1_000_000
+                     // The phone on the cable owns CarPlay; its session is no Wi-Fi presence either.
+-                    if (cablePhone) { viewerSeenAt = now; continue }
+-                    if (hub.viewerCount > 0) viewerSeenAt = now
++                    if (cablePhone) { idleTimer.action(now, true, activeSession); continue }
+                     // Learn the phone's Wi-Fi identity before an idle release can end its session: a phone invited
+                     // right after pairing, with no page open, was released first and then never invited again,
+                     // being unknown on this Wi-Fi (F50, 2026-10-19).
+@@ -654,9 +673,8 @@
+                             presenceLearned = presence("remember", peer, phone, activeSession?.controllerId.orEmpty())
+                         }
+                     }
+-                    when (idleAction(now, viewerSeenAt, activeSession != null, parked, releaseMs)) {
++                    when (idleTimer.action(now, hub.viewerCount > 0, activeSession)) {
+                         IdleAction.RELEASE -> {
+-                            parked = true
+                             log.info("no viewer for {} s: CarPlay released until a page opens", releaseMs / 1000)
+                             synchronized(this@CarPlayServer) {
+                                 ++wirelessGeneration
+@@ -669,7 +687,6 @@
+                         }
+                         IdleAction.WAIT -> continue
+                         IdleAction.RESUME -> {
+-                            parked = false
+                             log.info("a viewer opened the page: inviting the iPhone again")
+                             restartWireless()
+                             continue
+--- a/server/src/test/kotlin/com/playport/server/IdleReleaseTest.kt
++++ b/server/src/test/kotlin/com/playport/server/IdleReleaseTest.kt
+@@ -23,4 +23,50 @@
+         assertEquals(IdleAction.WAIT, CarPlayServer.idleAction(now = 10 * wait, viewerSeenAt = 0, session = false, parked = true))
+         assertEquals(IdleAction.RESUME, CarPlayServer.idleAction(now = 10 * wait, viewerSeenAt = 10 * wait, session = false, parked = true))
+     }
++    @Test fun lateFirstConnectionGetsTheFullWaitToAuthenticate() {
++        val timer = IdleReleaseTimer(0, wait)
++        assertEquals(IdleAction.NONE, timer.action(2 * wait, false, null))
++        val authenticating = Any()
++        assertEquals(IdleAction.NONE, timer.action(2 * wait + 1, false, authenticating))
++        assertEquals(IdleAction.NONE, timer.action(3 * wait, false, authenticating))
++        assertEquals(IdleAction.RELEASE, timer.action(3 * wait + 1, false, authenticating))
++        assertEquals(IdleAction.WAIT, timer.action(3 * wait + 2, false, null))
++        assertEquals(IdleAction.RESUME, timer.action(3 * wait + 3, true, null))
++    }
++
++    @Test fun replacementConnectionGetsItsOwnGraceWithoutAnEmptyPoll() {
++        val timer = IdleReleaseTimer(0, wait)
++        val first = Any()
++        val second = Any()
++        assertEquals(IdleAction.NONE, timer.action(0, false, first))
++        assertEquals(IdleAction.NONE, timer.action(wait - 1, false, first))
++        assertEquals(IdleAction.NONE, timer.action(wait, false, second))
++        assertEquals(IdleAction.NONE, timer.action(2 * wait - 1, false, second))
++        assertEquals(IdleAction.RELEASE, timer.action(2 * wait, false, second))
++    }
++
++    @Test fun openingThePageExtendsTheWaitAndZeroStillDisablesRelease() {
++        val session = Any()
++        val timer = IdleReleaseTimer(0, wait)
++        timer.action(0, false, session)
++        assertEquals(IdleAction.NONE, timer.action(wait, true, session))
++        assertEquals(IdleAction.NONE, timer.action(2 * wait - 1, false, session))
++        assertEquals(IdleAction.RELEASE, timer.action(2 * wait, false, session))
++        val disabled = IdleReleaseTimer(0, 0)
++        assertEquals(IdleAction.NONE, disabled.action(0, false, session))
++        assertEquals(IdleAction.NONE, disabled.action(100 * wait, false, session))
++    }
++
++    @Test fun explicitNewConnectionWhileParkedGetsOneGracePeriod() {
++        val timer = IdleReleaseTimer(0, 30_000)
++        val first = Any()
++        timer.action(0, false, first)
++        assertEquals(IdleAction.RELEASE, timer.action(30_000, false, first))
++        assertEquals(IdleAction.WAIT, timer.action(30_001, false, first))
++        timer.action(30_002, false, null)
++        val newlyPaired = Any()
++        assertEquals(IdleAction.NONE, timer.action(60_000, false, newlyPaired))
++        assertEquals(IdleAction.RELEASE, timer.action(90_000, false, newlyPaired))
++    }
++
+ }

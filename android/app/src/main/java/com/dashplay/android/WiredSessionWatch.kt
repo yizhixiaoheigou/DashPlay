@@ -12,7 +12,7 @@ internal class WiredSessionWatch(
     startedAt: Long,
     private val startWaitNanos: Long = 60_000_000_000L,
     private val graceNanos: Long = 10_000_000_000L,
-    private val startRetryNanos: Long = 20_000_000_000L,
+    private val startRetryNanos: Long = 3_000_000_000L,
 ) {
     enum class Step { WAITING, RETRY_START, LIVE, GONE, RESTART }
 

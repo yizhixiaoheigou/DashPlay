@@ -1,0 +1,59 @@
+Viewer: a swipe is not ended by a lost pointer capture (2026-10-23).
+
+On the car's browser the receiver saw finger down to up in 6-80 ms while the finger was still swiping, so
+the phone took the gesture as a tap. A lost pointer capture no longer ends the touch (only pointerup and
+pointercancel do), and a swipe that moved sends its final point as a move before the up, so an
+animation-frame flush starved by decoding cannot turn the swipe into a single up at the end.
+
+--- a/web/src/input.ts
++++ b/web/src/input.ts
+@@ -8,6 +8,8 @@
+   x: number;
+   y: number;
+   down: boolean;
++  startX: number;
++  startY: number;
+ }
+ 
+ const emptyKnob = (overrides: Partial<KnobState> = {}): KnobState => ({
+@@ -39,7 +41,6 @@
+     surface.addEventListener('pointermove', this.onPointerMove, { passive: false });
+     surface.addEventListener('pointerup', this.onPointerUp, { passive: false });
+     surface.addEventListener('pointercancel', this.onPointerUp, { passive: false });
+-    surface.addEventListener('lostpointercapture', this.onPointerUp, { passive: false });
+     window.addEventListener('keydown', this.onKeyDown);
+   }
+ 
+@@ -49,7 +50,6 @@
+     surface.removeEventListener('pointermove', this.onPointerMove);
+     surface.removeEventListener('pointerup', this.onPointerUp);
+     surface.removeEventListener('pointercancel', this.onPointerUp);
+-    surface.removeEventListener('lostpointercapture', this.onPointerUp);
+     this.reset();
+     window.removeEventListener('keydown', this.onKeyDown);
+   }
+@@ -59,12 +59,8 @@
+     if (this.surface.inert || (event.button !== undefined && event.button !== 0) || this.pointers.size >= MAX_CONTACTS) return;
+     this.surface.focus({ preventScroll: true });
+     this.surface.setPointerCapture(event.pointerId);
+-    this.pointers.set(event.pointerId, {
+-      slot: this.nextSlot(),
+-      x: this.normalizeX(event.clientX),
+-      y: this.normalizeY(event.clientY),
+-      down: true,
+-    });
++    const x = this.normalizeX(event.clientX), y = this.normalizeY(event.clientY);
++    this.pointers.set(event.pointerId, { slot: this.nextSlot(), x, y, down: true, startX: x, startY: y });
+     this.flush();
+     this.lastDownAt = performance.now();
+   };
+@@ -86,6 +82,9 @@
+     if (event.type === 'pointerup') {
+       pointer.x = this.normalizeX(event.clientX);
+       pointer.y = this.normalizeY(event.clientY);
++      // A swipe that moved sends its final point as a move before the up: the animation-frame flush can be
++      // starved while the page decodes, and an up alone at the end reads as a tap on the phone (2026-10-23).
++      if (Math.abs(pointer.x - pointer.startX) > 0.01 || Math.abs(pointer.y - pointer.startY) > 0.01) this.flush();
+     }
+     pointer.down = false;
+     this.flush();

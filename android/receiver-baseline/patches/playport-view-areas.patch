@@ -1,0 +1,1144 @@
+View areas (2026-10-14): a browser window that changes shape (a Tesla's own fullscreen 773x601 <-> 1256x706, the
+XPeng's fullscreen and dock, split screen) no longer reconnects CarPlay. Each shape the page has shown (at most 4)
+becomes a CarPlay view area at the stream's top left, the stream as large as all of them (/info viewAreas,
+viewAreaTransitionControl); a shape seen before is reached with updateViewArea {uuid, viewAreaIndex,
+animationDurationMillis, adjacentViewAreas} on the event channel, without reconnecting, and the page shows that
+area across its view (touches stay in stream coordinates). Only a shape seen the first time, a clearly sharper
+size or another codec declares the areas again (one reconnect). The narrowest area keeps the plain icon size: the
+display reports 200 mm per that area's width (at 200 mm for the whole 1920 px stream the windowed area looked
+crowded). The protocol side follows DiPlay (GPL-3.0, shihabal3amri/DiPlay#246, docs/VIEW_AREAS.md: tested on a
+BYD Tang with iOS 27). Replaces "renegotiate a close shape in fullscreen only, once per browser" (2026-10-13).
+
+Tesla, reverse gear: the car froze the browser without hiding the page (the last report a focus loss, then 67 s
+of nothing), and afterwards the picture stood still until the page was refreshed. The page now notices it was
+frozen (its one-second tick over 4 s late while it was not hidden, or the "resume" event) or that the box went
+silent for 8 s while CarPlay runs, and opens the link again at once (Connection.restart leaves a possibly dead
+socket without waiting for its close); unlike a reload the sound stays unlocked ("revived" in the viewer log).
+A new socket could then hang half-open, the page saying "connecting" until refreshed: one not open within 6 s is
+left for another, and after three in a row the page reloads itself, as the person did by hand, but only while
+the box answers. A hidden page's slowed timers (the XPeng's reverse camera) are no freeze.
+Coming back after the car froze the browser (a Tesla away from it): the iPhone's CarPlay never stops, only the
+page's link to the box may. The box pauses a page silent for 3 s (no sound, the picture waits for a keyframe)
+and keeps its link 10 minutes; the page, on any sign of coming back (a late tick, focus, pageshow, shown, a touch,
+"resume"), asks on its link first and goes on over it with a fresh keyframe when the box answers within 0.6 s, else
+opens a new link, which replaces its old one at once (the page's id); a reload only if no link is open 3 s later.
+The last picture stays up meanwhile. Logged: viewer connected/paused/resumed/replaced/closed on the box, and the
+page's life (ev 8 frozen with gapMs, 9 focus, 10 pageshow, 11 link open again, 12 reloading, 13 back: how 1 same
+link, 2 new link).
+A link that had been up and is closed (by the box, past 10 minutes) is opened again at once, without back-off.
+The last picture is held by awake time only (a timer counting the freeze cleared it the moment the page came back,
+just before the new picture), a new link not open within 1.5 s is replaced, and ev 14 reports pictureMs from waking.
+A Tesla leaves its Wi-Fi when it leaves Park unless "Remain connected in Drive" is on (6 s off in reverse): on the
+browser's "online" event the page opens a new link at once.
+Trimmed once the Tesla's Wi-Fi was found to be the cause: no key/wheel/focus diagnostics, the page wakes on a late
+tick, shown, resume or online only, a reload only after 15 s without a link, and an open-timer that runs late (the
+page frozen meanwhile) gives the socket more time instead of dropping it.
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayConfig.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayConfig.kt
+@@ -22,6 +22,22 @@
+     val initialUrl: String? = null,
+     /** Display feature bits; null keeps the main-screen default (high-fidelity touch and knobs). */
+     val features: Int? = null,
++    /**
++     * The view areas CarPlay may use on this display, or null for the whole display as one area. With several,
++     * the car moves CarPlay between them with updateViewArea, without reconnecting (as DiPlay does, GPL-3.0,
++     * shihabal3amri/DiPlay#246 and its docs/VIEW_AREAS.md).
++     */
++    val viewAreas: List<AirPlayViewArea>? = null,
++    /** The area CarPlay starts in, an index into [viewAreas]. */
++    val initialViewArea: Int = 0,
++)
++
++/** A rectangle of the display's stream that CarPlay can draw in. */
++data class AirPlayViewArea(
++    val width: Int,
++    val height: Int,
++    val originX: Int = 0,
++    val originY: Int = 0,
+ )
+ 
+ /** One OEM homescreen icon. */
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt
+@@ -146,6 +146,23 @@
+         )
+     }
+ 
++    private const val VIEW_AREA_ANIMATION_MILLIS = 300
++
++    /**
++     * updateViewArea for the main screen, on the event channel: the iPhone acts on it with an animation duration
++     * and the adjacent areas (DiPlay on a BYD Tang with iOS 27; key names beside AirPlayReceiverSessionViewAreaUpdate
++     * in CarPlaySDK).
++     */
++    fun viewAreaCommand(index: Int, areaCount: Int): Map<String, Any?> = linkedMapOf(
++        "type" to "updateViewArea",
++        "params" to linkedMapOf(
++            "uuid" to MAIN_UUID,
++            "viewAreaIndex" to index,
++            "animationDurationMillis" to VIEW_AREA_ANIMATION_MILLIS,
++            "adjacentViewAreas" to (0 until areaCount).filter { it != index },
++        ),
++    )
++
+     private fun displayEntry(display: AirPlayDisplayConfig, type: Int, uuid: String): Map<String, Any?> {
+         val widthPhysical = AirPlayDisplaySettings.sanitizeReportedPhysicalMm(
+             display.widthPhysicalMm ?: AirPlayDisplaySettings.DEFAULT_WIDTH_PHYSICAL_MM,
+@@ -170,25 +187,40 @@
+             "primaryInputDevice" to display.primaryInputDevice,
+         )
+ 
+-        entry["viewAreas"] = listOf(areaDict(display))
+-        entry["initialViewArea"] = 0
++        // Several areas let the car move CarPlay between them (a browser window that changes shape) with
++        // updateViewArea, without reconnecting.
++        val areas = display.viewAreas?.takeIf { it.isNotEmpty() }
++        entry["viewAreas"] = areas?.map { areaDict(display, it) } ?: listOf(areaDict(display))
++        entry["initialViewArea"] = if (areas == null) 0 else display.initialViewArea.coerceIn(0, areas.lastIndex)
++        if (areas != null && areas.size > 1) entry["viewAreaTransitionControl"] = true
+         if (display.initialUrl != null) entry["initialURL"] = display.initialUrl
+         return entry
+     }
+ 
+-    private fun areaDict(display: AirPlayDisplayConfig): Map<String, Any?> {
++    private fun areaDict(display: AirPlayDisplayConfig, area: AirPlayViewArea? = null): Map<String, Any?> {
+         // The session SETUP response enables "viewAreas", so /info must always describe one.
+-        // A display without custom insets uses the full panel for both the view and safe areas.
+-        val view = display.viewArea ?: AirPlayInsets()
++        // A display without custom insets uses the full panel for both the view and safe areas; an explicit
++        // area replaces the display's view insets and clips its safe area.
+         val width = display.widthPixels
+         val height = display.heightPixels
++        val view = area?.let {
++            AirPlayInsets(top = it.originY, bottom = height - it.originY - it.height,
++                left = it.originX, right = width - it.originX - it.width)
++        } ?: display.viewArea ?: AirPlayInsets()
+         val result = linkedMapOf<String, Any?>(
+             "widthPixels" to (width - view.left - view.right),
+             "heightPixels" to (height - view.top - view.bottom),
+             "originXPixels" to view.left,
+             "originYPixels" to view.top,
+         )
+-        val safe = display.safeArea ?: AirPlayInsets()
++        val displaySafe = display.safeArea ?: AirPlayInsets()
++        val clipped = if (area == null) displaySafe else AirPlayInsets(
++            top = maxOf(displaySafe.top, view.top), bottom = maxOf(displaySafe.bottom, view.bottom),
++            left = maxOf(displaySafe.left, view.left), right = maxOf(displaySafe.right, view.right),
++        )
++        // A safe area wholly outside a smaller view area leaves nothing: use the area's own bounds.
++        val safe = if (area != null && (clipped.left + clipped.right >= width || clipped.top + clipped.bottom >= height)) view
++            else clipped
+         val safeArea = linkedMapOf<String, Any?>(
+             "widthPixels" to (width - safe.left - safe.right),
+             "heightPixels" to (height - safe.top - safe.bottom),
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt
+@@ -139,6 +139,10 @@
+             sendCommand(mapOf("type" to "forceKeyFrame", "params" to mapOf("uuid" to uuid)))
+     }
+ 
++    /** Moves CarPlay on the main screen to one of its declared view areas, without reconnecting. */
++    fun showViewArea(index: Int): Boolean =
++        sendCommand(AirPlayInfoPlist.viewAreaCommand(index, config.main.viewAreas?.size ?: 1))
++
+     fun sendCommand(command: Map<String, Any?>): Boolean = synchronized(eventWriteLock) {
+         sendCommandLocked(command)
+     }
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/CarPlayUiScale.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/CarPlayUiScale.kt
+@@ -33,7 +33,13 @@
+                 right = (it.right * width.toDouble() / display.widthPixels).roundToInt(),
+             )
+         }
++        fun area(value: AirPlayViewArea) = AirPlayViewArea(
++            width = minOf(width, pixels(value.width)), height = minOf(height, pixels(value.height)),
++            originX = (value.originX * width.toDouble() / display.widthPixels).roundToInt(),
++            originY = (value.originY * height.toDouble() / display.heightPixels).roundToInt(),
++        )
+         return display.copy(widthPixels = width, heightPixels = height,
+-            viewArea = insets(display.viewArea), safeArea = insets(display.safeArea))
++            viewArea = insets(display.viewArea), safeArea = insets(display.safeArea),
++            viewAreas = display.viewAreas?.map(::area))
+     }
+ }
+--- a/protocol/src/test/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlistTest.kt
++++ b/protocol/src/test/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlistTest.kt
+@@ -35,6 +35,52 @@
+     }
+ 
+     @Test
++    fun severalViewAreasAreDeclaredAndSwitchedWithoutReconnecting() {
++        // A browser whose window changes shape (a Tesla windowed 1280x996 and fullscreen 1920x1080): the stream
++        // covers both, each shape is an area at its top left, and the car switches with updateViewArea.
++        val info = AirPlayInfoPlist.build(
++            AirPlayConfig(
++                deviceName = "test",
++                deviceId = "02:00:00:00:00:02",
++                btMac = "02:00:00:00:00:02",
++                sourceVersion = "366.0",
++                main = AirPlayDisplayConfig(widthPixels = 1920, heightPixels = 1080,
++                    viewAreas = listOf(AirPlayViewArea(1920, 1080), AirPlayViewArea(1280, 996)), initialViewArea = 1),
++            ),
++        )
++        val display = (info["displays"] as List<*>).first() as Map<*, *>
++        val areas = display["viewAreas"] as List<*>
++        assertEquals(2, areas.size)
++        assertEquals(1, display["initialViewArea"])
++        assertEquals(true, display["viewAreaTransitionControl"])
++        val small = areas[1] as Map<*, *>
++        assertEquals(1280, small["widthPixels"]); assertEquals(996, small["heightPixels"])
++        assertEquals(0, small["originXPixels"]); assertEquals(0, small["originYPixels"])
++        val safe = small["safeArea"] as Map<*, *>
++        assertEquals(1280, safe["widthPixels"]); assertEquals(996, safe["heightPixels"])
++
++        val command = AirPlayInfoPlist.viewAreaCommand(0, 2)
++        assertEquals("updateViewArea", command["type"])
++        val params = command["params"] as Map<*, *>
++        assertEquals(AirPlayInfoPlist.MAIN_UUID, params["uuid"])
++        assertEquals(0, params["viewAreaIndex"])
++        assertEquals(listOf(1), params["adjacentViewAreas"])
++    }
++
++    @Test
++    fun oneViewAreaKeepsTheEarlierDeclaration() {
++        val info = AirPlayInfoPlist.build(
++            AirPlayConfig(
++                deviceName = "test", deviceId = "02:00:00:00:00:02", btMac = "02:00:00:00:00:02", sourceVersion = "366.0",
++                main = AirPlayDisplayConfig(widthPixels = 1280, heightPixels = 720),
++            ),
++        )
++        val display = (info["displays"] as List<*>).first() as Map<*, *>
++        assertEquals(1, (display["viewAreas"] as List<*>).size)
++        assertFalse(display.containsKey("viewAreaTransitionControl"))
++    }
++
++    @Test
+     fun callsAndSiriCanBeLeftToTheCar() {
+         fun types(callsAndSiri: Boolean) = (AirPlayInfoPlist.build(
+             AirPlayConfig(
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -5,6 +5,7 @@
+ import com.shilapi.xcertplay.airplay.AirPlayContact
+ import com.shilapi.xcertplay.airplay.AirPlayDeviceInfo
+ import com.shilapi.xcertplay.airplay.AirPlayDisplayConfig
++import com.shilapi.xcertplay.airplay.AirPlayViewArea
+ import com.shilapi.xcertplay.airplay.AirPlayKnobState
+ import com.shilapi.xcertplay.airplay.AirPlayMediaHandler
+ import com.shilapi.xcertplay.airplay.AirPlaySession
+@@ -56,6 +57,9 @@
+         config.displayFps,
+         config.uiScale,
+         config.hevc,
++        config.displayAreas.takeIf { DisplayState.validateAreas(config.displayWidth, config.displayHeight, it, config.displayArea) == null }
++            ?: emptyList(),
++        config.displayArea,
+     )
+     val hub = WebHub(config, display)
+     val bridge = WebBridge(hub)
+@@ -119,6 +123,9 @@
+                     widthPixels = display.width,
+                     heightPixels = display.height,
+                     fps = display.fps,
++                    viewAreas = display.areas.takeIf { it.size > 1 }?.map { AirPlayViewArea(it.width, it.height) },
++                    initialViewArea = display.area,
++                    widthPhysicalMm = display.physicalWidthMm(),
+                 ),
+                 display.uiScale,
+             ),
+@@ -618,9 +625,23 @@
+      * Applies a new display configuration and restarts CarPlay so the phone re-negotiates the
+      * display. Returns null on success or a human-readable error.
+      */
+-    fun applyDisplay(width: Int, height: Int, fps: Int, uiScale: Int, hevc: Boolean): String? {
++    fun applyDisplay(request: DisplayRequest): String? {
++        val (width, height, fps, uiScale, hevc) = request
+         DisplayState.validate(width, height, fps)?.let { return it }
+-        display.update(width, height, fps, uiScale, hevc)
++        val areas = request.areas.takeIf { it.size > 1 } ?: emptyList()
++        DisplayState.validateAreas(width, height, areas, request.area)?.let { return it }
++        // Only another of the declared areas (the page's window changed shape): move CarPlay there, no reconnect.
++        val session = activeSession
++        if (areas.isNotEmpty() && session != null && display.sameStream(width, height, fps, uiScale, hevc, areas)) {
++            if (request.area == display.area) return null
++            display.useArea(request.area)
++            configStore?.save(PersistentConfig.of(config, display))
++            val sent = session.showViewArea(request.area)
++            log.info("view area {} ({}x{}) of {}x{} sent={}", request.area, areas[request.area].width,
++                areas[request.area].height, width, height, sent)
++            return if (sent) null else "view area not sent"
++        }
++        display.update(width, height, fps, uiScale, hevc, areas, request.area)
+         configStore?.save(PersistentConfig.of(config, display))
+         log.info(
+             "display changed to {}x{} @{}fps uiScale={} codec={} ({}); restarting CarPlay",
+--- a/server/src/main/kotlin/com/playport/server/DisplayState.kt
++++ b/server/src/main/kotlin/com/playport/server/DisplayState.kt
+@@ -8,7 +8,12 @@
+  * Portrait orientation is simply `height > width`. [uiScale] maps to [CarPlayUiScale]: a larger
+  * canvas requests proportionally smaller CarPlay controls.
+  */
+-class DisplayState(width: Int, height: Int, fps: Int, uiScale: Int, hevc: Boolean = false) {
++/** One view area: a width x height rectangle at the stream's top left (a browser window's shape). */
++@kotlinx.serialization.Serializable
++data class ViewArea(val width: Int, val height: Int)
++
++class DisplayState(width: Int, height: Int, fps: Int, uiScale: Int, hevc: Boolean = false,
++                   areas: List<ViewArea> = emptyList(), area: Int = 0) {
+     @Volatile var width: Int = width
+         private set
+     @Volatile var height: Int = height
+@@ -19,13 +24,36 @@
+         private set
+     @Volatile var hevc: Boolean = hevc
+         private set
++    /** The view areas declared to the phone (none: the whole stream), and the one in use. */
++    @Volatile var areas: List<ViewArea> = areas
++        private set
++    @Volatile var area: Int = area.coerceIn(0, maxOf(0, areas.lastIndex))
++        private set
+ 
+-    fun update(width: Int, height: Int, fps: Int, uiScale: Int, hevc: Boolean) {
++    fun update(width: Int, height: Int, fps: Int, uiScale: Int, hevc: Boolean, areas: List<ViewArea> = emptyList(), area: Int = 0) {
+         this.width = width
+         this.height = height
+         this.fps = fps
+         this.uiScale = CarPlayUiScale.sanitize(uiScale)
+         this.hevc = hevc
++        this.areas = areas
++        this.area = area.coerceIn(0, maxOf(0, areas.lastIndex))
++    }
++
++    /** Whether [width]..[areas] are what the phone was told: then only the area in use may differ. */
++    fun sameStream(width: Int, height: Int, fps: Int, uiScale: Int, hevc: Boolean, areas: List<ViewArea>): Boolean =
++        width == this.width && height == this.height && fps == this.fps && CarPlayUiScale.sanitize(uiScale) == this.uiScale &&
++            hevc == this.hevc && areas == this.areas
++
++    fun useArea(index: Int) { area = index.coerceIn(0, maxOf(0, areas.lastIndex)) }
++
++    /**
++     * CarPlay sizes its icons by pixels per millimetre. With areas the stream is wider than the window shape it mostly
++     * shows, and at the plain 200 mm the windowed area looked crowded (Tesla, 2026-10-14): the narrowest area keeps the
++     * plain density, 200 mm per its width. null (the plain 200 mm) without areas.
++     */
++    fun physicalWidthMm(): Int? = areas.takeIf { it.size > 1 }?.minOf { it.width }?.let {
++        com.shilapi.xcertplay.airplay.AirPlayDisplaySettings.DEFAULT_WIDTH_PHYSICAL_MM * width / it
+     }
+ 
+     val orientation: String get() = if (height > width) "portrait" else "landscape"
+@@ -36,6 +64,16 @@
+         const val MIN_EDGE = 480
+         const val MAX_EDGE = 3840
+ 
++        const val MAX_AREAS = 4
++
++        fun validateAreas(width: Int, height: Int, areas: List<ViewArea>, area: Int): String? = when {
++            areas.size > MAX_AREAS -> "at most $MAX_AREAS view areas"
++            areas.any { it.width !in 2..width || it.height !in 2..height || it.width % 2 != 0 || it.height % 2 != 0 } ->
++                "each view area must be even and fit the stream"
++            areas.isNotEmpty() && area !in areas.indices -> "no such view area"
++            else -> null
++        }
++
+         fun validate(width: Int, height: Int, fps: Int): String? = when {
+             width !in MIN_EDGE..MAX_EDGE || height !in MIN_EDGE..MAX_EDGE ->
+                 "width and height must be between $MIN_EDGE and $MAX_EDGE"
+--- a/server/src/main/kotlin/com/playport/server/PersistentConfig.kt
++++ b/server/src/main/kotlin/com/playport/server/PersistentConfig.kt
+@@ -15,6 +15,8 @@
+     val fps: Int = 30,
+     val uiScale: Int = 100,
+     val hevc: Boolean = false,
++    val areas: List<ViewArea> = emptyList(),
++    val area: Int = 0,
+ )
+ 
+ /** Settings persisted between runs in `~/.playport/config.json`. */
+@@ -46,6 +48,8 @@
+         displayFps = display.fps,
+         uiScale = display.uiScale,
+         hevc = display.hevc,
++        displayAreas = display.areas,
++        displayArea = display.area,
+         wireless = wireless,
+         wifiSsid = wifiSsid,
+         wifiPassphrase = wifiPassphrase,
+@@ -75,6 +79,8 @@
+                 fps = display.fps,
+                 uiScale = display.uiScale,
+                 hevc = display.hevc,
++                areas = display.areas,
++                area = display.area,
+             ),
+             wireless = config.wireless,
+             wifiSsid = config.wifiSsid,
+--- a/server/src/main/kotlin/com/playport/server/ServerConfig.kt
++++ b/server/src/main/kotlin/com/playport/server/ServerConfig.kt
+@@ -17,6 +17,9 @@
+     val displayFps: Int = 60,
+     val uiScale: Int = com.shilapi.xcertplay.airplay.CarPlayUiScale.DEFAULT,
+     val hevc: Boolean = false,
++    /** View areas of the display (the page's window shapes) and the one CarPlay starts in. */
++    val displayAreas: List<ViewArea> = emptyList(),
++    val displayArea: Int = 0,
+     /** Calls and Siri on the car's own Bluetooth (Tesla mode, 2026-10-14): no microphone, no call or Siri audio. */
+     val carVoice: Boolean = false,
+     val rightHandDrive: Boolean = false,
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -4,6 +4,7 @@
+ import com.shilapi.xcertplay.airplay.VideoCodec
+ import io.ktor.server.application.Application
+ import io.ktor.server.application.install
++import io.ktor.server.plugins.origin
+ import io.ktor.server.request.receiveText
+ import io.ktor.server.request.uri
+ import io.ktor.server.response.respondText
+@@ -19,6 +20,7 @@
+ import io.ktor.server.websocket.webSocket
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.cancel
+ import kotlinx.coroutines.channels.Channel
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.launch
+@@ -64,6 +66,9 @@
+     val fps: Int = 30,
+     val uiScale: Int = 100,
+     val hevc: Boolean = false,
++    /** Shapes the page's window takes (each at the stream's top left), and the one in use now. */
++    val areas: List<ViewArea> = emptyList(),
++    val area: Int = 0,
+ )
+ 
+ @Serializable
+@@ -101,12 +106,24 @@
+     }
+     val keyframeRequested = AtomicLong(0)
+     val id = nextClientId.incrementAndGet()
++    /** When anything last came from the page (it answers a mark every 200 ms while it runs). */
++    val lastHeard = AtomicLong(System.nanoTime())
++    val since: Long = System.nanoTime()
++    /** The page instance (a random id the page picks when it loads), so a reconnect replaces its old link at once. */
++    @Volatile var page: String = ""
++    @Volatile var session: kotlinx.coroutines.CoroutineScope? = null
++    /** Silent for 3 s: the browser froze the page (a Tesla away from its browser). Its sound is held back and the
++     *  picture waits for a keyframe (LagGate) until it answers again; the link itself is kept (SILENT_VIEWER_MS). */
++    fun paused(now: Long = System.nanoTime()) = now - lastHeard.get() > PAUSE_NANOS
++    @Volatile var wasPaused = false
+     val videoSent = AtomicLong(0)
+     val videoDropped = AtomicLong(0)
+     val bytesSent = AtomicLong(0)
+ 
+     private companion object {
+         val nextClientId = AtomicLong(0)
++        // 3 s, not 1.5: a page just opened was once quiet for 1.6 s (2026-10-14), and a slow car's page may be.
++        const val PAUSE_NANOS = 3_000_000_000L
+     }
+ }
+ 
+@@ -130,7 +147,7 @@
+     val viewerCount: Int get() = clients.size
+ 
+     /** Applies a display change; returns null on success or an error message. */
+-    @Volatile var onApplyDisplay: ((Int, Int, Int, Int, Boolean) -> String?)? = null
++    @Volatile var onApplyDisplay: ((DisplayRequest) -> String?)? = null
+ 
+     /** Browser microphone payloads: (isOpus, payload). */
+     @Volatile var onMicrophoneData: ((Boolean, ByteArray) -> Unit)? = null
+@@ -242,7 +259,11 @@
+     }
+ 
+     fun broadcastAudioPacket(type: Int, timestampUs: Long, payload: ByteArray) {
+-        broadcastBinary(Wire.audioPacket(type, timestampUs, payload))
++        val bytes = Wire.audioPacket(type, timestampUs, payload)
++        val now = System.nanoTime()
++        for (client in clients) {
++            if (!client.paused(now)) client.offer(Frame.Binary(true, bytes))   // a frozen page gets no stale sound
++        }
+     }
+ 
+     fun broadcastAudioStopped(type: Int) {
+@@ -309,7 +330,7 @@
+                     )
+                     return@post
+                 }
+-                val error = applier(request.width, request.height, request.fps, request.uiScale, request.hevc)
++                val error = applier(request)
+                 if (error != null) {
+                     call.respondText(
+                         "{\"error\":\"$error\"}",
+@@ -327,7 +348,18 @@
+                     return@webSocket
+                 }
+                 val client = WsClient(Channel(capacity = SEND_QUEUE_CAPACITY))
++                client.page = call.request.queryParameters["page"]?.take(32)?.filter { it.isLetterOrDigit() } ?: ""
++                client.session = this
++                // The same page connecting again (it came back from a freeze): its old link goes at once, not after
++                // SILENT_VIEWER_MS, so the two never share the stream.
++                if (client.page.isNotEmpty()) clients.filter { it.page == client.page }.forEach { old ->
++                    log.info("viewer client={} replaced by client={}", old.id, client.id)
++                    old.session?.cancel()
++                }
+                 clients.add(client)
++                val from = "${call.request.origin.remoteHost}:${call.request.origin.remotePort}"
++                log.info("viewer connected client={} from={} page={} viewers={}", client.id, from, client.page, clients.size)
++                var ending = "page closed"
+                 val wsSession = this
+                 val writer = launch {
+                     try {
+@@ -341,6 +373,20 @@
+                 val marker = launch {
+                     while (true) {
+                         delay(MARK_INTERVAL_MS)
++                        // A page that stopped answering marks was frozen (a Tesla's reverse gear, 2026-10-14) or lost:
++                        // close it, so it holds nothing and the log says when.
++                        val silentMs = (System.nanoTime() - client.lastHeard.get()) / 1_000_000
++                        if (client.paused() && !client.wasPaused) {
++                            client.wasPaused = true
++                            log.info("viewer paused client={} (silent {} ms)", client.id, silentMs)
++                        }
++                        if (silentMs > SILENT_VIEWER_MS) {
++                            ending = "silent ${silentMs} ms"
++                            // Cancel, not close(): a close frame waits behind a frozen page's full socket and never
++                            // finished (Tesla, 2026-10-14: the frozen viewer stayed listed next to its successor).
++                            wsSession.cancel()
++                            break
++                        }
+                         val id = client.nextMark.incrementAndGet()
+                         val frame = Frame.Text("""{"type":"mark","mark":$id}""")
+                         // Counted with the mark itself, so its answer confirms everything up to here.
+@@ -379,6 +425,14 @@
+                     }
+                     configByStream.keys.forEach { streamType -> onViewerJoined?.invoke(streamType) }
+                     for (frame in incoming) {
++                        val heardAt = System.nanoTime()
++                        if (client.wasPaused) {
++                            // Back from a freeze on the same link: a fresh keyframe at once.
++                            client.wasPaused = false
++                            log.info("viewer resumed client={} after {} ms", client.id, (heardAt - client.lastHeard.get()) / 1_000_000)
++                            configByStream.keys.forEach { streamType -> onViewerJoined?.invoke(streamType) }
++                        }
++                        client.lastHeard.set(heardAt)
+                         if (frame is Frame.Binary) {
+                             val data = frame.data
+                             if (data.size >= 2) {
+@@ -410,11 +464,16 @@
+                             inputHandler?.invoke(message)
+                         }
+                     }
++                } catch (error: Exception) {
++                    if (ending == "page closed") ending = "${error.javaClass.simpleName}: ${error.message}"
++                    throw error
+                 } finally {
+                     clients.remove(client)
+                     client.channel.close()
+                     writer.cancel()
+                     marker.cancel()
++                    log.info("viewer closed client={} after {} s ({}) viewers={}", client.id,
++                        (System.nanoTime() - client.since) / 1_000_000_000, ending, clients.size)
+                 }
+             }
+             get("/{path...}") {
+@@ -461,6 +520,13 @@
+         put("fps", kotlinx.serialization.json.JsonPrimitive(display.fps))
+         put("uiScale", kotlinx.serialization.json.JsonPrimitive(display.uiScale))
+         put("hevc", kotlinx.serialization.json.JsonPrimitive(display.hevc))
++        put("areas", kotlinx.serialization.json.buildJsonArray {
++            display.areas.forEach { area -> add(kotlinx.serialization.json.buildJsonObject {
++                put("width", kotlinx.serialization.json.JsonPrimitive(area.width))
++                put("height", kotlinx.serialization.json.JsonPrimitive(area.height))
++            }) }
++        })
++        put("area", kotlinx.serialization.json.JsonPrimitive(display.area))
+         put("orientation", kotlinx.serialization.json.JsonPrimitive(display.orientation))
+         put(
+             "presets",
+@@ -541,5 +607,8 @@
+         const val ACCESS_FILE = "receiver-access.json"
+         private const val KEYFRAME_REQUEST_INTERVAL_NS = 1_000_000_000L
+         private const val MARK_INTERVAL_MS = 200L
++        /** No answer to marks for this long: the page is gone. A shorter silence only pauses it (WsClient.paused):
++         *  a Tesla page back within 10 minutes goes on over the same link. */
++        private const val SILENT_VIEWER_MS = 600_000L
+     }
+ }
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/ViewAreaTest.kt
+@@ -0,0 +1,58 @@
++package com.playport.server
++
++import kotlinx.serialization.json.Json
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** View areas (2026-10-14): the page's window shapes, switched without reconnecting CarPlay. */
++class ViewAreaTest {
++    private val windowed = ViewArea(1280, 996)
++    private val full = ViewArea(1920, 1080)
++
++    @Test
++    fun areasMustFitTheStream() {
++        assertNull(DisplayState.validateAreas(1920, 1080, listOf(full, windowed), 1))
++        assertNotNull(DisplayState.validateAreas(1280, 996, listOf(full, windowed), 0))
++        assertNotNull(DisplayState.validateAreas(1920, 1080, listOf(full, ViewArea(1281, 996)), 0))
++        assertNotNull(DisplayState.validateAreas(1920, 1080, listOf(full, windowed), 2))
++        assertNotNull(DisplayState.validateAreas(1920, 1080, List(5) { windowed }, 0))
++    }
++
++    @Test
++    fun onlyTheAreaInUseMayChangeWithoutReconnecting() {
++        val display = DisplayState(1920, 1080, 30, 100, true, listOf(windowed, full), 0)
++        assertTrue(display.sameStream(1920, 1080, 30, 100, true, listOf(windowed, full)))
++        assertFalse(display.sameStream(1920, 1080, 30, 100, false, listOf(windowed, full)))
++        assertFalse(display.sameStream(1920, 1080, 30, 100, true, listOf(windowed)))
++        display.useArea(1)
++        assertEquals(1, display.area)
++        display.useArea(7)
++        assertEquals(1, display.area)
++    }
++
++    @Test
++    fun theNarrowestAreaKeepsThePlainDensity() {
++        assertEquals(300, DisplayState(1920, 1080, 30, 100, true, listOf(windowed, full), 0).physicalWidthMm())
++        assertNull(DisplayState(1280, 996, 30, 100).physicalWidthMm())
++    }
++
++    @Test
++    fun theRequestAndTheSavedSettingsCarryTheAreas() {
++        val request = Json.decodeFromString(DisplayRequest.serializer(),
++            """{"width":1920,"height":1080,"fps":30,"uiScale":100,"hevc":true,"areas":[{"width":1280,"height":996},{"width":1920,"height":1080}],"area":1}""")
++        assertEquals(listOf(windowed, full), request.areas)
++        assertEquals(1, request.area)
++        val old = Json.decodeFromString(DisplayRequest.serializer(), """{"width":1280,"height":720}""")
++        assertTrue("an older page sends no areas", old.areas.isEmpty())
++
++        val prefs = DisplayPrefs(1920, 1080, 30, 100, true, listOf(windowed, full), 1)
++        val json = Json { encodeDefaults = true }
++        assertEquals(prefs, json.decodeFromString(DisplayPrefs.serializer(), json.encodeToString(DisplayPrefs.serializer(), prefs)))
++        assertTrue("an older config.json has no areas",
++            json.decodeFromString(DisplayPrefs.serializer(), """{"width":1280,"height":720}""").areas.isEmpty())
++    }
++}
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -6,20 +6,20 @@
+   const {outputText}=ts.transpileModule(source,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ESNext}});
+   return import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
+ }
+-const {suggestedResolution,aspectChanged,shownSize,closeShape,renegotiate}=await load('display-fit');
++const {suggestedResolution,aspectChanged,shownSize,areaPlan,areaSize}=await load('display-fit');
+ { // XPeng fullscreen is 876x579 or 876x641 CSS px (dock shown or not): 1280x846 or 1280x936 (F50 drive 2026-10-13).
++  // With view areas the page (1280x756) and both fullscreen heights are areas: learned once, then switched.
+   const s846=suggestedResolution(876,579),s936=suggestedResolution(876,641),page=suggestedResolution(876,518);
+   assert.deepEqual([s846,s936],[{width:1280,height:846},{width:1280,height:936}]);
+-  assert.equal(renegotiate({width:1280,height:756},s846,true,''),true,'Fullscreen gets its own size once');
+-  assert.equal(renegotiate({width:1280,height:846},s936,true,'1280x846'),false,'then the other fullscreen height only stretches');
+-  assert.equal(renegotiate({width:1280,height:936},s846,true,'1280x936'),false,'either way round');
+-  assert.equal(renegotiate({width:1280,height:846},page,false,'1280x846'),false,'leaving fullscreen keeps it too');
+-  assert.equal(renegotiate({width:1280,height:602},s846,true,'1280x846'),true,'a size far off (a test window) is renegotiated');
+-  assert.equal(renegotiate({width:1280,height:846},{width:1372,height:686},false,'1280x846'),true,'split screen at once');
+-  assert.equal(renegotiate({width:1280,height:846},s846,true,''),false,'the same shape never'); }
+-assert.equal(closeShape({width:1280,height:846},{width:1280,height:756}),true,'page vs fullscreen: no renegotiation outside fullscreen');
+-assert.equal(closeShape({width:1280,height:846},{width:1082,height:1280}),false,'portrait renegotiates at once');
+-assert.equal(closeShape({width:1280,height:846},{width:1372,height:686}),false,'split screen renegotiates at once');
++  const start={width:1280,height:756,hevc:false,fps:30};
++  let plan=areaPlan(start,s846,false,[page]); let display=plan.display, shapes=plan.shapes;
++  plan=areaPlan(display,s936,false,shapes); display=plan.display; shapes=plan.shapes;
++  assert.deepEqual([display.width,display.height,display.areas.length],[1280,936,3],'three shapes, the stream as tall as the tallest');
++  for (const [shape,index] of [[page,0],[s846,1],[s936,2],[page,0]]) {
++    const next=areaPlan(display,shape,false,shapes);
++    assert.deepEqual(next.display,{...display,area:index},'every later change only switches area');
++    display=next.display; }
++  assert.equal(areaPlan(display,page,false,shapes),null,'the same shape never'); }
+ assert.deepEqual(shownSize(1280,846,1280,756),{width:1280,height:756},'fullscreen picture fills the normal page without bars');
+ assert.deepEqual(shownSize(1280,756,1280,846),{width:1280,height:846},'and the other way round');
+ assert.deepEqual(shownSize(1280,846,1082,1280),{width:1082,height:1280},'no black bars even before a portrait renegotiation');
+@@ -181,3 +181,24 @@
+ assert.equal(isNight('system',at(12,0),true),true);assert.equal(isNight('system',at(23,0),false),false);
+ assert.equal(isNight('day',at(23,0),true),false);assert.equal(isNight('night',at(12,0),false),true);
+ console.log('Car checks passed: aspect fit, media keys, disconnect state, single music route, MP4 framing, night schedule.');
++{ // View areas (2026-10-14): a window shape seen before is an area switch, never a reconnect.
++  const windowed={width:1280,height:996}, full={width:1920,height:1080};
++  const start={width:1280,height:996,hevc:true,fps:30};
++  const first=areaPlan(start,windowed,true,[]);
++  assert.equal(first,null,'the shape in use: nothing to do');
++  const learn=areaPlan(start,full,true,[windowed]);
++  assert.deepEqual([learn.display.width,learn.display.height],[1920,1080],'the stream covers both shapes');
++  assert.deepEqual(learn.display.areas,[windowed,full],'both shapes declared as areas');
++  assert.equal(learn.display.area,1,'and the fullscreen one in use');
++  const back=areaPlan(learn.display,windowed,true,learn.shapes);
++  assert.deepEqual(back.display,{...learn.display,area:0},'back to the window: only the area changes');
++  assert.equal(areaPlan(back.display,{width:1282,height:998},true,back.shapes),null,'a shape within 2.5% is the same area');
++  const sharper=areaPlan(back.display,{width:1280,height:996},false,back.shapes);
++  assert.equal(sharper.display.hevc,false,'another codec declares again');
++  const s=areaSize(1920,1080,windowed,773,601);
++  assert.ok(Math.abs(s.width-773*1920/1280)<1e-6 && Math.abs(s.height-601*1080/996)<1e-6,'the area fills the view');
++  assert.deepEqual(areaSize(1280,996,undefined,773,601),{width:773,height:601},'without areas as before');
++  const four=areaPlan(start,{width:800,height:1280},true,[{width:1280,height:720},{width:1280,height:996},{width:1920,height:1080},{width:1280,height:640}]);
++  assert.equal(four.display.areas.length,4,'at most four areas');
++}
++console.log('View areas: shapes learned once, switched without reconnecting.');
+--- a/web/src/audio.ts
++++ b/web/src/audio.ts
+@@ -36,9 +36,6 @@
+    *  hard to hear at 1 (2026-10-14). 1 leaves them as sent. */
+   private readonly promptBoost: number;
+   private promptLimiter: DynamicsCompressorNode | null = null;
+-  /** Tesla mode: music is the car's, over Bluetooth; music the iPhone still sends here is not played, so that the
+-   *  two never sound together. */
+-  private readonly musicOff: boolean;
+   /** Tesla mode: the car takes a browser that has an audio output open, even a silent one, for a music source and
+    *  switched its media card between it and the iPhone's Bluetooth over and over (2026-10-14). The output is closed
+    *  (context suspended) a few seconds after the last stream ends and opened again for the next prompt or call. */
+@@ -46,12 +43,11 @@
+   private idleTimer = 0;
+   private sleeping = false;
+ 
+-  constructor(private readonly onError: (message: string) => void, options: { promptBoost?: number; musicOff?: boolean; idleClose?: boolean } = {}) {
++  constructor(private readonly onError: (message: string) => void, options: { promptBoost?: number; idleClose?: boolean } = {}) {
+     this.context = new AudioContext({ latencyHint: 'interactive' });
+     this.gain = this.context.createGain();
+     this.gain.connect(this.context.destination);
+     this.promptBoost = Math.min(8, Math.max(1, options.promptBoost ?? 1));
+-    this.musicOff = options.musicOff ?? false;
+     this.idleClose = options.idleClose ?? false;
+   }
+ 
+@@ -118,7 +114,6 @@
+   handleConfig(message: AudioConfigMessage): void {
+     this.closeStream(message.streamType);
+     this.wake();
+-    if (this.musicOff && message.name === 'media') return;   // its packets find no stream and are dropped
+     const streamGain = this.context.createGain();
+     streamGain.gain.value = this.streamGainValue(message.name);
+     streamGain.connect(this.streamOutput(message.name));
+--- a/web/src/display-fit.ts
++++ b/web/src/display-fit.ts
+@@ -11,20 +11,6 @@
+ export function aspectChanged(a: {width: number; height: number}, b: {width: number; height: number}) {
+   return Math.abs((a.width / a.height) / (b.width / b.height) - 1) > 0.025;
+ }
+-/** Shapes within 20% of each other (the car's page 1280x756 vs fullscreen 1280x846) are not renegotiated
+- *  outside fullscreen; clearly different ones (portrait, split screen) are, at once. */
+-export function closeShape(a: {width: number; height: number}, b: {width: number; height: number}) {
+-  return a.width > 0 && a.height > 0 && b.width > 0 && b.height > 0 &&
+-    Math.abs((a.width / a.height) / (b.width / b.height) - 1) <= 0.2;
+-}
+-/** Whether to renegotiate CarPlay to `target`. A close shape is renegotiated in fullscreen only once: when the
+- *  current size was not itself set for fullscreen on this browser (`fullscreenSize`). The car's fullscreen is not
+- *  always the same height (XPeng, 2026-10-13: 876x579 or 876x641 CSS px, its dock shown or not), and switching
+- *  between 1280x846 and 1280x936 reconnected CarPlay, a crackle and seconds without a picture, on most entries. */
+-export function renegotiate(display: {width: number; height: number}, target: {width: number; height: number}, fullscreen: boolean, fullscreenSize: string) {
+-  if (!aspectChanged(display, target)) return false;
+-  return !(closeShape(display, target) && (!fullscreen || fullscreenSize === `${display.width}x${display.height}`));
+-}
+ /** The picture always fills the view, stretched per axis: no black bars (user 2026-10-12). A close shape
+  *  stays stretched; a clearly different one is shown stretched only until CarPlay is renegotiated.
+  *  Touch input is normalized per axis, so it stays exact. */
+@@ -32,3 +18,36 @@
+   if (width <= 0 || height <= 0) return { width: 0, height: 0 };
+   return { width: viewWidth, height: viewHeight };
+ }
++
++export interface Area { width: number; height: number }
++export interface AreaDisplay { width: number; height: number; hevc: boolean; areas?: Area[]; area?: number }
++/** Window shapes kept per browser as CarPlay view areas (protocol: at most 4). */
++export const MAX_AREAS = 4;
++/** View areas (2026-10-14): each window shape this browser has shown (normal, fullscreen, the car's dock shown or not)
++ *  becomes an area at the stream's top left, the stream as large as all of them. A shape seen before is reached by
++ *  switching area, without reconnecting CarPlay; a new shape, or one that wants a clearly sharper size, declares the
++ *  areas again (one reconnect). Returns what to send and the shapes to keep, or null when nothing changes. */
++export function areaPlan<T extends AreaDisplay>(display: T, target: Area, hevc: boolean, known: Area[]): { display: T; shapes: Area[] } | null {
++  const shapes = known.filter(s => s.width > 0 && s.height > 0).slice(-MAX_AREAS).map(s => ({ width: s.width, height: s.height }));
++  let at = shapes.findIndex(s => !aspectChanged(s, target));
++  if (at < 0) {
++    shapes.push({ ...target });
++    if (shapes.length > MAX_AREAS) shapes.shift();
++    at = shapes.length - 1;
++  } else if (target.width * target.height > shapes[at].width * shapes[at].height * 1.2) {
++    shapes[at] = { ...target };   // sharper (a fast decoder's real pixels): worth one reconnect
++  }
++  const width = Math.max(...shapes.map(s => s.width)), height = Math.max(...shapes.map(s => s.height));
++  const areas = shapes.length > 1 ? shapes : [];
++  const declared = display.areas ?? [];
++  const same = display.width === width && display.height === height && display.hevc === hevc &&
++    declared.length === areas.length && declared.every((a, i) => a.width === areas[i].width && a.height === areas[i].height);
++  if (same) return areas.length && (display.area ?? 0) !== at ? { display: { ...display, area: at }, shapes } : null;
++  return { display: { ...display, width, height, hevc, areas, area: areas.length ? at : 0 }, shapes };
++}
++/** The picture element's size so that the area in use fills the view (the rest of the stream lies outside it, to the
++ *  right and below; touches, normalized over the element, stay in stream coordinates). Without areas: shownSize. */
++export function areaSize(streamWidth: number, streamHeight: number, area: Area | undefined, viewWidth: number, viewHeight: number) {
++  if (!area || area.width <= 0 || area.height <= 0 || streamWidth <= 0 || streamHeight <= 0) return shownSize(streamWidth, streamHeight, viewWidth, viewHeight);
++  return { width: viewWidth * streamWidth / area.width, height: viewHeight * streamHeight / area.height };
++}
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -5,7 +5,7 @@
+ import { Connection } from './ws';
+ import { SystemMedia } from './media-session';
+ import { LagProbe } from './lag';
+-import { shownSize, suggestedResolution, renegotiate } from './display-fit';
++import { suggestedResolution, areaPlan, areaSize, type Area } from './display-fit';
+ import { t, language, setLanguage, type Key } from './i18n';
+ import { isNight, parseNightMode } from './night';
+ import type { ServerMessage, ClientMessage } from './protocol';
+@@ -31,7 +31,7 @@
+ let state: Key = token ? 'connecting' : 'access';
+ let hint: Key = token ? 'waitingHint' : 'accessHint';
+ let lastAutoTarget = '', autoTimer = 0, displayBusy = false;
+-interface Display { width: number; height: number; fps: number; uiScale: number; hevc: boolean; }
++interface Display { width: number; height: number; fps: number; uiScale: number; hevc: boolean; areas?: Area[]; area?: number; }
+ let display: Display | null = null;
+ const autoFit = el<HTMLInputElement>('auto-fit');
+ autoFit.checked = localStorage.getItem('f50-auto-fit') !== 'false';
+@@ -57,8 +57,8 @@
+   volume.setAttribute('aria-label', t('volume'));
+   el('connection-text').textContent = t(state);
+   el('connection-hint').textContent = t(hint);
+-  el('overlay').hidden = painted;
+-  el('app').dataset.live = String(painted);
++  el('overlay').hidden = painted || holding;
++  el('app').dataset.live = String(painted || holding);
+   el('capabilities').textContent = !isSecureContext ? t('insecure') : typeof VideoDecoder === 'undefined' || typeof AudioDecoder === 'undefined' ? t('unsupported') : t('compatible');
+   el('media-support').textContent = t(media.supported ? 'mediaYes' : 'mediaNo');
+   el<HTMLInputElement>('width').disabled = autoFit.checked;
+@@ -69,8 +69,12 @@
+   el('night-status').title = t(darkQuery.matches ? 'browserDark' : 'browserLight');
+ }
+ function fit() {
+-  const size = shownSize(canvas.width, canvas.height, screen.clientWidth, screen.clientHeight);
++  // With view areas the stream is larger than the area in use: the area fills the view from the top left and the
++  // rest of the picture lies outside it (areaSize, display-fit.ts).
++  const areas = display?.areas ?? [], area = areas.length > 1 ? areas[display?.area ?? 0] : undefined;
++  const size = areaSize(canvas.width, canvas.height, area, screen.clientWidth, screen.clientHeight);
+   surface.style.width = `${size.width}px`; surface.style.height = `${size.height}px`;
++  screen.classList.toggle('area', !!area);
+ }
+ function error(message: string) {
+   // This browser said it decodes H.265 but cannot: auto goes back to H.264 for good (on this browser).
+@@ -103,7 +107,9 @@
+ function send(message: ClientMessage) { if (active) connection.send(message); }
+ const video = new VideoPlayer(canvas, error, () => {
+   if (!active) return;
+-  frames++; reportFrames++; painted = true; el('overlay').hidden = true; el('app').dataset.live = 'true';
++  frames++; reportFrames++; painted = true; shownOnce = true; el('overlay').hidden = true; el('app').dataset.live = 'true';
++  if (holding) { holding = false; el('toast').hidden = true; }
++  if (wokeAt) { lifeEvent(14, { pictureMs: Math.round(performance.now() - wokeAt) }); wokeAt = 0; }
+   const now = performance.now();
+   if (input.lastDownAt > handledDownAt) {
+     handledDownAt = input.lastDownAt;
+@@ -150,10 +156,11 @@
+       case 'audio-stopped': audio.stopStream(message.streamType); voiceStopped(message.streamType); break;
+     }
+   },
+-  onServer: server,
+-  onBytes(count) { reportBytes += count; },
++  onServer(message) { lastHeard = performance.now(); server(message); },
++  onBytes(count) { reportBytes += count; lastHeard = performance.now(); },
+   onState(value) {
+-    if (value === 'closed') { reset(); state = 'reconnecting'; }
++    if (value === 'open' && closedAt) { lifeEvent(11, { downMs: Math.round(performance.now() - closedAt), failures: connection.failures }); closedAt = 0; }
++    if (value === 'closed') { if (!closedAt) closedAt = performance.now(); if (!wokeAt) wokeAt = closedAt; reset(shownOnce); state = 'reconnecting'; }
+     else if (value === 'connecting') state = 'connecting';
+     else { state = 'waiting'; void loadDisplay(); void unlock(); }
+     render();
+@@ -167,12 +174,21 @@
+   if (night === sentNight) return;
+   sentNight = night; send({ type:'night', night });
+ }
+-function reset() {
++/** hold: the link dropped after a picture was shown (the car froze the browser, 2026-10-14). The last picture stays
++ *  up with a small notice while the link comes back, instead of the full "connecting" screen. Only time the page is
++ *  awake counts towards HOLD_MS (the one-second tick adds it): a wall-clock timer ran on while a Tesla had the page
++ *  frozen and cleared the picture the moment it came back, just before the new one arrived. */
++const HOLD_MS = 8000;
++let holding = false, holdAwakeMs = 0, shownOnce = false;
++function reset(hold = false) {
+   sentNight = null; lag.reset();
+   active = painted = false; input.reset(); canvas.inert = true;
+   video.close(); audio.stopAll(); media.setActive(false); void microphone.stop();
+-  canvas.getContext('2d')?.clearRect(0,0,canvas.width,canvas.height);
++  holding = hold; holdAwakeMs = 0;
++  if (hold) toast(t('reconnecting'));
++  else clearPicture();
+ }
++function clearPicture() { canvas.getContext('2d')?.clearRect(0,0,canvas.width,canvas.height); }
+ function server(message: ServerMessage) {
+   if (message.type === 'pong') { lag.pong(performance.now()); return; }
+   // Straight back, also before CarPlay starts: the box pauses the picture while this page lags behind.
+@@ -328,22 +344,24 @@
+   // Not for a hidden page (a covered page reports a small window) nor while fullscreen waits for its tap; a timer
+   // set just before the car covered the page fired anyway and renegotiated to 800x400 (Chrome, 2026-10-12).
+   if (!display || !autoFit.checked || displayBusy || document.hidden || (wantFullscreen && !document.fullscreenElement)) return;
+-  const target=autoTarget(),fullscreen=!!document.fullscreenElement,hevc=wantHevc();
+-  // Sharper than now (a fast decoder's real pixels, or the codec changed): once; else the shape rules below.
+-  const sharper=target.width*target.height>display.width*display.height*1.2||hevc!==display.hevc;
+-  if (!sharper && !renegotiate(display,target,fullscreen,storedFullscreenSize())) return;
+-  const key=`${target.width}x${target.height}${hevc?'-h265':''}`;
++  const plan=areaPlan(display,autoTarget(),wantHevc(),storedShapes());
++  if (!plan) return;
++  const next=plan.display,key=`${next.width}x${next.height}${next.hevc?'-h265':''}/${(next.areas??[]).map(a=>`${a.width}x${a.height}`).join(',')}/${next.area??0}`;
+   if (key===lastAutoTarget) return;
+   // Avoid a reconnect loop even when another viewer has a different screen shape.
+   lastAutoTarget=key;
+-  if (!(await saveDisplay({...display,...target,hevc}))) { error(t('autoFail')); return; }
+-  if (fullscreen) try { localStorage.setItem('f50-fullscreen-shape',key); } catch { /* Then fullscreen may renegotiate once more. */ }
++  if (!(await saveDisplay(next))) { error(t('autoFail')); return; }
++  saveFlag('f50-view-areas', JSON.stringify(plan.shapes));
++  fit();
++}
++/** The window shapes this browser has shown, kept as CarPlay view areas (areaPlan, display-fit.ts): switching
++ *  between them (fullscreen in and out, the car's dock, a Tesla's own fullscreen) moves CarPlay to another area
++ *  without reconnecting; only a shape seen the first time reconnects, once (2026-10-14, replacing the earlier
++ *  "renegotiate a close shape in fullscreen only, once per browser"). */
++function storedShapes(): Area[] {
++  try { const value = JSON.parse(readFlag('f50-view-areas') || '[]'); return Array.isArray(value) ? value.filter(a => Number.isInteger(a?.width) && Number.isInteger(a?.height)) : []; }
++  catch { return []; }
+ }
+-function storedFullscreenSize() { try { return localStorage.getItem('f50-fullscreen-shape') ?? ''; } catch { return ''; } }
+-/** A close shape is renegotiated only in fullscreen, and there only once (renegotiate, display-fit.ts): opening
+- *  the page or leaving fullscreen shows the current picture stretched (shownSize, never black bars) instead of a
+- *  black reconnect right after opening. A clearly different shape (portrait, split screen) is renegotiated at
+- *  once, as before (user 2026-10-12, replacing 2026-10-11's reconnect on every window change). */
+ function autoTarget() {
+   const pixels=fastDecoder()?Math.min(2,Math.max(1,window.devicePixelRatio||1)):1;
+   return suggestedResolution(screen.clientWidth*pixels,screen.clientHeight*pixels);
+@@ -368,10 +386,10 @@
+ });
+ /** Straight into the viewer log, not only every 10 s: ev 1 hidden, 2 shown, 3 fullscreen, 4 out of fullscreen, 5 resized. */
+ function pageEvent(ev: number) {
+-  send({type:'stats',stats:{ev,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,width:screen.clientWidth,height:screen.clientHeight,want:wantFullscreen?1:0,...viewport()}});
++  connection.send({type:'stats',stats:{ev,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,width:screen.clientWidth,height:screen.clientHeight,want:wantFullscreen?1:0,...viewport()}});
+ }
+ /** Which page build runs (raised with each build tried in the car). */
+-const BUILD = 202610141550;
++const BUILD = 202610142250;
+ /** What the browser says of the space it gives the page, to find the car's bar over a fullscreen page (2026-10-13):
+  *  window, visual viewport (and its offset), screen, available screen, outer window, pixel ratio. */
+ function viewport(): Record<string, number> {
+@@ -380,20 +398,6 @@
+     vt:Math.round(v?.offsetTop ?? -1), sw:d.width, sh:d.height, sah:d.availHeight, oh:window.outerHeight,
+     dpr:Math.round(window.devicePixelRatio*100) };
+ }
+-/** Every key, wheel and focus move the page receives, by name ("inK<code>", "inWheelUp", "inFocus"), sent within a
+- *  second as ev 6: what a car's steering-wheel buttons and scroll wheels reach the browser as (Tesla, 2026-10-14). */
+-const inputSeen: Record<string, number> = {};
+-let inputTimer = 0;
+-function seenInput(name: string) {
+-  const key = ('in' + name.replace(/[^A-Za-z]/g, '')).slice(0, 24);
+-  inputSeen[key] = (inputSeen[key] ?? 0) + 1;
+-  window.clearTimeout(inputTimer);
+-  inputTimer = window.setTimeout(() => send({type:'stats',stats:{ev:6,...inputSeen}}), 1000);
+-}
+-window.addEventListener('keydown', e => seenInput('K' + (e.code || e.key || 'Unknown')), { capture: true });
+-window.addEventListener('wheel', e => seenInput(Math.abs(e.deltaY) >= Math.abs(e.deltaX)
+-  ? (e.deltaY < 0 ? 'WheelUp' : 'WheelDown') : (e.deltaX < 0 ? 'WheelLeft' : 'WheelRight')), { capture: true, passive: true });
+-document.addEventListener('focusin', () => seenInput('Focus'), true);
+ // ev 5: the window changed size (debounced), with what the browser says of it.
+ let resizeTimer = 0;
+ window.addEventListener('resize', () => { window.clearTimeout(resizeTimer); resizeTimer = window.setTimeout(() => pageEvent(5), 400); });
+@@ -412,12 +416,69 @@
+ }
+ // Once a second while CarPlay runs: the pong comes back behind every frame still queued for this page.
+ window.setInterval(()=>{ if (active) { lag.sent(performance.now()); connection.send({type:'ping'}); } },1000);
++/** Coming back after the car froze the browser (a Tesla away from it: reverse gear, another app; 2026-10-14). The
++ *  iPhone's CarPlay never stopped; only this page's link to the box may have. On a sign of coming back (a one-second
++ *  tick over 2.5 s late, the page shown again, "resume", the network back) the page asks on its link first: the box
++ *  keeps a silent page's link for 10 minutes with its sound held back, and an answer within PROBE_MS means a
++ *  keyframe and the picture go on over it (21 ms to the first picture in the car). Without an answer a new link
++ *  replaces it (the box drops the old one by this page's id). A reload, which loses the sound's unlock, only as the
++ *  last resort: no link for RELOAD_AFTER_MS while the box answers. The last picture stays up meanwhile (reset, hold).
++ *  A Tesla also leaves its Wi-Fi out of Park unless "Remain connected in Drive" is on: then the link comes back on
++ *  "online". Viewer log: ev 8 frozen (gapMs), 11 link open again (downMs), 12 reloading, 13 back (how: 1 same link,
++ *  2 new link, 3 network back), 14 first picture (pictureMs since waking). */
++const PROBE_MS = 600, RELOAD_AFTER_MS = 15000;
++let lastTick = performance.now(), lastHeard = performance.now(), revived = 0, hiddenMeanwhile = document.hidden;
++let reloading = false, closedAt = 0, lifecycle: Record<string, number> = {}, probing = 0, wokeAt = 0;
++/** Straight into the viewer log whenever the link is open (also before CarPlay runs), else with the next open. */
++function lifeEvent(ev: number, data: Record<string, number> = {}) {
++  lifecycle = { ...lifecycle, ev, ...data };
++  if (connection.send({ type:'stats', stats: lifecycle })) lifecycle = {};
++}
++function revive() { revived++; lastHeard = performance.now(); connection.restart(); }
++function wake(why: number) {
++  if (!token || probing || reloading) return;
++  const asked = performance.now();
++  if (asked - lastHeard < 1500) return;   // the box was heard just now: nothing was frozen
++  wokeAt = asked;
++  if (!connection.isOpen) { revive(); lifeEvent(13, { how: 2, why }); return; }   // no link to ask on
++  probing = window.setTimeout(() => {
++    probing = 0;
++    if (lastHeard > asked) { lifeEvent(13, { how: 1, why, ms: Math.round(lastHeard - asked) }); send({ type:'keyframe' }); return; }
++    revive();
++    lifeEvent(13, { how: 2, why });
++  }, PROBE_MS);
++  connection.send({ type:'ping' });
++  connection.send({ type:'keyframe' });
++}
++/** The last resort: a reload, as a refresh by hand always came back, while the box answers (a reload while the box
++ *  restarts would leave the browser's own error page). */
++function reloadWhenBoxAnswers() {
++  if (reloading) return;
++  reloading = true;
++  lifeEvent(12);
++  void fetch('./receiver-access.json', { cache: 'no-store' }).then(r => { if (r.ok) location.reload(); else reloading = false; })
++    .catch(() => { reloading = false; });
++}
++// A hidden page's timers are slowed on purpose (the XPeng's reverse camera hides the page, and its link lives on):
++// lateness then is no freeze.
++document.addEventListener('visibilitychange', () => { if (document.hidden) hiddenMeanwhile = true; else wake(4); });
++document.addEventListener('resume', () => wake(6));
++window.addEventListener('online', () => { if (token && !connection.isOpen) { lifeEvent(13, { how: 3 }); revive(); } });
++window.setInterval(() => {
++  const now = performance.now(), gap = now - lastTick, late = gap > 2500 && !hiddenMeanwhile;
++  lastTick = now; hiddenMeanwhile = document.hidden;
++  if (!token) return;
++  if (holding && !late) { holdAwakeMs += Math.min(gap, 1000); if (holdAwakeMs > HOLD_MS) { holding = false; clearPicture(); render(); } }
++  if (late) { lifeEvent(8, { gapMs: Math.round(gap) }); wake(1); }
++  else if (active && !document.hidden && now - lastHeard > 8000) revive();   // the link died while in view
++  else if (!document.hidden && closedAt && now - closedAt > RELOAD_AFTER_MS) reloadWhenBoxAnswers();
++}, 1000);
+ window.setInterval(()=>{
+   const now=performance.now(),seconds=Math.max(1,(now-reportStart)/1000);
+   send({type:'stats',stats:{fps:reportFrames/seconds,decodeMs:video.decodeLatencyMs,queue:video.decodeQueueSize,
+     kbps:reportBytes*8/1000/seconds,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,
+     width:canvas.width,height:canvas.height,...(touchCount?{touchMs:touchSum/touchCount,touches:touchCount}:{}),...(musicBytes?{musicKbps:musicBytes*8/1000/seconds}:{}),
+-    chrome:chromeMajor,build:BUILD,webView,teslaMode:teslaMode?1:0,promptGain,fastDecoder:fastDecoder()?1:0,hevcDecodes:hevcDecodes?1:0,hevc:display?.hevc?1:0,...microphone.report(),...audio.farReport(),...media.report(),...musicTimeline(),...audio.musicReport(),...video.takeStalls(),...lag.take(performance.now())}});
++    chrome:chromeMajor,build:BUILD,webView,teslaMode:teslaMode?1:0,promptGain,...(revived?{revived}:{}),fastDecoder:fastDecoder()?1:0,hevcDecodes:hevcDecodes?1:0,hevc:display?.hevc?1:0,...microphone.report(),...audio.farReport(),...media.report(),...musicTimeline(),...audio.musicReport(),...video.takeStalls(),...lag.take(performance.now())}});
+   judgeDecoder(video.decodeLatencyMs, reportFrames/seconds);
+   reportFrames=0;reportBytes=0;reportStart=now;touchSum=0;touchCount=0;musicBytes=0;
+ },10000);
+--- a/web/src/style.css
++++ b/web/src/style.css
+@@ -20,6 +20,8 @@
+    changes while the window was 579, and CarPlay's bottom row (home button) went below the screen (2026-10-13). */
+ #app { position:fixed; top:0; right:0; bottom:0; left:0; background:#000; }
+ #screen-container { position:absolute; top:0; right:0; bottom:0; left:0; inset:0; display:flex; justify-content:center; align-items:center; }
++/* View areas: the area in use fills the view from the top left; the rest of the stream stays outside it. */
++#screen-container.area { justify-content:flex-start; align-items:flex-start; overflow:hidden; }
+ #surface { flex:none; }
+ #screen { display:block; width:100%; height:100%; touch-action:none; user-select:none; -webkit-user-select:none; }
+ 
+--- a/web/src/ws.ts
++++ b/web/src/ws.ts
+@@ -2,6 +2,13 @@
+ 
+ export type ConnectionState = 'connecting' | 'open' | 'closed';
+ 
++/** This page load's id (letters and digits). */
++const PAGE_ID = Array.from(crypto.getRandomValues(new Uint8Array(8)), b => b.toString(16).padStart(2, '0')).join('');
++
++/** A socket not open by then is given up for a new one: in the car a link opens in tens of milliseconds, and the
++ *  first one tried right after a Tesla unfroze the page sometimes hung (2026-10-14). */
++const OPEN_TIMEOUT_MS = 1500;
++
+ export interface ConnectionHandlers {
+   onWire: (message: WireMessage) => void;
+   onServer: (message: ServerMessage) => void;
+@@ -15,6 +22,8 @@
+   private retryTimer: number | null = null;
+   private retryDelayMs = 500;
+   private stopped = false;
++  /** Sockets in a row that did not open (closed first, or not open within OPEN_TIMEOUT_MS); 0 once one opens. */
++  failures = 0;
+ 
+   constructor(
+     private readonly token: string,
+@@ -29,16 +38,35 @@
+   private open(): void {
+     this.handlers.onState('connecting');
+     const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+-    const url = `${scheme}://${location.host}/ws?token=${encodeURIComponent(this.token)}`;
++    // page: this page's id, so the box replaces this page's old link at once when it connects again.
++    const url = `${scheme}://${location.host}/ws?token=${encodeURIComponent(this.token)}&page=${PAGE_ID}`;
+     const socket = new WebSocket(url);
+     socket.binaryType = 'arraybuffer';
+     this.socket = socket;
++    let opened = false, openedAt = 0;
++    // After a Tesla unfroze its browser (reverse gear, 2026-10-14) a new socket hung half-open, neither open nor
++    // closed, and the page said "connecting" until refreshed: one that is not open in time is left for another.
++    // A timer that runs late means the page was frozen meanwhile: the socket may have opened with its "open" not
++    // handled yet (a test froze the page 0.3 s after connecting, 2026-10-14), so it gets another OPEN_TIMEOUT_MS.
++    let openTimer = 0;
++    const checkOpen = (armedAt: number) => {
++      if (this.socket !== socket || socket.readyState === WebSocket.OPEN) return;
++      if (performance.now() - armedAt > OPEN_TIMEOUT_MS + 1000) { const now = performance.now(); openTimer = window.setTimeout(() => checkOpen(now), OPEN_TIMEOUT_MS); return; }
++      this.failures++; this.restart();
++    };
++    const armedAt = performance.now();
++    openTimer = window.setTimeout(() => checkOpen(armedAt), OPEN_TIMEOUT_MS);
+ 
+     socket.addEventListener('open', () => {
++      window.clearTimeout(openTimer);
++      if (this.socket !== socket) return;
++      opened = true; openedAt = performance.now();
+       this.retryDelayMs = 500;
++      this.failures = 0;
+       this.handlers.onState('open');
+     });
+     socket.addEventListener('message', (event: MessageEvent<string | ArrayBuffer>) => {
++      if (this.socket !== socket) return;   // a socket left by restart()
+       if (typeof event.data === 'string') {
+         try {
+           this.handlers.onServer(JSON.parse(event.data) as ServerMessage);
+@@ -52,7 +80,12 @@
+       if (message) this.handlers.onWire(message);
+     });
+     socket.addEventListener('close', () => {
+-      if (this.socket === socket) this.socket = null;
++      window.clearTimeout(openTimer);
++      if (this.socket !== socket) return;   // left by restart(), which already moved on
++      if (!opened) this.failures++;
++      // A link that had been up a while (the box closed it while the page was frozen): again at once, no back-off.
++      if (opened && performance.now() - openedAt > 5000) this.retryDelayMs = 0;
++      this.socket = null;
+       this.handlers.onState('closed');
+       this.scheduleReconnect();
+     });
+@@ -67,13 +100,17 @@
+       this.retryTimer = null;
+       this.open();
+     }, this.retryDelayMs);
+-    this.retryDelayMs = Math.min(this.retryDelayMs * 2, 5000);
++    this.retryDelayMs = Math.min(Math.max(this.retryDelayMs * 2, 500), 5000);
+   }
+ 
+-  send(message: ClientMessage): void {
++  get isOpen(): boolean { return this.socket?.readyState === WebSocket.OPEN; }
++
++  /** false when the link is not open (nothing sent). */
++  send(message: ClientMessage): boolean {
+     const socket = this.socket;
+-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
++    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+     socket.send(JSON.stringify(message));
++    return true;
+   }
+ 
+   sendBinary(payload: Uint8Array): void {
+@@ -82,6 +119,19 @@
+     socket.send(payload);
+   }
+ 
++  /** Leaves the current socket at once, without waiting for it to close (after the browser was frozen it may be
++   *  dead with no close to come), and opens a new one. */
++  restart(): void {
++    if (this.stopped) return;
++    const old = this.socket;
++    this.socket = null;
++    if (this.retryTimer !== null) { window.clearTimeout(this.retryTimer); this.retryTimer = null; }
++    try { old?.close(); } catch { /* Already gone. */ }
++    this.handlers.onState('closed');
++    this.retryDelayMs = 500;
++    this.open();
++  }
++
+   close(): void {
+     this.stopped = true;
+     if (this.retryTimer !== null) {

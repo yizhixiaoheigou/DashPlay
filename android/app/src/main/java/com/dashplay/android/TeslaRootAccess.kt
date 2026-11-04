@@ -79,7 +79,10 @@ class TeslaRootAccess internal constructor(context: Context, private val rootOve
         if (result.finished && !result.owned && prefs.edit().remove(JOURNAL).commit()) {
             lease.delete()
             closeChecks()
-            phase = "FAILED"; message = "Root 权限、iptables 或规则链不可用，未接管已有网络规则。"; return
+            phase = "FAILED"
+            message = if (!RootShell.available()) "本机 Root 不允许应用使用（su 只有 shell 组可执行），无法启用访问地址。"
+            else "Root 权限、iptables 或规则链不可用，未接管已有网络规则。"
+            return
         }
         if (recover()) { phase = "FAILED"; message = "系统未能启用访问地址，已移除本次规则。" }
     }
@@ -140,7 +143,7 @@ class TeslaRootAccess internal constructor(context: Context, private val rootOve
     internal data class Result(val success: Boolean, val owned: Boolean, val finished: Boolean, val rootGranted: Boolean = false)
     private fun runRoot(script: String, success: String): Result {
         rootOverride?.let { return it(script, success) }
-        val process = try { ProcessBuilder("su", "-c", script).redirectErrorStream(true).start() }
+        val process = try { RootShell.open(script) }
             catch (_: Exception) { return Result(false, false, true) }
         val task = FutureTask<Result> {
             var matched = false

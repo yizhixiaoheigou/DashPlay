@@ -1,0 +1,304 @@
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -1,4 +1,5 @@
+ package com.playport.server
++
+ 
+ import com.shilapi.xcertplay.airplay.AirPlayIcon
+ import com.shilapi.xcertplay.airplay.AirPlayConfig
+@@ -317,10 +318,20 @@
+             if (session === wiredSession) return true
+             if (session !== activeSession) return false
+             val handoff = System.nanoTime() / 1_000_000 - handoffAcceptedAt < HANDOFF_ADMIT_MS
+-            return runCatching { check(session.controllerId, selectedPhone, bootInvite || handoff) }.getOrDefault(false)
+-        }
+-
+-        override fun onSessionActive(session: AirPlaySession) {
++            val phone = selectedPhone
++            val allowed = runCatching { check(session.controllerId, phone, bootInvite || handoff) }.getOrDefault(false)
++            return synchronized(this@CarPlayServer) {
++                if (!allowed || closed.get() || activeSession !== session) false
++                else { authorizedWireless = WirelessOwner(session, phone); true }
++            }
++        }
++
++        override fun onSessionActive(session: AirPlaySession) = synchronized(this@CarPlayServer) {
++            if (closed.get() || activeSession !== session) return@synchronized
++            val authorized = authorizedWireless
++            if (session !== wiredSession && platformController != null && authorized?.session !== session) return@synchronized
++            liveWireless = if (session === wiredSession) null else WirelessOwner(session,
++                if (authorized?.session === session) authorized.phone else selectedPhone ?: config.bluetoothDeviceAddress)
+             log.info("CarPlay session active peer={}", session.host)
+             activeSession = session
+             connectedSession = session
+@@ -335,9 +346,11 @@
+             hub.setSessionState(true, null)
+         }
+ 
+-        override fun onSessionEnded(session: AirPlaySession) {
++        override fun onSessionEnded(session: AirPlaySession) = synchronized(this@CarPlayServer) {
+             log.info("CarPlay session ended peer={}", session.host)
+-            if (activeSession !== session) return
++            if (activeSession !== session) return@synchronized
++            if (liveWireless?.session === session) liveWireless = null
++            if (authorizedWireless?.session === session) authorizedWireless = null
+             activeSession = null
+             if (connectedSession === session) connectedSession = null
+             if (hasPresence) presence("idle")
+@@ -356,10 +369,11 @@
+             hub.setSessionState(false, null, restarting = forDisplay)
+         }
+ 
+-        override fun onDeviceInfo(session: AirPlaySession, info: AirPlayDeviceInfo) {
++        override fun onDeviceInfo(session: AirPlaySession, info: AirPlayDeviceInfo) = synchronized(this@CarPlayServer) {
++            if (closed.get() || activeSession !== session) return@synchronized
+             log.info("iPhone connected name={} model={} deviceId={}", info.name, info.model, info.deviceId)
+             if (session === wiredSession) { wiredName = info.name; cableName = info.name }
+-            hub.setSessionState(true, info.name)
++            hub.setSessionState(session === connectedSession, info.name)
+         }
+ 
+         override fun onHostUiRequested(session: AirPlaySession) {
+@@ -464,11 +478,20 @@
+     @Volatile private var wiredSession: AirPlaySession? = null
+     /** The session reached RECORD, rather than merely opening a control socket. */
+     @Volatile private var connectedSession: AirPlaySession? = null
++    private data class WirelessOwner(val session: AirPlaySession, val phone: String?)
++    @Volatile private var authorizedWireless: WirelessOwner? = null
++    @Volatile private var liveWireless: WirelessOwner? = null
++
++    /** Display state comes from RECORD, never from an invitation or SETUP authorization. */
++    fun wirelessSessionPhone(): String? {
++        val live = liveWireless ?: return null
++        return live.phone.takeIf { live.session === activeSession && live.session === connectedSession && live.session !== wiredSession }
++    }
+     /** The wired iPhone's name from its CarPlay device info (for the settings' phone list). */
+     @Volatile private var wiredName: String? = null
+ 
+     /** The iPhone on the cable has opened CarPlay (AirPlay over its NCM link) and is the active session. */
+-    fun wiredSessionActive(): Boolean = wiredSession.let { it != null && it === activeSession }
++    fun wiredSessionActive(): Boolean = wiredSession.let { it != null && it === activeSession && it === connectedSession }
+ 
+     /** Called before the helper changes USB mode; false keeps the cable for power/internet only. */
+     fun prepareCablePhone(): Boolean {
+@@ -568,11 +591,11 @@
+ 
+     /** The paired phones plus the wired row (see [CableRole.wiredRow]); a live cable session is the one in use. */
+     private fun withWiredRow(body: String): String {
+-        // Only the Linux USB helper reports the cable's states; other platforms keep the plain "cable" name.
+-        if (wired == null && platformWiredReselect == null) return body
++        val selected = PhoneList.withActiveWireless(body, wirelessSessionPhone())
++        if (wired == null && platformWiredReselect == null) return selected
+         val live = wiredSessionActive()
+         val row = CableRole.wiredRow(cablePresent || cablePhone, cableRole.carPlayOnCable(), live, cableRole.staticOff)
+-        return PhoneList.withWired(body, row, cableName ?: wiredName)
++        return PhoneList.withWired(selected, row, cableName ?: wiredName)
+     }
+ 
+     /**
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -136,6 +136,14 @@
+         if (!ADDRESS.matches(address)) null
+         else entry.copy(address = address, name = entry.name.take(64).ifBlank { address })
+     }.distinctBy { it.address }.take(MAX_PHONES)
++
++    /** Only the current RECORD-confirmed session may be shown as active. */
++    fun withActiveWireless(body: String, address: String?): String {
++        val parsed = runCatching { json.decodeFromString(PhoneListBody.serializer(), body) }.getOrNull() ?: return body
++        val active = address?.let(::normalize)
++        return json.encodeToString(PhoneListBody.serializer(), parsed.copy(
++            phones = parsed.phones.map { it.copy(active = it.address == active) }))
++    }
+ 
+     /**
+      * Adds the wired row to a phone list body. While CarPlay is live on the cable no wireless row is "in use":
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -161,20 +161,47 @@
+ let wiredRow: WiredRow | null = null;
+ let wiredName = '';
+ let devicesLoading = false;
++let devicesRefreshPending = false;
+ /** 'cable' or a phone address while a switch request is under way. */
+ let switchingTo: string | null = null;
+ let deviceNotice = '';
++let devicesRevision = 0;
++/** An accepted invitation is still pending until the box reports an actual active session. */
++let connectingTo: string | null = null;
++let connectingUntil = 0, devicesPollTimer = 0;
++const devicesBusy = () => switchingTo !== null || connectingTo !== null;
++devicesStatus.setAttribute('role', 'status');
++devicesStatus.setAttribute('aria-live', 'polite');
++function endDeviceConnection(notice = '') {
++  if (notice && connectingTo === 'cable' && wiredRow === 'starting') wiredRow = 'available';
++  connectingTo = null;
++  window.clearTimeout(devicesPollTimer); devicesPollTimer = 0;
++  deviceNotice = notice;
++}
++function pollDeviceConnection() {
++  window.clearTimeout(devicesPollTimer); devicesPollTimer = 0;
++  if (!connectingTo) return;
++  const remaining = connectingUntil - Date.now();
++  if (remaining <= 0) {
++    ++devicesRevision;
++    endDeviceConnection(t('deviceConnectTimeout'));
++    renderDevices();
++    return;
++  }
++  devicesPollTimer = window.setTimeout(() => { void loadDevices(); }, Math.min(1500, remaining));
++}
+ const deviceAddress = (phone: BoxPhone) => `蓝牙 …${phone.address.slice(-5)}`;
+ function deviceRow(label: string, detail: string, active: boolean, value: string, onPick: (() => void) | null) {
+   const row = document.createElement(onPick ? 'button' : 'div') as HTMLDivElement & HTMLButtonElement;
+   row.className = active ? 'cell on' : 'cell';
+-  if (onPick) { row.type = 'button'; row.disabled = switchingTo !== null; row.onclick = onPick; }
++  if (onPick) { row.type = 'button'; row.disabled = devicesBusy(); row.onclick = onPick; }
+   const main = document.createElement('span'); main.className = 'main';
+   const name = document.createElement('b'); name.textContent = label;
+   const sub = document.createElement('span'); sub.textContent = detail;
+   main.append(name, sub);
+   const right = document.createElement('span'); right.className = 'value'; right.textContent = value;
+-  row.append(main, right); deviceList.append(row);
++  row.append(main, right);
++  deviceList.append(row);
+ }
+ function renderDevices() {
+   deviceList.textContent = '';
+@@ -188,11 +215,11 @@
+     devicesStatus.textContent = deviceNotice;
+     return;
+   }
+-  // With a single row there is nothing to switch to: show it, not a button that picks itself.
++  // Keep the existing switch controls; pending state does not add a new action.
+   const canSwitch = rows > 1;
+   if (wiredRow) {
+     const active = cableLive || wiredRow === 'starting';
+-    const value = cableLive ? t('deviceInUse') : wiredRow === 'starting' ? t('deviceStarting')
++    const value = cableLive ? t('deviceInUse') : wiredRow === 'starting' || connectingTo === 'cable' ? t('deviceStarting')
+       : switchingTo === 'cable' ? t('deviceSwitchingShort') : t('deviceSwitch');
+     deviceRow(`${t('deviceWired')} · ${wiredName || 'iPhone'}`, t('deviceCableDetail'), active, value,
+       !active && canSwitch ? () => { void switchTo(null); } : null);
+@@ -202,35 +229,48 @@
+     const active = !cableLive && wiredRow !== 'starting' && phone.active === true;
+     const label = `${t('deviceWireless')} · ${phone.name || phone.address}`;
+     const detail = phone.last && !active && canSwitch ? `${t('deviceLast')} · ${deviceAddress(phone)}` : deviceAddress(phone);
+-    const value = active ? t('deviceInUse')
++    const value = active ? t('deviceInUse') : connectingTo === phone.address ? t('deviceStarting')
+       : switchingTo === phone.address ? t('deviceSwitchingShort')
+       : canSwitch ? t('deviceSwitch') : phone.last ? t('deviceLast') : t('deviceIdle');
+     deviceRow(label, detail, active, value, !active && canSwitch ? () => { void switchTo(phone); } : null);
+   }
+-  devicesStatus.textContent = deviceNotice || (canSwitch ? t('devicesHint') : t('devicesOne'));
++  devicesStatus.textContent = deviceNotice || (connectingTo ? t('deviceStarting') : canSwitch ? t('devicesHint') : t('devicesOne'));
+ }
+ async function loadDevices() {
+-  if (!token || devicesLoading) return;
++  if (!token) return;
++  if (devicesLoading) { devicesRefreshPending = true; return; }
+   devicesLoading = true;
+-  deviceNotice = '';
++  const revision = devicesRevision;
++  if (!connectingTo) deviceNotice = '';
++  const abort = new AbortController(), timeout = window.setTimeout(() => abort.abort(), 8000);
+   try {
+-    const r = await fetch(`/api/phones?token=${encodeURIComponent(token)}`, { cache: 'no-store' });
++    const r = await fetch(`/api/phones?token=${encodeURIComponent(token)}`, { cache: 'no-store', signal: abort.signal });
+     if (!r.ok) throw new Error();
+     const body = await r.json() as BoxPhones;
+-    if (!body.supported) { devicesBlock.hidden = true; return; }
++    if (revision !== devicesRevision || switchingTo) return;
++    // BlueZ can be temporarily busy during the invitation; the accepted action still needs confirmation.
++    if (!body.supported) { if (!connectingTo) devicesBlock.hidden = true; return; }
+     boxPhones = Array.isArray(body.phones) ? body.phones : [];
+     const legacyCable = typeof body.cable === 'string' && body.cable ? body.cable : '';
+     // An older receiver only names the phone using CarPlay on the cable.
+     wiredRow = body.wired === 'live' || body.wired === 'starting' || body.wired === 'available' ? body.wired
+       : legacyCable ? 'live' : null;
+     wiredName = (typeof body.wiredName === 'string' && body.wiredName) || legacyCable;
++    if (connectingTo === 'cable' ? wiredRow === 'live'
++      : connectingTo && boxPhones.some(phone => phone.address === connectingTo && phone.active === true) && wiredRow !== 'live' && wiredRow !== 'starting')
++      endDeviceConnection();
+     devicesBlock.hidden = false;
+     renderDevices();
+   } catch {
+-    // An older receiver has no such endpoint: the section simply stays hidden.
+-    devicesBlock.hidden = true;
++    // Ignore a response begun before a user action.
++    if (revision === devicesRevision && !connectingTo) devicesBlock.hidden = true;
+   } finally {
++    window.clearTimeout(timeout);
+     devicesLoading = false;
++    if (devicesRefreshPending) {
++      devicesRefreshPending = false;
++      if (panel.open || connectingTo) void loadDevices();
++    } else pollDeviceConnection();
+   }
+ }
+ function deviceError(code: string): string {
+@@ -246,34 +286,39 @@
+ }
+ /** phone null: the wired row. */
+ async function switchTo(phone: BoxPhone | null) {
+-  if (switchingTo) return;
++  if (devicesBusy()) return;
++  ++devicesRevision;
+   switchingTo = phone ? phone.address : 'cable';
++  deviceNotice = '';
+   renderDevices();
++  const abort = new AbortController(), timeout = window.setTimeout(() => abort.abort(), 20000);
+   try {
+     const r = await fetch(`/api/phones/switch?token=${encodeURIComponent(token)}`, {
+-      method: 'POST', headers: { 'Content-Type': 'application/json' },
++      method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: abort.signal,
+       body: JSON.stringify(phone ? { address: phone.address } : { cable: true }),
+     });
+     const body = await r.json().catch(() => ({})) as { error?: string };
+     if (!r.ok) throw new Error(body.error || '');
+-    // The row in use loses CarPlay (not the Wi-Fi); show the chosen one as in use and confirm from the box
+-    // again in a few seconds, once the new session is up.
++    // Accepted only: the old session ended, but the new phone has not necessarily connected.
++    connectingTo = phone ? phone.address : 'cable';
++    connectingUntil = Date.now() + 90_000;
++    boxPhones = boxPhones.map(entry => ({ ...entry, active: false }));
+     if (phone) {
+       if (wiredRow) wiredRow = 'available';
+-      boxPhones = boxPhones.map(entry => ({ ...entry, active: entry.address === phone.address }));
+     } else {
+       wiredRow = 'starting';
+-      boxPhones = boxPhones.map(entry => ({ ...entry, active: false }));
+     }
+     deviceNotice = '';
+     toast(t('deviceSwitching').replace('{name}', phone ? `${t('deviceWireless')} · ${phone.name || phone.address}`
+       : `${t('deviceWired')} · ${wiredName || 'iPhone'}`));
+-    window.setTimeout(() => { if (!devicesBlock.hidden) void loadDevices(); }, 8000);
+   } catch (error) {
+     deviceNotice = deviceError((error as Error).message);
+   } finally {
++    window.clearTimeout(timeout);
++    ++devicesRevision;
+     switchingTo = null;
+     if (!devicesBlock.hidden) renderDevices();
++    if (connectingTo) void loadDevices();
+   }
+ }
+ function fit() {
+@@ -976,7 +1021,7 @@
+   connection.send({type:'stats',stats:{ev,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,width:screen.clientWidth,height:screen.clientHeight,want:wantFullscreen?1:0,...viewport()}});
+ }
+ /** Which page build runs (raised with each build tried in the car). */
+-const BUILD = 2026110423;
++const BUILD = 2026110424;
+ /** What the browser says of the space it gives the page, to find the car's bar over a fullscreen page (2026-10-13):
+  *  window, visual viewport (and its offset), screen, available screen, outer window, pixel ratio. */
+ function viewport(): Record<string, number> {
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -10,6 +10,7 @@
+   deviceSwitching: ['正在切换到「{name}」，现在这部会先断开 CarPlay…', 'Switching to “{name}”; the current CarPlay ends first…'],
+   deviceUnsupported: ['这部盒子不能切换手机。', 'This box cannot switch phones.'], deviceNotPaired: ['这部手机没有配对，请先在盒子的设置页添加。', 'This phone is not paired; add it on the box settings page.'],
+   deviceCable: ['这部盒子只能用数据线，不能切到无线。', 'This box only offers the cable; wireless is not available.'],
++  deviceConnectTimeout: ['尚未确认连接成功，请检查手机蓝牙和 CarPlay 状态后重试。', 'Connection was not confirmed. Check the phone’s Bluetooth and CarPlay, then try again.'],
+   deviceWired: ['有线', 'Wired'], deviceWireless: ['无线', 'Wireless'], deviceStarting: ['正在连接', 'Connecting'], deviceSwitchingShort: ['正在切换…', 'Switching…'],
+   deviceNoCable: ['数据线上现在没有 iPhone。', 'No iPhone on the cable right now.'],
+   deviceCableOff: ['后台设置了「只用无线」，数据线不做 CarPlay。', 'The box is set to wireless only; the cable carries no CarPlay.'],

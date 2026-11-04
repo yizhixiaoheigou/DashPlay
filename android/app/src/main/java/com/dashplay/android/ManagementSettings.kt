@@ -6,6 +6,7 @@ import kotlinx.serialization.Serializable
 @Serializable
 data class ManagementSettings(
     val deviceName: String? = null,
+    val deviceKind: DeviceKind? = null,
     val autoHotspot: Boolean? = null,
     val usbInternet: Boolean? = null,
     val usbHotspotShare: Boolean? = null,
@@ -16,6 +17,7 @@ data class ManagementSettings(
     val passphrase: String? = null,
     /** External network the box joins (router / pocket Wi-Fi / car hotspot); never the box's own hotspot. */
     val uplinkSsid: String? = null,
+    val externalWifiChoice: ExternalWifiChoice? = null,
     val uplinkPassphrase: String? = null,
     val wifiSecurity: WifiSecurity? = null,
     val wifiChannel: Int? = null,
@@ -26,6 +28,12 @@ data class ManagementSettings(
     val ownNameOnHotspot: Boolean? = null,
     val updateCheck: Boolean? = null,
     val updateMirror: String? = null,
+    /** The plain-HTTP compatibility entry (no management, JPEG/RTC picture only). */
+    val compatHttp: Boolean? = null,
+    val browserPort: Int? = null,
+    /** Legacy alias, accepted for older clients. */
+    val compatHttpPort: Int? = null,
+    val videoTransport: VideoTransport? = null,
 )
 
 enum class WifiSecurity { OPEN, WPA2, WPA3 }

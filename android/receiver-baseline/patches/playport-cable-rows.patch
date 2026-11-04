@@ -1,0 +1,717 @@
+diff --git a/server/src/main/kotlin/com/playport/server/CableRole.kt b/server/src/main/kotlin/com/playport/server/CableRole.kt
+new file mode 100644
+index 0000000..3b92a1e
+--- /dev/null
++++ b/server/src/main/kotlin/com/playport/server/CableRole.kt
+@@ -0,0 +1,83 @@
++package com.playport.server
++
++import java.nio.file.Files
++import java.nio.file.Path
++
++/**
++ * Whether the USB cable carries CarPlay (2026-10-31). Independent of how the box reaches the internet: the iPhone
++ * stays in its CarPlay USB configuration either way, so its USB internet interface works with or without CarPlay
++ * on the cable. The viewer's phone list has one row per way in ("wired · phone", "wireless · phone", ...); picking
++ * a wireless row while CarPlay is on the cable turns the cable's CarPlay off, picking the wired row turns it on.
++ *
++ * The marker file (CARPLAY_CABLE_OFF_FILE) is read by iphone-usb-bridge.py each time it starts: present means
++ * "report the iPhone as tether, stay out of usbmux/NCM". Its content says who wrote it:
++ *  - "once": the viewer picked a wireless row; cleared when the iPhone is unplugged, so the next plug-in is wired.
++ *  - "static": the owner chose wireless only (CARPLAY_CABLE_CARPLAY=off); kept across unplugs.
++ */
++class CableRole(private val file: Path?, private val static: Boolean) {
++    /** At receiver start: a static choice writes the marker; a stale static marker from an earlier setting goes. */
++    fun init() {
++        val path = file ?: return
++        runCatching {
++            if (static) write(STATIC)
++            else if (read() == STATIC) Files.deleteIfExists(path)
++        }
++    }
++
++    /** Whether CarPlay may run on the cable now. Without a marker path the cable always carries CarPlay. */
++    fun carPlayOnCable(): Boolean = file == null || !Files.exists(file)
++
++    /** The owner chose wireless only: the wired row is not offered at all. */
++    val staticOff: Boolean get() = file != null && static
++
++    /** The viewer picked a wireless row: the cable stops carrying CarPlay until the iPhone is unplugged. */
++    fun turnOff(): Boolean {
++        if (file == null) return false
++        return runCatching { if (!Files.exists(file)) write(ONCE); true }.getOrDefault(false)
++    }
++
++    /** The viewer picked the wired row. A static choice is not overridden from the viewer. */
++    fun turnOn(): Boolean {
++        if (file == null || static) return false
++        return runCatching { Files.deleteIfExists(file); true }.getOrDefault(false)
++    }
++
++    /** The iPhone was unplugged: a one-off choice ends with it. */
++    fun unplugged() {
++        if (file == null || static) return
++        runCatching { if (read() == ONCE) Files.deleteIfExists(file) }
++    }
++
++    // readAllBytes, not readString: Android 5 (API 21) has no Files.readString.
++    private fun read(): String? = runCatching { String(Files.readAllBytes(file!!)).trim() }.getOrNull()
++
++    private fun write(value: String) {
++        val path = file ?: return
++        path.parent?.let { Files.createDirectories(it) }
++        val temporary = path.resolveSibling(path.fileName.toString() + ".tmp")
++        Files.write(temporary, (value + "\n").toByteArray())
++        Files.move(temporary, path, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
++    }
++
++    companion object {
++        const val ONCE = "once"
++        const val STATIC = "static"
++
++        fun fromEnvironment(): CableRole = CableRole(
++            System.getenv("CARPLAY_CABLE_OFF_FILE")?.takeIf { it.isNotBlank() }?.let { Path.of(it) },
++            System.getenv("CARPLAY_CABLE_CARPLAY") == "off",
++        )
++
++        /**
++         * The viewer's wired row: "live" (CarPlay on the cable now), "starting" (being brought up), "available"
++         * (plugged in, CarPlay off on the cable, tap to move it there), or null (no row: nothing plugged in, or
++         * wireless only).
++         */
++        fun wiredRow(plugged: Boolean, carPlayOnCable: Boolean, live: Boolean, staticOff: Boolean): String? = when {
++            !plugged || staticOff -> null
++            live -> "live"
++            carPlayOnCable -> "starting"
++            else -> "available"
++        }
++    }
++}
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+index 3e026b7..b4f7efd 100644
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -176,12 +176,24 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+         val phone = PhoneList.normalize(address)
+         if (!PhoneList.ADDRESS.matches(phone)) return "invalid"
+         if (closed.get()) return "closed"
+-        if (cablePhone) return "cable"
++        // CarPlay on the cable: picking a wireless row turns the cable's CarPlay off first (the cable keeps
++        // charging and, if chosen, feeding the box internet), then invites the phone like any other switch.
++        val fromCable = cablePhone
++        if (fromCable && (!config.wireless || wired == null)) return "cable"
+         if (switchingTo == phone) return "busy"
+         // Checked and written before the old session ends: the grant names the phone to invite next.
+         if (!presence("switch", phone)) return "not-paired"
++        if (fromCable && !cableRole.turnOff()) return "cable"
+         synchronized(this) {
+-            if (closed.get() || cablePhone) return "busy"
++            if (closed.get() || cablePhone != fromCable) return "busy"
++            if (fromCable) {
++                // The helper starts again and reports "tether"; until then nothing may re-pause wireless.
++                cablePhone = false
++                wiredSession?.let { runCatching { it.close() } }
++                wiredSession = null
++                wiredName = null
++                wired?.reselect()
++            }
+             selectedPhone = phone
+             switchingTo = phone
+             // Only the chosen phone's own handoff may admit an unidentified peer; an old boot grant or the
+@@ -318,7 +330,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+ 
+         override fun onDeviceInfo(session: AirPlaySession, info: AirPlayDeviceInfo) {
+             log.info("iPhone connected name={} model={} deviceId={}", info.name, info.model, info.deviceId)
+-            if (session === wiredSession) wiredName = info.name
++            if (session === wiredSession) { wiredName = info.name; cableName = info.name }
+             hub.setSessionState(true, info.name)
+         }
+ 
+@@ -368,7 +380,8 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+         hub.inputHandler = ::routeInput
+         hub.onApplyDisplay = ::applyDisplay
+         hub.onAudioRoutes = ::audioRoutesJson
+-        hub.onPhones = ::phonesJson
++        hub.onPhones = { withWiredRow(phonesJson()) }
++        hub.onSwitchCable = ::switchToCable
+         hub.onSwitchPhone = ::switchPhone
+         hub.onMicrophoneData = { opus, payload -> bridge.sendMicrophonePayload(payload, opus) }
+         hub.onViewerJoined = { streamType ->
+@@ -379,6 +392,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+         }
+         // Wired CarPlay needs no Wi-Fi: bring the cable up while the box is still joining the car hotspot
+         // (22-37 s on the Xpeng), so the picture is there when the head unit's browser connects.
++        cableRole.init()
+         config.usbBridge?.let { wired = WiredBootstrap(this, it).also(WiredBootstrap::start) }
+         awaitBindAddress()
+         selectedPhone = presenceResult("boot")?.takeIf { it.isNotBlank() }
+@@ -412,6 +426,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+     fun wiredSessionActive(): Boolean = wiredSession.let { it != null && it === activeSession }
+ 
+     fun setCablePhone(present: Boolean) {
++        if (present) cablePresent = true
+         if (cablePhone == present) return
+         cablePhone = present
+         if (!config.wireless) return
+@@ -441,6 +456,63 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+         }
+     }
+ 
++    /** Whether CarPlay runs on the cable is the viewer's choice, separate from the box's internet. */
++    private val cableRole = CableRole.fromEnvironment()
++    /** An iPhone is plugged into the cable, with or without CarPlay on it; its name once known. */
++    @Volatile private var cablePresent = false
++    @Volatile private var cableName: String? = null
++
++    /** The helper reported no iPhone on the cable: a one-off "wireless instead" ends with the unplug. */
++    fun cableUnplugged() {
++        cablePresent = false
++        cableName = null
++        cableRole.unplugged()
++        setCablePhone(false)
++    }
++
++    /** An iPhone is plugged in but the cable carries no CarPlay ("tether"): wireless keeps running. */
++    fun cableWithoutCarPlay() {
++        cablePresent = true
++        setCablePhone(false)
++    }
++
++    /**
++     * The viewer picked the wired row: end the wireless session and bring CarPlay up on the cable. The cable's
++     * role only; the box's internet is not touched. Returns an error code, or null.
++     */
++    fun switchToCable(): String? {
++        if (closed.get()) return "closed"
++        val bootstrap = wired ?: return "unsupported"
++        if (!cablePresent && !cablePhone) return "no-cable"
++        if (cablePhone) return null   // already there
++        if (cableRole.staticOff || !cableRole.turnOn()) return "cable-off"
++        synchronized(this) {
++            if (closed.get()) return "closed"
++            // Paused before the helper confirms, so neither the supervisor nor a quick retry invites a phone
++            // over Wi-Fi in between; setCablePhone(true) then finds it already done.
++            cablePhone = true
++            switchingTo = null
++            invitedPhone = null
++            ++wirelessGeneration
++            val link = wireless
++            wireless = null
++            link?.close()
++            activeSession?.takeIf { it !== wiredSession }?.let { runCatching { it.close() } }
++        }
++        log.info("CarPlay moving onto the USB cable, chosen in the viewer")
++        bootstrap.reselect()
++        return null
++    }
++
++    /** The paired phones plus the wired row (see [CableRole.wiredRow]); a live cable session is the one in use. */
++    private fun withWiredRow(body: String): String {
++        // Only the Linux USB helper reports the cable's states; other platforms keep the plain "cable" name.
++        if (wired == null) return body
++        val live = wiredSessionActive()
++        val row = CableRole.wiredRow(cablePresent || cablePhone, cableRole.carPlayOnCable(), live, cableRole.staticOff)
++        return PhoneList.withWired(body, row, cableName ?: wiredName)
++    }
++
+     /**
+      * A receiver started before its network is up (CARPLAY_BIND_WAIT_MS, with ip_nonlocal_bind) loads
+      * while the box joins the Wi-Fi, then waits here until the address is really configured, so the
+diff --git a/server/src/main/kotlin/com/playport/server/WebHub.kt b/server/src/main/kotlin/com/playport/server/WebHub.kt
+index 5d4688e..01651d8 100644
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -97,12 +97,16 @@ data class PhoneEntry(
+ data class PhoneListBody(
+     val supported: Boolean = false,
+     val phones: List<PhoneEntry> = emptyList(),
+-    /** The iPhone using CarPlay over the USB cable (its name), or null: shown in use, nothing can be switched. */
++    /** The iPhone using CarPlay over the USB cable (its name), or null. */
+     val cable: String? = null,
++    /** The wired row (CableRole.wiredRow): "live", "starting", "available", or null for none. */
++    val wired: String? = null,
++    /** The name of the iPhone on the cable, kept while it is plugged in (also when CarPlay is off on it). */
++    val wiredName: String? = null,
+ )
+ 
+ @Serializable
+-data class PhoneSwitchRequest(val address: String = "")
++data class PhoneSwitchRequest(val address: String = "", val cable: Boolean = false)
+ 
+ @Serializable
+ data class AudioRouteRequest(val category: String, val destination: String)
+@@ -127,6 +131,19 @@ object PhoneList {
+         else entry.copy(address = address, name = entry.name.take(64).ifBlank { address })
+     }.distinctBy { it.address }.take(MAX_PHONES)
+ 
++    /**
++     * Adds the wired row to a phone list body. While CarPlay is live on the cable no wireless row is "in use":
++     * the presence helper may still name the last wireless phone as active.
++     */
++    fun withWired(body: String, row: String?, name: String?): String {
++        if (row == null) return body
++        val parsed = runCatching { json.decodeFromString(PhoneListBody.serializer(), body) }.getOrNull() ?: return body
++        val phones = if (row == "live") parsed.phones.map { it.copy(active = false) } else parsed.phones
++        return json.encodeToString(PhoneListBody.serializer(), parsed.copy(
++            supported = true, phones = phones, wired = row,
++            wiredName = name?.trim()?.take(64)?.ifBlank { null } ?: "iPhone"))
++    }
++
+     fun body(supported: Boolean, raw: String?): String =
+         json.encodeToString(PhoneListBody.serializer(), PhoneListBody(supported, parse(raw)))
+ 
+@@ -223,6 +240,9 @@ class WebHub(
+     /** Explicitly switch CarPlay to a paired phone: null on success, or an error code for the page. */
+     @Volatile var onSwitchPhone: ((String) -> String?)? = null
+ 
++    /** Move CarPlay onto the USB cable (the viewer's wired row): null on success, or an error code. */
++    @Volatile var onSwitchCable: (() -> String?)? = null
++
+     /** Browser microphone payloads: (isOpus, payload). */
+     @Volatile var onMicrophoneData: ((Boolean, ByteArray) -> Unit)? = null
+ 
+@@ -499,7 +519,9 @@ class WebHub(
+                     )
+                     return@post
+                 }
+-                val switcher = onSwitchPhone
++                val cableSwitch = onSwitchCable
++                val switcher: ((String) -> String?)? = if (request.cable) cableSwitch?.let { s -> { _: String -> s() } }
++                    else onSwitchPhone
+                 if (switcher == null) {
+                     call.respondText(
+                         json.encodeToString(PhoneSwitchError.serializer(), PhoneSwitchError("unsupported")),
+diff --git a/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt b/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt
+index 4890ef4..a67c44c 100644
+--- a/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt
++++ b/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt
+@@ -62,10 +62,13 @@ class WiredBootstrap(private val server: CarPlayServer, private val helper: Path
+     private fun runOnce() {
+         val bridge = UsbBridgePipe.start(helper) { state ->
+             // The helper says "usb waiting" (no iPhone) or "usb iphone <serial>" (one plugged in) first.
++            // "tether <serial>": an iPhone is plugged in but the cable carries no CarPlay (the viewer picked a
++            // wireless row, or the owner chose wireless only); the cable may still give the box internet.
+             val parts = state.split(" ")
+             when (parts[0]) {
+-                "waiting" -> { server.setCablePhone(false); status("cable") }
++                "waiting" -> { server.cableUnplugged(); status("cable") }
+                 "iphone" -> { serial = parts.getOrNull(1); server.setCablePhone(true); status("starting") }
++                "tether" -> { serial = parts.getOrNull(1); server.cableWithoutCarPlay(); status("") }
+             }
+         }.also { pipe = it }
+         // The helper exits when the iPhone is unplugged, but the iAP2 session blocked in recv never
+@@ -76,7 +79,17 @@ class WiredBootstrap(private val server: CarPlayServer, private val helper: Path
+                 closeLink()
+             }
+         }
+-        val ncm = bridge.awaitNcm(Long.MAX_VALUE) ?: throw EOFException("USB helper exited before an iPhone appeared")
++        val ncm = bridge.awaitNcm(Long.MAX_VALUE)
++        if (ncm == null) {
++            // Without CarPlay on the cable the helper reports no NCM interface and only waits for the unplug.
++            // It stays alive until the unplug (or [reselect] ends it): wait for that, not a retry loop.
++            if (bridge.tether) {
++                log.info("wired: iPhone plugged in, no CarPlay on the cable")
++                bridge.awaitExit()
++                return
++            }
++            throw EOFException("USB helper exited before an iPhone appeared")
++        }
+         log.info("wired: iPhone in its CarPlay configuration, NCM interface {}", ncm)
+         val mux = Iap2UsbMuxHost.open(bridge).also { this.mux = it }
+         log.info("wired: USBMUX open")
+@@ -240,6 +253,16 @@ class WiredBootstrap(private val server: CarPlayServer, private val helper: Path
+         closeLink()
+     }
+ 
++    /**
++     * The viewer moved CarPlay onto or off the cable: end this helper so the loop starts a new one, which reads
++     * the cable marker again and reports "iphone" (CarPlay on the cable) or "tether" (none). The iPhone stays
++     * in its CarPlay USB configuration throughout, so its USB internet interface keeps working.
++     */
++    fun reselect() {
++        log.info("wired: the cable's role changed; starting the USB helper again")
++        closeLink()
++    }
++
+     /** The iAP2 session blocks in recv without noticing a closed pipe (2026-10-12), so close it too. */
+     private fun closeLink() {
+         runCatching { session?.close() }
+@@ -321,11 +344,16 @@ internal class UsbBridgePipe private constructor(
+     var ncmMac: String? = null
+         private set
+ 
++    /** The helper said "usb tether": an iPhone is plugged in and the cable carries no CarPlay. */
++    @Volatile var tether: Boolean = false
++        private set
++
+     init {
+         Thread({
+             process.errorStream.bufferedReader().forEachLine { line ->
+                 if (line.startsWith("usb ")) {
+                     log.info(line)
++                    if (line.startsWith("usb tether")) tether = true
+                     runCatching { onState(line.removePrefix("usb ").trim()) }
+                 } else if (line.startsWith("ncm ")) {
+                     val parts = line.split(" ")
+@@ -359,11 +387,16 @@ internal class UsbBridgePipe private constructor(
+                 ncmMac = found.third?.uppercase()
+                 return found.first
+             }
+-            if (!process.isAlive) return null
++            if (!process.isAlive || tether) return null
+         }
+         return null
+     }
+ 
++    /** Block until the helper exits: the iPhone was unplugged, or [close] ended it. */
++    fun awaitExit() {
++        runCatching { process.waitFor() }
++    }
++
+     @Synchronized
+     override fun write(data: ByteArray, timeoutMillis: Int) {
+         if (ended || !process.isAlive) throw EOFException("USB helper exited")
+diff --git a/server/src/test/kotlin/com/playport/server/CableRoleTest.kt b/server/src/test/kotlin/com/playport/server/CableRoleTest.kt
+new file mode 100644
+index 0000000..f53d5e6
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/CableRoleTest.kt
+@@ -0,0 +1,101 @@
++package com.playport.server
++
++import kotlinx.serialization.json.Json
++import kotlinx.serialization.json.jsonObject
++import kotlinx.serialization.json.jsonPrimitive
++import kotlinx.serialization.json.boolean
++import java.nio.file.Files
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * The cable's CarPlay is the viewer's choice and has nothing to do with the box's internet (2026-10-31): the
++ * phone list has a row per way in, and switching between rows never needs a network setting. Before, moving the
++ * same phone from the cable to Wi-Fi only worked after changing "car internet" in the settings page.
++ */
++class CableRoleTest {
++    private fun temp() = Files.createTempDirectory("cable").resolve("cable-carplay-off")
++
++    @Test fun withoutAMarkerPathTheCableAlwaysCarriesCarPlay() {
++        val role = CableRole(null, static = false)
++        assertTrue(role.carPlayOnCable())
++        assertFalse(role.turnOff())
++    }
++
++    @Test fun pickingAWirelessRowTurnsTheCableOffUntilTheUnplug() {
++        val file = temp()
++        val role = CableRole(file, static = false).also { it.init() }
++        assertTrue(role.carPlayOnCable())
++        assertTrue(role.turnOff())
++        assertFalse(role.carPlayOnCable())
++        assertEquals(CableRole.ONCE, String(Files.readAllBytes(file)).trim())
++        // Plugging in again is wired by default.
++        role.unplugged()
++        assertTrue(role.carPlayOnCable())
++    }
++
++    @Test fun pickingTheWiredRowTurnsTheCableBackOn() {
++        val role = CableRole(temp(), static = false)
++        role.turnOff()
++        assertTrue(role.turnOn())
++        assertTrue(role.carPlayOnCable())
++    }
++
++    @Test fun wirelessOnlyKeepsTheCableOffAcrossUnplugsAndTheViewerCannotOverrideIt() {
++        val file = temp()
++        val role = CableRole(file, static = true).also { it.init() }
++        assertFalse(role.carPlayOnCable())
++        assertTrue(role.staticOff)
++        role.unplugged()
++        assertFalse(role.carPlayOnCable())
++        assertFalse(role.turnOn())
++        assertFalse(role.carPlayOnCable())
++    }
++
++    @Test fun aStaleWirelessOnlyMarkerGoesWhenTheSettingChanged() {
++        val file = temp()
++        CableRole(file, static = true).init()
++        CableRole(file, static = false).init()
++        assertTrue(CableRole(file, static = false).carPlayOnCable())
++    }
++
++    @Test fun aOneOffChoiceSurvivesAReceiverRestartWhileThePhoneStaysPluggedIn() {
++        val file = temp()
++        CableRole(file, static = false).turnOff()
++        val restarted = CableRole(file, static = false).also { it.init() }
++        assertFalse(restarted.carPlayOnCable())
++    }
++
++    @Test fun theWiredRowFollowsThePlugAndTheCablesRole() {
++        assertNull(CableRole.wiredRow(plugged = false, carPlayOnCable = true, live = false, staticOff = false))
++        assertNull(CableRole.wiredRow(plugged = true, carPlayOnCable = false, live = false, staticOff = true))
++        assertEquals("live", CableRole.wiredRow(plugged = true, carPlayOnCable = true, live = true, staticOff = false))
++        assertEquals("starting", CableRole.wiredRow(plugged = true, carPlayOnCable = true, live = false, staticOff = false))
++        assertEquals("available", CableRole.wiredRow(plugged = true, carPlayOnCable = false, live = false, staticOff = false))
++    }
++
++    @Test fun aLiveCableSessionIsTheOnlyRowInUse() {
++        val raw = """[{"address":"02:00:00:00:00:0A","name":"Phone A","active":true}]"""
++        val body = PhoneList.withWired(PhoneList.body(true, raw), "live", "Phone A")
++        val parsed = Json.parseToJsonElement(body).jsonObject
++        assertEquals("live", parsed["wired"]!!.jsonPrimitive.content)
++        assertEquals("Phone A", parsed["wiredName"]!!.jsonPrimitive.content)
++        val phone = (parsed["phones"] as kotlinx.serialization.json.JsonArray)[0].jsonObject
++        assertFalse(phone["active"]!!.jsonPrimitive.boolean)
++    }
++
++    @Test fun aWirelessSessionStaysInUseBesideAnAvailableCable() {
++        val raw = """[{"address":"02:00:00:00:00:0A","name":"Phone A","active":true}]"""
++        val body = PhoneList.withWired(PhoneList.body(true, raw), "available", "Phone A")
++        val phone = (Json.parseToJsonElement(body).jsonObject["phones"] as kotlinx.serialization.json.JsonArray)[0].jsonObject
++        assertTrue(phone["active"]!!.jsonPrimitive.boolean)
++    }
++
++    @Test fun noRowLeavesTheBodyAlone() {
++        val body = PhoneList.body(true, "[]")
++        assertEquals(body, PhoneList.withWired(body, null, "x"))
++    }
++}
+diff --git a/web/index.html b/web/index.html
+index 1cf5b9e..0a1577b 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -29,6 +29,7 @@
+     <div class="group" id="device-list"></div>
+     <p id="devices-status" class="foot" role="status"></p>
+   </div>
++  <div class="group more"><details id="display-sound"><summary class="cell"><span class="main"><b data-i18n="playerSettings"></b><span data-i18n="playerSettingsHint"></span></span><span class="chev"></span></summary><div class="more-body">
+   <p class="group-title" data-i18n="volume"></p>
+   <div class="group" id="audio-mix">
+     <div class="cell volume audio-row"><span class="main"><b data-i18n="volumeAll"></b></span><input id="volume" type="range" min="0" max="100" value="100"/><output id="volume-value">100%</output></div>
+@@ -61,6 +62,7 @@
+     <details><summary class="cell"><span class="main"><b data-i18n="advanced"></b></span><span class="chev"></span></summary><div id="fallback-controls" class="inner"><button data-command="home" data-i18n="home"></button><button data-command="back" data-i18n="back"></button><button data-command="previous" data-i18n="previous"></button><button data-command="play" data-i18n="play"></button><button data-command="next" data-i18n="next"></button><button data-command="refresh" data-i18n="refresh"></button></div></details>
+   </div>
+   <p class="foot" data-i18n="savedHere"></p>
++  </div></details></div>
+   <p class="group-title" data-i18n="follow"></p>
+   <div class="group follow"><figure><img src="data:image/png;base64,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" alt="" width="112" height="112" decoding="async"/><figcaption data-i18n="followDouyin"></figcaption></figure><figure><img src="data:image/png;base64,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" alt="" width="112" height="112" decoding="async"/><figcaption data-i18n="followXiaohongshu"></figcaption></figure></div>
+   <p class="foot" data-i18n="followHint"></p>
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+index f637129..0a35e92 100644
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -2,16 +2,19 @@ const messages = {
+   settings: ['盒子设置', 'Box settings'], close: ['关闭', 'Close'], done: ['完成', 'Done'],
+   boxLink: ['添加 iPhone · 网络设置', 'Add iPhone · Network'], boxLinkHint: ['配对新手机、选择热点', 'Pair a phone, choose the hotspot'],
+   boxLinkHintLive: ['离开画面，配对手机、更换热点', 'Leaves the picture to pair phones or change the hotspot'],
+-  devices: ['已连接的手机', 'Phones'], devicesHint: ['点一下切换到那部手机：现在这部不会断开 WiFi，只是 CarPlay 会断开，另一部一般 10–30 秒接上；对方的蓝牙要打开。', 'Tap a phone to switch to it: the current one stays on Wi-Fi, only CarPlay ends; the other takes over in about 10–30 s with Bluetooth on.'],
++  devices: ['已连接的手机', 'Phones'], devicesHint: ['点一下就切到那一行：有线、无线、这部、那部都能随意切，和盒子怎么上网无关。现在这部不断 WiFi，只是 CarPlay 断开；无线一般 10–30 秒接上，对方的蓝牙要打开。', 'Tap a row to move CarPlay there: wired or wireless, this phone or another, independent of how the box reaches the internet. The current phone stays on Wi-Fi; wireless takes about 10–30 s with Bluetooth on.'],
+   deviceInUse: ['正在使用', 'In use'], deviceLast: ['上次使用', 'Last used'], deviceIdle: ['未连接', 'Not connected'], deviceSwitch: ['切换到这部', 'Switch to this'],
+   devicesOne: ['目前只配对了这一部；配对第二部后，可以直接在这里切换。', 'Only one phone is paired; add a second to switch here.'],
+   deviceSwitching: ['正在切换到「{name}」，现在这部会先断开 CarPlay…', 'Switching to “{name}”; the current CarPlay ends first…'],
+   deviceUnsupported: ['这部盒子不能切换手机。', 'This box cannot switch phones.'], deviceNotPaired: ['这部手机没有配对，请先在盒子的设置页添加。', 'This phone is not paired; add it on the box settings page.'],
+-  deviceCable: ['现在用数据线连着 CarPlay，拔掉数据线后再切换。', 'CarPlay is using the cable; unplug it before switching.'],
++  deviceCable: ['这部盒子只能用数据线，不能切到无线。', 'This box only offers the cable; wireless is not available.'],
++  deviceWired: ['有线', 'Wired'], deviceWireless: ['无线', 'Wireless'], deviceStarting: ['正在连接', 'Connecting'], deviceSwitchingShort: ['正在切换…', 'Switching…'],
++  deviceNoCable: ['数据线上现在没有 iPhone。', 'No iPhone on the cable right now.'],
++  deviceCableOff: ['后台设置了「只用无线」，数据线不做 CarPlay。', 'The box is set to wireless only; the cable carries no CarPlay.'],
+   deviceCableDetail: ['数据线连接', 'On the USB cable'],
+   deviceBusy: ['正在切换，请稍等。', 'A switch is already in progress.'], deviceFail: ['切换失败，请稍后重试。', 'Switch failed. Try again later.'],
+   deviceNoPhones: ['还没有配对的手机。', 'No paired phones yet.'],
+-  playerSettings: ['画面与声音', 'Display and sound'], displaySettings: ['画面参数', 'Display settings'], performanceMode: ['高清画质', 'Sharper picture'], performanceModeHint: ['开：按 iPhone 能给的最清楚尺寸解码，再缩到窗口里，更清楚但更吃车机性能，画面卡就关掉；关：按窗口实际尺寸（最小宽度 720），更省但可能偏软', 'On: decode the sharpest size the iPhone offers and shrink it into the window, sharper but heavier (turn it off if the picture stutters); off: the window own size (min width 720), lighter but may look soft'], customSize: ['自定义分辨率', 'Custom resolution'], customSizeHint: ['关：跟随窗口。开：在下面「画面参数」里填宽度、高度，点「应用并重连」生效', 'Off: follow the window. On: enter width and height under Display settings below, then Apply and reconnect'], language: ['语言', 'Language'],
++  playerSettings: ['画面与声音', 'Display and sound'], playerSettingsHint: ['音量、声音输出、夜间、画质、语言', 'Volume, sound output, night, picture, language'], displaySettings: ['画面参数', 'Display settings'], performanceMode: ['高清画质', 'Sharper picture'], performanceModeHint: ['开：按 iPhone 能给的最清楚尺寸解码，再缩到窗口里，更清楚但更吃车机性能，画面卡就关掉；关：按窗口实际尺寸（最小宽度 720），更省但可能偏软', 'On: decode the sharpest size the iPhone offers and shrink it into the window, sharper but heavier (turn it off if the picture stutters); off: the window own size (min width 720), lighter but may look soft'], customSize: ['自定义分辨率', 'Custom resolution'], customSizeHint: ['关：跟随窗口。开：在下面「画面参数」里填宽度、高度，点「应用并重连」生效', 'Off: follow the window. On: enter width and height under Display settings below, then Apply and reconnect'], language: ['语言', 'Language'],
+   waiting: ['正在等待 iPhone', 'Waiting for iPhone'], waitingHint: ['已添加的 iPhone 打开蓝牙和 Wi-Fi 后会自动连接。第一次使用，请先添加 iPhone。', 'An added iPhone connects by itself with Bluetooth and Wi-Fi on. First time here? Add your iPhone.'],
+   connecting: ['正在连接盒子…', 'Connecting to receiver…'], reconnecting: ['连接中断，正在自动重连…', 'Disconnected. Reconnecting automatically…'],
+   starting: ['已连接，正在等待画面…', 'Connected. Waiting for video…'], live: ['已连接', 'Connected'],
+diff --git a/web/src/main.ts b/web/src/main.ts
+index b59e1e3..1b87ba3 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -91,45 +91,41 @@ function render() {
+   if (!devicesBlock.hidden) renderDevices();
+ }
+ 
+-// The box's paired phones, for switching CarPlay without touching the Wi-Fi: the current phone stays
+-// connected to the hotspot, only its CarPlay session ends and the chosen phone is invited over Bluetooth.
++// The box's ways in, one row each: "wired · phone" while an iPhone is plugged in, and "wireless · phone" for
++// every paired phone. Tapping a row moves CarPlay there; none of this touches how the box reaches the internet
++// (2026-10-31). A wireless row while CarPlay is on the cable turns the cable's CarPlay off (the cable keeps
++// charging and, if chosen, feeding the box); the wired row brings it back. Wi-Fi to the hotspot is never dropped.
+ interface BoxPhone { address: string; name: string; active?: boolean; last?: boolean; }
+-interface BoxPhones { supported?: boolean; phones?: BoxPhone[]; cable?: string | null; }
++interface BoxPhones { supported?: boolean; phones?: BoxPhone[]; cable?: string | null; wired?: string | null; wiredName?: string | null; }
++type WiredRow = 'live' | 'starting' | 'available';
+ const devicesBlock = el('devices-block');
+ const deviceList = el('device-list');
+ const devicesStatus = el('devices-status');
+ let boxPhones: BoxPhone[] = [];
+-/** The iPhone using CarPlay over the cable (its name), or null. Not a Bluetooth pairing; nothing switches meanwhile. */
+-let cablePhone: string | null = null;
++/** The wired row's state and the plugged iPhone's name, or null without a row. */
++let wiredRow: WiredRow | null = null;
++let wiredName = '';
+ let devicesLoading = false;
++/** 'cable' or a phone address while a switch request is under way. */
+ let switchingTo: string | null = null;
+ let deviceNotice = '';
+ const deviceAddress = (phone: BoxPhone) => `蓝牙 …${phone.address.slice(-5)}`;
++function deviceRow(label: string, detail: string, active: boolean, value: string, onPick: (() => void) | null) {
++  const row = document.createElement(onPick ? 'button' : 'div') as HTMLDivElement & HTMLButtonElement;
++  row.className = active ? 'cell on' : 'cell';
++  if (onPick) { row.type = 'button'; row.disabled = switchingTo !== null; row.onclick = onPick; }
++  const main = document.createElement('span'); main.className = 'main';
++  const name = document.createElement('b'); name.textContent = label;
++  const sub = document.createElement('span'); sub.textContent = detail;
++  main.append(name, sub);
++  const right = document.createElement('span'); right.className = 'value'; right.textContent = value;
++  row.append(main, right); deviceList.append(row);
++}
+ function renderDevices() {
+   deviceList.textContent = '';
+-  if (cablePhone) {
+-    const row = document.createElement('div'); row.className = 'cell on';
+-    const main = document.createElement('span'); main.className = 'main';
+-    const name = document.createElement('b'); name.textContent = cablePhone;
+-    const detail = document.createElement('span'); detail.textContent = t('deviceCableDetail');
+-    main.append(name, detail);
+-    const value = document.createElement('span'); value.className = 'value'; value.textContent = t('deviceInUse');
+-    row.append(main, value); deviceList.append(row);
+-    // The paired phones stay listed, as information only: switching waits until the cable is unplugged.
+-    for (const phone of boxPhones) {
+-      if (phone.name === cablePhone) continue;
+-      const other = document.createElement('div'); other.className = 'cell';
+-      const otherMain = document.createElement('span'); otherMain.className = 'main';
+-      const otherName = document.createElement('b'); otherName.textContent = phone.name || phone.address;
+-      const otherDetail = document.createElement('span'); otherDetail.textContent = deviceAddress(phone);
+-      otherMain.append(otherName, otherDetail);
+-      const otherValue = document.createElement('span'); otherValue.className = 'value'; otherValue.textContent = t('deviceIdle');
+-      other.append(otherMain, otherValue); deviceList.append(other);
+-    }
+-    devicesStatus.textContent = deviceNotice || t('deviceCable');
+-    return;
+-  }
+-  if (!boxPhones.length) {
++  const cableLive = wiredRow === 'live';
++  const rows = (wiredRow ? 1 : 0) + boxPhones.length;
++  if (!rows) {
+     const row = document.createElement('div'); row.className = 'cell';
+     const main = document.createElement('span'); main.className = 'main';
+     const text = document.createElement('span'); text.textContent = t('deviceNoPhones');
+@@ -137,28 +133,24 @@ function renderDevices() {
+     devicesStatus.textContent = deviceNotice;
+     return;
+   }
+-  // With one paired phone there is nothing to switch to: show it, not a button that invites itself.
+-  const canSwitch = boxPhones.length > 1;
++  // With a single row there is nothing to switch to: show it, not a button that picks itself.
++  const canSwitch = rows > 1;
++  if (wiredRow) {
++    const active = cableLive || wiredRow === 'starting';
++    const value = cableLive ? t('deviceInUse') : wiredRow === 'starting' ? t('deviceStarting')
++      : switchingTo === 'cable' ? t('deviceSwitchingShort') : t('deviceSwitch');
++    deviceRow(`${t('deviceWired')} · ${wiredName || 'iPhone'}`, t('deviceCableDetail'), active, value,
++      !active && canSwitch ? () => { void switchTo(null); } : null);
++  }
+   for (const phone of boxPhones) {
+-    const active = phone.active === true;
+-    // A div for the phone in use and for a single phone (nothing to do), buttons when there is a choice.
+-    const row = document.createElement(active || !canSwitch ? 'div' : 'button') as HTMLDivElement & HTMLButtonElement;
+-    row.className = active ? 'cell on' : 'cell';
+-    if (!active && canSwitch) row.type = 'button';
+-    const main = document.createElement('span'); main.className = 'main';
+-    const name = document.createElement('b'); name.textContent = phone.name || phone.address;
+-    const detail = document.createElement('span'); detail.textContent = phone.last && !active && canSwitch ? `${t('deviceLast')} · ${deviceAddress(phone)}` : deviceAddress(phone);
+-    main.append(name, detail);
+-    const value = document.createElement('span'); value.className = 'value';
+-    value.textContent = active ? t('deviceInUse')
+-      : switchingTo === phone.address ? t('deviceSwitching').replace('{name}', phone.name || phone.address)
++    // While CarPlay is on the cable no wireless row is in use (the box may still name the last one).
++    const active = !cableLive && wiredRow !== 'starting' && phone.active === true;
++    const label = `${t('deviceWireless')} · ${phone.name || phone.address}`;
++    const detail = phone.last && !active && canSwitch ? `${t('deviceLast')} · ${deviceAddress(phone)}` : deviceAddress(phone);
++    const value = active ? t('deviceInUse')
++      : switchingTo === phone.address ? t('deviceSwitchingShort')
+       : canSwitch ? t('deviceSwitch') : phone.last ? t('deviceLast') : t('deviceIdle');
+-    row.append(main, value);
+-    if (!active && canSwitch) {
+-      row.disabled = switchingTo !== null;
+-      row.onclick = () => { void switchPhone(phone); };
+-    }
+-    deviceList.append(row);
++    deviceRow(label, detail, active, value, !active && canSwitch ? () => { void switchTo(phone); } : null);
+   }
+   devicesStatus.textContent = deviceNotice || (canSwitch ? t('devicesHint') : t('devicesOne'));
+ }
+@@ -172,7 +164,11 @@ async function loadDevices() {
+     const body = await r.json() as BoxPhones;
+     if (!body.supported) { devicesBlock.hidden = true; return; }
+     boxPhones = Array.isArray(body.phones) ? body.phones : [];
+-    cablePhone = typeof body.cable === 'string' && body.cable ? body.cable : null;
++    const legacyCable = typeof body.cable === 'string' && body.cable ? body.cable : '';
++    // An older receiver only names the phone using CarPlay on the cable.
++    wiredRow = body.wired === 'live' || body.wired === 'starting' || body.wired === 'available' ? body.wired
++      : legacyCable ? 'live' : null;
++    wiredName = (typeof body.wiredName === 'string' && body.wiredName) || legacyCable;
+     devicesBlock.hidden = false;
+     renderDevices();
+   } catch {
+@@ -187,26 +183,36 @@ function deviceError(code: string): string {
+     case 'unsupported': return t('deviceUnsupported');
+     case 'not-paired': return t('deviceNotPaired');
+     case 'cable': return t('deviceCable');
++    case 'no-cable': return t('deviceNoCable');
++    case 'cable-off': return t('deviceCableOff');
+     case 'busy': return t('deviceBusy');
+     default: return t('deviceFail');
+   }
+ }
+-async function switchPhone(phone: BoxPhone) {
++/** phone null: the wired row. */
++async function switchTo(phone: BoxPhone | null) {
+   if (switchingTo) return;
+-  switchingTo = phone.address;
+-  deviceNotice = t('deviceSwitching').replace('{name}', phone.name || phone.address);
++  switchingTo = phone ? phone.address : 'cable';
+   renderDevices();
+   try {
+     const r = await fetch(`/api/phones/switch?token=${encodeURIComponent(token)}`, {
+-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address: phone.address }),
++      method: 'POST', headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify(phone ? { address: phone.address } : { cable: true }),
+     });
+     const body = await r.json().catch(() => ({})) as { error?: string };
+     if (!r.ok) throw new Error(body.error || '');
+-    // The phone in use loses CarPlay (not the Wi-Fi); show the chosen one as in use and confirm from
+-    // the box again in a few seconds, once the new session has set the presence state.
+-    boxPhones = boxPhones.map(entry => ({ ...entry, active: entry.address === phone.address }));
++    // The row in use loses CarPlay (not the Wi-Fi); show the chosen one as in use and confirm from the box
++    // again in a few seconds, once the new session is up.
++    if (phone) {
++      if (wiredRow) wiredRow = 'available';
++      boxPhones = boxPhones.map(entry => ({ ...entry, active: entry.address === phone.address }));
++    } else {
++      wiredRow = 'starting';
++      boxPhones = boxPhones.map(entry => ({ ...entry, active: false }));
++    }
+     deviceNotice = '';
+-    toast(t('deviceSwitching').replace('{name}', phone.name || phone.address));
++    toast(t('deviceSwitching').replace('{name}', phone ? `${t('deviceWireless')} · ${phone.name || phone.address}`
++      : `${t('deviceWired')} · ${wiredName || 'iPhone'}`));
+     window.setTimeout(() => { if (!devicesBlock.hidden) void loadDevices(); }, 8000);
+   } catch (error) {
+     deviceNotice = deviceError((error as Error).message);
+diff --git a/web/src/style.css b/web/src/style.css
+index 4b3146c..6ae8039 100644
+--- a/web/src/style.css
++++ b/web/src/style.css
+@@ -167,4 +167,7 @@ h2 { font-size:28px; line-height:1.15; font-weight:700; letter-spacing:-.02em; m
+ 
+ 
+ .audio-output-cell .main b { font-size:15px; line-height:1.4; }
+-
++/* The sheet's second level, "Display and sound" (2026-10-31): the first level only switches phones. */
++.group.more { margin-top:26px; }
++.more-body { padding:0 12px 16px; background:var(--bg, transparent); }
++.more-body > .group-title:first-child { margin-top:16px; }

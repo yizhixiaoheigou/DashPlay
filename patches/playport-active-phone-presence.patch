@@ -1,0 +1,218 @@
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -103,6 +103,8 @@
+     private var bootDeadline = 0L
+     @Volatile private var presenceLearned = false
+     @Volatile private var lastPeer: String? = null
++    private val presenceStateLock = Any()
++    private var presenceActive = false
+ 
+     private val sessionRecovery = WirelessSessionRecovery()
+     private val cableRecovery = CableRecovery()
+@@ -307,9 +309,13 @@
+         override fun onSessionActive(session: AirPlaySession) {
+             cableRecovery.cancel(); sessionRecovery.cancel()
+             log.info("CarPlay session active peer={}", session.host)
+-            activeSession = session
+-            connectedWirelessPhone = if (session === wiredSession) null else selectedPhone ?: config.bluetoothDeviceAddress
+-            connectedSession = session
++            synchronized(presenceStateLock) {
++                activeSession = session
++                connectedWirelessPhone = if (session === wiredSession) null else selectedPhone ?: config.bluetoothDeviceAddress
++                connectedSession = session
++                presenceActive = false
++                presenceLearned = false
++            }
+             sessionRecovery.active(connectedWirelessPhone)
+             bootInvite = false
+             invitedPhone = null
+@@ -318,20 +324,22 @@
+             handoffRetried = false
+             quickRetriesLeft = 0
+             lastPeer = session.host
+-            presenceLearned = false
+             hub.setSessionState(true, null)
+         }
+ 
+         override fun onSessionEnded(session: AirPlaySession) {
+             log.info("CarPlay session ended peer={}", session.host)
+-            if (activeSession !== session) return
+-            activeSession = null
+-            if (connectedSession === session) {
+-                if (!closed.get() && !cablePhone) sessionRecovery.ended(System.nanoTime() / 1_000_000)
+-                connectedSession = null
+-                connectedWirelessPhone = null
+-            }
+-            if (presenceHelper != null) presence("idle")
++            synchronized(presenceStateLock) {
++                if (activeSession !== session) return
++                activeSession = null
++                if (connectedSession === session) {
++                    if (!closed.get() && !cablePhone) sessionRecovery.ended(System.nanoTime() / 1_000_000)
++                    connectedSession = null
++                    connectedWirelessPhone = null
++                }
++                presenceActive = false
++                if (presenceHelper != null) presence("idle")
++            }
+             // A session the receiver closed itself to apply a new display is already being re-invited;
+             // flagging it as ended made the supervisor start a second invitation that cut off the first
+             // (fullscreen switch took 19 s instead of ~12 s, 2026-10-11).
+@@ -850,14 +858,7 @@
+                     }
+                     // The phone on the cable owns CarPlay; its session is no Wi-Fi presence either.
+                     if (cablePhone) { idleTimer.action(now, true, activeSession); continue }
+-                    // Learn the phone's Wi-Fi identity before an idle release can end its session: a phone invited
+-                    // right after pairing, with no page open, was released first and then never invited again,
+-                    // being unknown on this Wi-Fi (F50, 2026-10-19).
+-                    if (activeSession != null && !presenceLearned) lastPeer?.let { peer ->
+-                        selectedPhone?.let { phone ->
+-                            presenceLearned = presence("remember", peer, phone, activeSession?.controllerId.orEmpty())
+-                        }
+-                    }
++                    refreshWirelessPresence()
+                     when (idleTimer.action(now, hub.viewerCount > 0, activeSession)) {
+                         IdleAction.RELEASE -> {
+                             sessionRecovery.cancel()
+@@ -1034,6 +1035,19 @@
+     private fun displayKeepLinkMs(): Long =
+         System.getenv("CARPLAY_DISPLAY_KEEP_LINK_MS")?.toLongOrNull()?.coerceIn(0, 20_000) ?: 0L
+ 
++    /** Live-session ownership must not depend on ARP learning; the settings page needs it to disconnect.
++     * Serialize publication and idle clearing so a slow helper cannot resurrect a closed session.
++     * Only an actually active wireless session is reported, never an invitation or negotiation.
++     */
++    private fun refreshWirelessPresence(): Unit = synchronized(presenceStateLock) {
++        val session = connectedSession ?: return
++        val phone = connectedWirelessPhone ?: return
++        if (activeSession !== session || cablePhone) return
++        if (!presenceActive) presenceActive = presence("active", phone)
++        // Continue learning the Wi-Fi identity for normal invitations, independently of active reporting.
++        if (!presenceLearned) presenceLearned = presence("remember", session.host, phone, session.controllerId.orEmpty())
++    }
++
+     /** A lost live owner gets one attempt even after leaving our AP to provide a personal hotspot.
+      * This does not change the iPhone Wi-Fi switch, and does not renew failed negotiations.
+      */
+diff --git a/server/src/test/kotlin/com/playport/server/ActivePhonePresenceTest.kt b/server/src/test/kotlin/com/playport/server/ActivePhonePresenceTest.kt
+new file mode 100644
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/ActivePhonePresenceTest.kt
+@@ -0,0 +1,116 @@
++package com.playport.server
++
++import com.shilapi.xcertplay.airplay.*
++import java.net.Socket
++import java.nio.file.Files
++import java.nio.file.Path
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
++import org.junit.Assert.*
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++
++class ActivePhonePresenceTest {
++    @get:Rule val temp = TemporaryFolder()
++    private val phone = "02:00:00:00:00:01"
++    private fun field(server: CarPlayServer, name: String) = CarPlayServer::class.java.getDeclaredField(name).also { it.isAccessible = true }
++    private fun set(server: CarPlayServer, name: String, value: Any?) = field(server, name).set(server, value)
++    private fun listener(server: CarPlayServer) = field(server, "listener").get(server) as AirPlaySessionListener
++    private fun session(server: CarPlayServer) = AirPlaySession(Socket(), server.airPlayConfig, server.identity, PairingStore(), null, listener(server), object: AirPlayMediaHandler {})
++    private fun refresh(server: CarPlayServer) {
++        CarPlayServer::class.java.getDeclaredMethod("refreshWirelessPresence").also { it.isAccessible = true }.invoke(server)
++    }
++    private fun withServer(block: (CarPlayServer, Path) -> Unit) {
++        val root = temp.newFolder().toPath()
++        Files.writeString(root.resolve("presence.py"), """
++            import pathlib, sys, time
++            root = pathlib.Path(__file__).parent
++            command = sys.argv[1]
++            with (root / 'commands').open('a') as out: out.write(command + '\n')
++            if command == 'active':
++                if (root / 'hold').exists():
++                    (root / 'publishing').touch()
++                    deadline = time.monotonic() + 4
++                    while (root / 'hold').exists() and time.monotonic() < deadline:
++                        time.sleep(.01)
++                fail = root / 'fail-once'
++                if fail.exists():
++                    fail.unlink()
++                    sys.exit(1)
++                (root / 'active').write_text(sys.argv[2])
++            elif command == 'idle':
++                (root / 'active').write_text('')
++            else:
++                sys.exit(1)  # ARP learning fails throughout this reproduction.
++            print('ok')
++        """.trimIndent())
++        CarPlayServer(ServerConfig(identityDir = root, stateDir = root.resolve("state"), bindAddress = "127.0.0.1", wireless = true)).use {
++            set(it, "presenceHelper", root.resolve("presence.py").toString())
++            set(it, "selectedPhone", phone)
++            block(it, root)
++        }
++    }
++    @Test fun liveSessionIsPublishedEvenWhenArpLearningFails() = withServer { server, root ->
++        val live = session(server)
++        listener(server).onSessionActive(live)
++        refresh(server); refresh(server)
++        assertEquals(phone, Files.readString(root.resolve("active")))
++        assertEquals(1, Files.readAllLines(root.resolve("commands")).count { it == "active" })
++        live.close()
++        refresh(server)
++        assertEquals("", Files.readString(root.resolve("active")))
++    }
++    @Test fun failedPublicationIsRetried() = withServer { server, root ->
++        Files.writeString(root.resolve("fail-once"), "")
++        listener(server).onSessionActive(session(server))
++        refresh(server)
++        assertFalse(Files.exists(root.resolve("active")))
++        refresh(server)
++        assertEquals(phone, Files.readString(root.resolve("active")))
++    }
++    @Test fun negotiationAndWiredSessionsAreNotWirelessOwners() = withServer { server, root ->
++        val negotiating = session(server)
++        set(server, "activeSession", negotiating)
++        refresh(server)
++        assertFalse(Files.exists(root.resolve("active")))
++        val wired = session(server)
++        set(server, "wiredSession", wired)
++        listener(server).onSessionActive(wired)
++        refresh(server)
++        assertFalse(Files.exists(root.resolve("active")))
++    }
++    @Test fun oldCloseCannotEraseNewOwner() = withServer { server, root ->
++        val old = session(server)
++        listener(server).onSessionActive(old); refresh(server)
++        val next = session(server)
++        val nextPhone = "02:00:00:00:00:02"
++        set(server, "selectedPhone", nextPhone)
++        listener(server).onSessionActive(next); refresh(server)
++        old.close()
++        assertEquals(nextPhone, Files.readString(root.resolve("active")))
++        next.close()
++        assertEquals("", Files.readString(root.resolve("active")))
++    }
++    @Test fun closingDuringPublicationLeavesPresenceIdle() = withServer { server, root ->
++        val live = session(server)
++        listener(server).onSessionActive(live)
++        Files.createFile(root.resolve("hold"))
++        val executor = Executors.newFixedThreadPool(2)
++        try {
++            val publishing = executor.submit { refresh(server) }
++            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
++            while (!Files.exists(root.resolve("publishing")) && System.nanoTime() < deadline) Thread.sleep(10)
++            assertTrue("helper began publication", Files.exists(root.resolve("publishing")))
++            val ending = executor.submit { live.close() }
++            // The end callback waits for the in-flight publication before clearing it.
++            Files.delete(root.resolve("hold"))
++            publishing.get(8, TimeUnit.SECONDS)
++            ending.get(8, TimeUnit.SECONDS)
++            assertEquals("", Files.readString(root.resolve("active")))
++            assertEquals("idle", Files.readAllLines(root.resolve("commands")).last())
++        } finally {
++            executor.shutdownNow()
++        }
++    }
++}

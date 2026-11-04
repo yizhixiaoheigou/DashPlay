@@ -1,0 +1,103 @@
+Viewer log: how far the picture lags behind (2026-10-12).
+
+On the road some wired sessions lagged for their first ten-odd seconds and a replug cured it. The box's
+per-viewer send queue holds 1024 messages and drops only when full, so a slow moment on the car's Wi-Fi
+turns into lag instead of skipped frames. The page now pings once a second while CarPlay runs; the pong
+waits behind every queued frame, and the worst round trip of each 10-second report (a pong still on its
+way counts with its age) goes to the box log as lagMs.
+
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -79,6 +79,15 @@
+ assert.deepEqual(boxes(init),['ftyp','moov']);
+ assert.deepEqual(boxes(aacFragment(1,0,[new Uint8Array([1,2,3])])),['moof','mdat']);
+ assert.throws(()=>aacInit(48000,2,new Uint8Array()));
++{ // The pong waits behind every queued frame, so its round trip is how far the picture lags behind.
++  const {LagProbe}=await load('lag');const probe=new LagProbe();
++  probe.sent(0);probe.sent(1000);probe.pong(120);probe.pong(1900);
++  assert.deepEqual(probe.take(2000),{lagMs:900},'Worst round trip of the window');
++  assert.deepEqual(probe.take(3000),{},'Nothing measured, nothing reported');
++  probe.sent(3000);probe.sent(4000);
++  assert.deepEqual(probe.take(14000),{lagMs:11000},'A pong still queued counts with its age, so a lag beyond the window shows');
++  probe.reset();assert.deepEqual(probe.take(15000),{},'A new connection starts clean');
++  for(let i=0;i<100;i++)probe.sent(i);assert.ok(probe.pending<=30,'No unbounded list when pongs never come'); }
+ const {isNight,parseNightMode}=await load('night');
+ const at=(h,m)=>new Date(2026,9,10,h,m);
+ assert.equal(parseNightMode(null),'schedule');assert.equal(parseNightMode('bogus'),'schedule');assert.equal(parseNightMode('system'),'system');
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -4,6 +4,7 @@
+ import { VideoPlayer } from './video';
+ import { Connection } from './ws';
+ import { SystemMedia } from './media-session';
++import { LagProbe } from './lag';
+ import { shownSize, suggestedResolution, aspectChanged, closeShape } from './display-fit';
+ import { t, language, setLanguage, type Key } from './i18n';
+ import { isNight, parseNightMode } from './night';
+@@ -84,6 +85,7 @@
+   lastPaintAt = now;
+ }, () => send({ type:'keyframe' }), fit);
+ const audio = new AudioEngine(error);
++const lag = new LagProbe();
+ const media = new SystemMedia(send, () => { void audio.unlock().catch(error); }, () => audio.pauseMusic());
+ const microphone = new MicrophoneUplink((payload, opus) => {
+   const frame = new Uint8Array(payload.length + 1); frame[0] = opus ? 0x11 : 0x10; frame.set(payload, 1); connection.sendBinary(frame);
+@@ -116,12 +118,13 @@
+   sentNight = night; send({ type:'night', night });
+ }
+ function reset() {
+-  sentNight = null;
++  sentNight = null; lag.reset();
+   active = painted = false; input.reset(); canvas.inert = true;
+   video.close(); audio.stopAll(); media.setActive(false); void microphone.stop();
+   canvas.getContext('2d')?.clearRect(0,0,canvas.width,canvas.height);
+ }
+ function server(message: ServerMessage) {
++  if (message.type === 'pong') { lag.pong(performance.now()); return; }
+   if(message.type === 'artwork' && message.artwork) { media.setArtwork(message.revision ?? 0,message.artwork); return; }
+   if (message.type === 'now-playing' && message.nowPlaying) { media.setMetadata(message.nowPlaying); return; }
+   if (message.type === 'host-ui' && active) {
+@@ -268,12 +271,14 @@
+   if(!element) return {};
+   return {elTime:Math.round(element.currentTime),elDur:Number.isFinite(element.duration)?Math.round(element.duration):-1};
+ }
++// Once a second while CarPlay runs: the pong comes back behind every frame still queued for this page.
++window.setInterval(()=>{ if (active) { lag.sent(performance.now()); connection.send({type:'ping'}); } },1000);
+ window.setInterval(()=>{
+   const now=performance.now(),seconds=Math.max(1,(now-reportStart)/1000);
+   send({type:'stats',stats:{fps:reportFrames/seconds,decodeMs:video.decodeLatencyMs,queue:video.decodeQueueSize,
+     kbps:reportBytes*8/1000/seconds,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,
+     width:canvas.width,height:canvas.height,...(touchCount?{touchMs:touchSum/touchCount,touches:touchCount}:{}),...(musicBytes?{musicKbps:musicBytes*8/1000/seconds}:{}),
+-    chrome:chromeMajor,webView,...media.report(),...musicTimeline(),...video.takeStalls()}});
++    chrome:chromeMajor,webView,...media.report(),...musicTimeline(),...video.takeStalls(),...lag.take(performance.now())}});
+   reportFrames=0;reportBytes=0;reportStart=now;touchSum=0;touchCount=0;musicBytes=0;
+ },10000);
+ render();fit();if(token) connection.connect();
+--- /dev/null
++++ b/web/src/lag.ts
+@@ -0,0 +1,25 @@
++/**
++ * How far the picture lags behind: the box answers a ping with a pong queued behind every frame it has not
++ * sent yet (its send queue, then the TCP buffers), so the round trip grows with any backlog on the way.
++ */
++export class LagProbe {
++  private readonly queue: number[] = [];
++  private worst = -1;
++  get pending() { return this.queue.length; }
++  sent(now: number) {
++    this.queue.push(now);
++    if (this.queue.length > 30) this.queue.shift();
++  }
++  pong(now: number) {
++    const at = this.queue.shift();
++    if (at !== undefined) this.worst = Math.max(this.worst, now - at);
++  }
++  /** The window's worst round trip, counting a pong still on its way by its age; then a new window. */
++  take(now: number): Record<string, number> {
++    const waiting = this.queue.length ? now - this.queue[0] : -1;
++    const lag = Math.max(this.worst, waiting);
++    this.worst = -1;
++    return lag >= 0 ? { lagMs: Math.round(lag) } : {};
++  }
++  reset() { this.queue.length = 0; this.worst = -1; }
++}

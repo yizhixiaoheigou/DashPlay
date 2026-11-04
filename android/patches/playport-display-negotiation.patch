@@ -1,0 +1,122 @@
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -44,6 +44,8 @@
+ let urgentChange = '';
+ /** This page asked for a renegotiation: keep the layout of the picture on screen until the new one comes. */
+ let expectRestart = false, expectTimer = 0;
++// An HTTP display acknowledgement is not a completed CarPlay negotiation.
++let displayNegotiating = false;
+ interface Display { width: number; height: number; fps: number; uiScale: number; hevc: boolean; areas?: Area[]; area?: number; pending?: boolean; }
+ let display: Display | null = null;
+ let initialVideoTarget: Pick<Display, 'width' | 'height' | 'hevc'> | null = null;
+@@ -296,6 +298,9 @@
+ }
+ const hevcSupport = probeHevc().then(supported => { hevcDecodes = supported; });
+ const fastDecoder = () => readFlag('f50-fast-decoder') === '1';
++// Learning that decoding is fast must not interrupt a working picture to upgrade it.
++// Use that hint on the next page load; slow-decoder fallback still takes effect now.
++let pageFastDecoder = fastDecoder();
+ function wantHevc() {
+   const codec = el<HTMLSelectElement>('codec').value;
+   return codec === 'h265' || (codec === 'auto' && hevcDecodes && readFlag('f50-hevc-failed') !== '1');
+@@ -306,8 +311,8 @@
+   if (!(decodeMs > 0) || fps < 5) return;
+   fastReports = decodeMs < 12 ? fastReports + 1 : 0;
+   slowReports = decodeMs > 40 ? slowReports + 1 : 0;
+-  if (fastReports >= 3 && !fastDecoder()) { saveFlag('f50-fast-decoder', '1'); lastAutoTarget = ''; scheduleAuto(); }
+-  if (slowReports >= 3 && fastDecoder()) { saveFlag('f50-fast-decoder', '0'); lastAutoTarget = ''; scheduleAuto(); }
++  if (fastReports >= 3 && !fastDecoder()) saveFlag('f50-fast-decoder', '1');
++  if (slowReports >= 3 && fastDecoder()) { saveFlag('f50-fast-decoder', '0'); pageFastDecoder = false; lastAutoTarget = ''; urgentChange = 'decoder'; scheduleAuto(); }
+ }
+ /** Automatic display only, once per browser: 60 fps chosen again by hand afterwards stays. */
+ let behindRun = 0;
+@@ -324,8 +329,12 @@
+ const video = new VideoPlayer(canvas, error, () => {
+   if (!active) return;
+   if (!shownOnce) { startup.mark('firstFrameMs'); connection.send({type:'stats', stats:{ev:16,...startupStats()}}); }
++  const firstPicture = !painted;
+   frames++; reportFrames++; hudFrames++; painted = true; shownOnce = true; el('overlay').hidden = true; el('app').dataset.live = 'true';
+   if (holding) { holding = false; el('toast').hidden = true; fit(); }
++  if (firstPicture || displayNegotiating) {
++    displayNegotiating = false; scheduleAuto();
++  }
+   if (wokeAt) { lifeEvent(14, { pictureMs: Math.round(performance.now() - wokeAt) }); wokeAt = 0; }
+   const now = performance.now();
+   if (input.lastDownAt > handledDownAt) {
+@@ -690,7 +699,9 @@
+   displayBusy = true; el<HTMLButtonElement>('apply').disabled = true; el<HTMLFieldSetElement>('display-fields').disabled = true;
+   el('display-status').textContent = t('applying');
+   // A renegotiation is coming: hold the layout from now, the session's end may arrive before this answer.
+-  const restart = active && !how.defer && (!display || !sameStream(display, target));
++  const changed = !how.defer && (!display || !sameStream(display, target));
++  if (changed) displayNegotiating = true;
++  const restart = active && changed;
+   if (restart) { expectRestart = true; window.clearTimeout(expectTimer); expectTimer = window.setTimeout(() => { endExpectRestart(); fit(); }, DISPLAY_HOLD_MS); }
+   const abort = new AbortController(), timer = window.setTimeout(() => abort.abort(), 5000);
+   try {
+@@ -699,7 +710,7 @@
+     const body = await r.json() as {ok?:boolean; deferred?:boolean}; if (!r.ok || !body.ok) throw new Error();
+     if (body.deferred) { if (display) display.pending = true; el('display-status').textContent = t('deferred'); return true; }
+     display = { ...target, pending: false }; el('display-status').textContent = t('applied'); return true;
+-  } catch { if (restart) { endExpectRestart(); fit(); } el('display-status').textContent = t('applyFail'); return false; }
++  } catch { if (changed) displayNegotiating = false; if (restart) { endExpectRestart(); fit(); } el('display-status').textContent = t('applyFail'); return false; }
+   finally { window.clearTimeout(timer); displayBusy=false; el<HTMLButtonElement>('apply').disabled=false; el<HTMLFieldSetElement>('display-fields').disabled=false; render(); }
+ }
+ function scheduleAuto() {
+@@ -710,7 +721,12 @@
+ async function adapt() {
+   // Not for a hidden page (a covered page reports a small window) nor while fullscreen waits for its tap; a timer
+   // set just before the car covered the page fired anyway and renegotiated to 800x400 (Chrome, 2026-10-12).
+-  const busy = () => !display || !autoFitOn() || displayBusy || document.hidden || (wantFullscreen && !document.fullscreenElement);
++  // Size changes during negotiation are coalesced: after the first new frame,
++  // recompute the latest viewport instead of aborting iAP2 every time it changes.
++  const explicit = () => urgentChange === 'manual' || urgentChange === 'codec' || urgentChange === 'decoder';
++  const busy = () => !display || !autoFitOn() || displayBusy || document.hidden
++    || (!explicit() && (!active || !painted || displayNegotiating))
++    || (wantFullscreen && !document.fullscreenElement);
+   if (busy()) return;
+   // From the box's own, not what this page last saw: fps and size set by another page are kept, not sent back.
+   const current = await fetchDisplay();
+@@ -721,8 +737,15 @@
+   const next={...display,width:target.width,height:target.height,areas:[],area:0,hevc:wantHevc()};
+   const key=`${next.width}x${next.height}${next.hevc?'-h265':''}`;
+   if (key===lastAutoTarget) return;
++  // A fresh origin (e.g. DHCP gave the box another address) has no decoder history.
++  // Do not downgrade/restart an already decoded stream of this window's shape.
++  const initialCompatible = !lastAutoTarget && !urgent && active && painted
++    && !(display.areas?.length) && !aspectChanged(display, next)
++    && el<HTMLSelectElement>('codec').value === 'auto'
++    && (!display.hevc || (hevcDecodes && readFlag('f50-hevc-failed') !== '1'));
+   // Avoid a reconnect loop even when another viewer has a different screen shape.
+   lastAutoTarget=key;
++  if (initialCompatible) return;
+   if (sameStream(display,next)) return;
+   // Every window size (and a codec this browser proved it can or cannot handle) renegotiates now: each size is its
+   // own CarPlay session at its sharpest resolution (2026-10-23).
+@@ -733,8 +756,8 @@
+  *  with a fast decoder), long side 1280 to 1920 (2560 with a fast decoder). Each window size is its own CarPlay
+  *  session (2026-10-23: one stream shared by several window shapes made small windows soft and cramped). */
+ function autoTarget() {
+-  const pixels=fastDecoder()?Math.min(2,Math.max(1,window.devicePixelRatio||1)):1;
+-  const max=fastDecoder()?2560:1920, width=screen.clientWidth*pixels, height=screen.clientHeight*pixels;
++  const pixels=pageFastDecoder?Math.min(2,Math.max(1,window.devicePixelRatio||1)):1;
++  const max=pageFastDecoder?2560:1920, width=screen.clientWidth*pixels, height=screen.clientHeight*pixels;
+   return performanceOn() ? suggestedResolution(width,height,max) : windowResolution(width,height,max);
+ }
+ el<HTMLSelectElement>('codec').value = readFlag('f50-codec') || 'auto';
+@@ -776,9 +799,15 @@
+   const v = window.visualViewport, d = window.screen;
+   return { build:BUILD, iw:window.innerWidth, ih:window.innerHeight, vw:Math.round(v?.width ?? -1), vh:Math.round(v?.height ?? -1),
+     vt:Math.round(v?.offsetTop ?? -1), sw:d.width, sh:d.height, sah:d.availHeight, oh:window.outerHeight,
++    ow:window.outerWidth, sx:window.screenX, sy:window.screenY, scrollX:Math.round(window.scrollX), scrollY:Math.round(window.scrollY),
++    focused:document.hasFocus()?1:0, pageFast:pageFastDecoder?1:0, negotiating:displayNegotiating?1:0,
+     dpr:Math.round(window.devicePixelRatio*100) };
+ }
+ // ev 5: the window changed size (debounced), with what the browser says of it.
++// Correlate a real gesture with browser geometry; no pointer coordinates or page titles.
++for (const [name, ev] of [['pointerdown', 19], ['pointerup', 20]] as const) {
++  surface.addEventListener(name, () => pageEvent(ev), { passive: true });
++}
+ let resizeTimer = 0;
+ window.addEventListener('resize', () => { window.clearTimeout(resizeTimer); resizeTimer = window.setTimeout(() => pageEvent(5), 400); });
+ window.setInterval(()=>{

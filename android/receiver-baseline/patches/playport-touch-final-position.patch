@@ -1,0 +1,135 @@
+# Preserve every unsent final pointer position before release, independent of viewport size.
+# The phone owns gesture recognition; do not turn sub-1% drags into down/up-only reports.
+diff --git a/web/src/input.ts b/web/src/input.ts
+--- a/web/src/input.ts
++++ b/web/src/input.ts
+@@ -8,8 +8,8 @@
+   x: number;
+   y: number;
+   down: boolean;
+-  startX: number;
+-  startY: number;
++  sentX: number;
++  sentY: number;
+ }
+ 
+ const emptyKnob = (overrides: Partial<KnobState> = {}): KnobState => ({
+@@ -60,7 +60,7 @@
+     this.surface.focus({ preventScroll: true });
+     this.surface.setPointerCapture(event.pointerId);
+     const x = this.normalizeX(event.clientX), y = this.normalizeY(event.clientY);
+-    this.pointers.set(event.pointerId, { slot: this.nextSlot(), x, y, down: true, startX: x, startY: y });
++    this.pointers.set(event.pointerId, { slot: this.nextSlot(), x, y, down: true, sentX: x, sentY: y });
+     this.flush();
+     this.lastDownAt = performance.now();
+   };
+@@ -82,9 +82,9 @@
+     if (event.type === 'pointerup') {
+       pointer.x = this.normalizeX(event.clientX);
+       pointer.y = this.normalizeY(event.clientY);
+-      // A swipe that moved sends its final point as a move before the up: the animation-frame flush can be
+-      // starved while the page decodes, and an up alone at the end reads as a tap on the phone (2026-10-23).
+-      if (Math.abs(pointer.x - pointer.startX) > 0.01 || Math.abs(pointer.y - pointer.startY) > 0.01) this.flush();
++      // RAF may not have sent the final move yet. Preserve even short drags and returns to the
++      // starting point; gesture thresholds belong to the phone, not to the viewer window size.
++      if (pointer.x !== pointer.sentX || pointer.y !== pointer.sentY) this.flush();
+     }
+     pointer.down = false;
+     this.flush();
+@@ -172,6 +172,8 @@
+         contacts.push({ id: contacts.length, x: 0, y: 0, down: false });
+       }
+       contacts[pointer.slot] = { id: pointer.slot, x: pointer.x, y: pointer.y, down: pointer.down };
++      pointer.sentX = pointer.x;
++      pointer.sentY = pointer.y;
+     }
+     this.send({ type: 'touch', contacts });
+   }
+diff --git a/web/check.mjs b/web/check.mjs
+--- a/web/check.mjs
++++ b/web/check.mjs
+@@ -54,37 +54,71 @@
+ key('ArrowLeft', new Element('button'));
+ assert.equal(messages.pop().knob.x, -127, 'Navigation still works after clicking a toolbar button');
+ 
+-const pointer = (id, x, y) => ({ pointerId: id, clientX: x, clientY: y, preventDefault() {} });
+-listeners.get('pointerdown')(pointer(1, 300, 162.5));
++const pointer = (id, x, y) => ({ pointerId: id, clientX: x, clientY: y, button: 0, preventDefault() {} });
++const emit = (type, event) => listeners.get(type)({ ...event, type });
++emit('pointerdown', pointer(1, 300, 162.5));
+ flush();
+ assert.deepEqual(messages.pop().contacts, [{ id: 0, x: .5, y: .5, down: true }]);
+ rect = { left: 100, top: 50, width: 225, height: 400 };
+-listeners.get('pointermove')(pointer(1, 212.5, 250));
+-listeners.get('pointerdown')(pointer(2, 500, 0));
+-listeners.get('pointerdown')(pointer(3, 200, 100));
++emit('pointermove', pointer(1, 212.5, 250));
++emit('pointerdown', pointer(2, 500, 0));
++emit('pointerdown', pointer(3, 200, 100));
+ flush();
+ assert.deepEqual(messages.pop().contacts, [{ id: 0, x: .5, y: .5, down: true }, { id: 1, x: 1, y: 0, down: true }]);
+-listeners.get('pointerup')(pointer(1, 0, 0));
+-listeners.get('pointercancel')(pointer(2, 0, 0));
++emit('pointerup', pointer(1, 0, 0));
++emit('pointercancel', pointer(2, 0, 0));
+ flush();
+ assert.ok(messages.pop().contacts.every(c => !c.down), 'Release every contact, including cancelled touches');
+ messages.length = 0;
+ // A complete quick click may happen before the next animation frame.
+ messages.length = 0;
+-listeners.get('pointerdown')(pointer(7, 212.5, 250));
+-listeners.get('pointerup')(pointer(7, 212.5, 250));
++emit('pointerdown', pointer(7, 212.5, 250));
++emit('pointerup', pointer(7, 212.5, 250));
+ flush();
+ assert.ok(messages.some(m => m.contacts?.some(c => c.down)), 'A quick tap must deliver a down report');
+ assert.deepEqual(messages.at(-1).contacts, [{ id: 0, x: .5, y: .5, down: false }], 'Lift preserves the hit target');
+ messages.length = 0;
+-listeners.get('pointerdown')(pointer(8, 212.5, 250));
+-listeners.get('pointerdown')(pointer(9, 212.5, 250));
+-listeners.get('pointerup')(pointer(8, 212.5, 250));
+-listeners.get('pointermove')(pointer(9, 212.5, 250));
++emit('pointerdown', pointer(8, 212.5, 250));
++emit('pointerdown', pointer(9, 212.5, 250));
++emit('pointerup', pointer(8, 212.5, 250));
++emit('pointermove', pointer(9, 212.5, 250));
+ flush();
+ assert.equal(messages.at(-1).contacts[1].id, 1, 'Second finger retains its HID slot');
+ assert.equal(messages.at(-1).contacts[0].down, false);
+ controller.reset();
++rect = { left: 0, top: 0, width: 1300, height: 638 };
++// A short drag must not become only down/up when RAF has not run yet.
++for (const [dx, dy] of [[3, 0], [8, 0], [12, 0], [0, 3], [0, 6], [40, 0]]) {
++  messages.length = 0;
++  emit('pointerdown', pointer(1, 700, 560));
++  emit('pointermove', pointer(1, 700 - dx, 560 - dy));
++  emit('pointerup', pointer(1, 700 - dx, 560 - dy));
++  flush();
++  assert.equal(messages.length, 3, `Short drag ${dx},${dy} must send down/move/up before RAF`);
++  assert.deepEqual(messages[1].contacts, [{ id: 0, x: (700 - dx) / 1300, y: (560 - dy) / 638, down: true }]);
++  assert.equal(messages[2].contacts[0].down, false);
++}
++// Returning to the start still needs a move if the last sent position was elsewhere.
++messages.length = 0;
++emit('pointerdown', pointer(1, 700, 560));
++emit('pointermove', pointer(1, 600, 560)); flush();
++emit('pointerup', pointer(1, 700, 560)); flush();
++assert.equal(messages.length, 4);
++assert.deepEqual(messages[2].contacts, [{ id: 0, x: 700 / 1300, y: 560 / 638, down: true }]);
++// Do not duplicate a move already sent, or invent movement for a stationary tap/cancel.
++for (const type of ['pointerup', 'pointercancel']) {
++  messages.length = 0;
++  emit('pointerdown', pointer(1, 700, 560));
++  emit('pointermove', pointer(1, 600, 560)); flush();
++  emit(type, pointer(1, type === 'pointercancel' ? 0 : 600, type === 'pointercancel' ? 0 : 560)); flush();
++  assert.equal(messages.length, 3);
++  assert.deepEqual(messages[2].contacts, [{ id: 0, x: 600 / 1300, y: 560 / 638, down: false }]);
++}
++messages.length = 0;
++emit('pointerdown', pointer(1, 700, 560));
++emit('pointerup', pointer(1, 700, 560)); flush();
++assert.equal(messages.length, 2);
++controller.reset();
+ controller.detach();
+ assert.equal(listeners.size, 0);
+ console.log('Viewer input check passed: keyboard isolation, native controls, portrait/landscape coordinates, multi-touch, and release.');

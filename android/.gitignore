@@ -8,3 +8,6 @@ release-keystore.properties
 # The root .gitignore drops Gradle wrappers; this one pins the Gradle version for the app build.
 !gradle/wrapper/gradle-wrapper.jar
 !gradle/wrapper/gradle-wrapper.properties
+# CMake/NDK scratch output from externalNativeBuild
+.cxx/
+.kotlin/

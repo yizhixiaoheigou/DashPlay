@@ -122,10 +122,13 @@ def choose_phone(state, present, paired, newly_paired=None, now=0.0):
     return next((phone for phone in state.get('phones', {}) if phone in eligible), None)
 
 
-def invite_phone(state, paired):
+def invite_phone(state, paired, cable_phone=None):
     """Whom to invite without a presence proof (boot, cable just pulled): the last wireless user, or
     the only paired phone. A phone used on the USB cable only was never remembered (2026-10-12)."""
     paired = paired - set(state.get('paused', []))
+    if cable_phone:
+        # A known cable identity must not silently invite a different owner if it is unpaired/paused.
+        return cable_phone if cable_phone in paired else None
     if state.get('last_phone') in paired:
         return state['last_phone']
     return next(iter(paired)) if len(paired) == 1 else None
@@ -338,11 +341,32 @@ def main():
                     state, now, lambda: asyncio.run(paired_phones())))
                 ok = bool(output)
         elif command == 'unplugged':
-            output = invite_phone(state, paired_cached(state, now, lambda: asyncio.run(paired_phones())))
+            output = invite_phone(state, paired_cached(state, now, lambda: asyncio.run(paired_phones())),
+                                  sys.argv[2].upper() if len(sys.argv) > 2 else None)
             ok = bool(output)
+        elif command == 'active':
+            # Report an authenticated live session, not an ARP inference. A phone can
+            # stream CarPlay while ignoring raw ARP (N1 AP+STA); the settings page
+            # must still expose its disconnect/switch controls. Pause remains intact.
+            phone = sys.argv[2].upper()
+            if re.fullmatch(r'(?:[0-9A-F]{2}:){5}[0-9A-F]{2}', phone) and phone in paired_cached(
+                    state, now, lambda: asyncio.run(paired_phones())):
+                state['active'] = state['last_phone'] = phone
+                ok = True
         elif command == 'idle':
             state.pop('active', None)
             ok = True
+        elif command == 'pause':
+            # The viewer uses the same durable pause list and presence lock as PairingWindow._disconnect.
+            phone = sys.argv[2].upper()
+            if phone in paired_cached(state, now, lambda: asyncio.run(paired_phones())):
+                state['paused'] = sorted(set(state['paused']) | {phone})
+                grant_phone(paused_path, {'phones': state['paused']})
+                with paused_path.open('rb') as saved:
+                    os.fsync(saved.fileno())
+                if _read_json(request_path).get('phone') == phone:
+                    request_path.unlink(missing_ok=True)
+                ok = True
         elif command == 'decline':
             phone = sys.argv[2].upper()
             if phone in state['phones'] or phone == pending_phone(request_path, boot, now):

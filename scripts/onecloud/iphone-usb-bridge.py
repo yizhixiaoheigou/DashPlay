@@ -148,7 +148,7 @@ IPHETH_BIND = Path("/sys/bus/usb/drivers/ipheth/bind")
 # box's internet over the cable (USB_TETHER_MARK) is decided separately. Configuration 4, the iPhone's own
 # hotspot configuration, cannot replace this: ipheth binds but the carrier stays 0 and no lease is asked for
 # (dp-0017, measured). Configuration 6 with only ipheth bound comes up (carrier 1, a 172.20.10.x lease), so
-# the bridge still selects it and then stays out of its CarPlay functions (usbmux, NCM).
+# the bridge selects it. USB sharing authenticates over USBMUX, without carkit or CarPlay NCM.
 CABLE_OFF_ENV = "CARPLAY_CABLE_OFF_FILE"
 
 
@@ -190,10 +190,15 @@ def report_tether_interface(device):
 def wait_for_unplug(device):
     """Block until the iPhone leaves; the receiver starts the bridge again when it returns."""
     node_name = device.name
-    while apple_device() is not None and Path(device).exists():
-        time.sleep(2)
-    # Not "usb ...": the receiver reads every "usb <state>" line as a state, and "usb iphone ... gone" read as a
-    # new iPhone on the cable paused wireless and ended a wireless session on unplug (2026-10-31, Xs).
+    try:
+        generation = (device / 'devnum').read_text()
+        while apple_device() is not None and (device / 'devnum').read_text() == generation:
+            time.sleep(2)
+    except FileNotFoundError:
+        pass
+    # Report the unplug before the next helper starts, even if the phone is already plugged back in.
+    # The USB device number distinguishes a quick replug at the same sysfs path.
+    log('usb waiting')
     log(f"iPhone {node_name} unplugged")
 
 
@@ -318,6 +323,42 @@ def prepare_carplay(serial, off, stream=None, environ=None):
     return off
 
 
+def relay_usbmux(fd, mux):
+    number, out_ep, in_ep = mux
+    stdout = sys.stdout.buffer
+    stdout_lock = threading.Lock()
+
+    def from_phone():
+        while True:
+            try:
+                # A timed-out synchronous USBDEVFS_BULK can discard actual_length bytes.
+                # Keep this IN request pending; device errors/process termination still end it.
+                data = bulk(fd, in_ep, timeout=0)
+            except OSError as error:
+                if error.errno == errno.ETIMEDOUT:
+                    continue
+                log(f"USBMUX read ended: {error.strerror}")
+                os._exit(0)
+            if data:
+                with stdout_lock:
+                    stdout.write(struct.pack(">I", len(data)) + data)
+                    stdout.flush()
+
+    threading.Thread(target=from_phone, daemon=True).start()
+    stdin = sys.stdin.buffer
+    while True:
+        header = stdin.read(4)
+        if len(header) < 4:
+            return 0
+        (length,) = struct.unpack(">I", header)
+        data = stdin.read(length)
+        try:
+            bulk(fd, out_ep, data, timeout=2000)
+        except OSError as error:
+            log(f"USBMUX write failed: {error.strerror}")
+            return 0
+
+
 def main():
     if ROLE.exists() and ROLE.read_text().strip() != "host":
         ROLE.write_text("none\n")
@@ -338,12 +379,12 @@ def main():
     device = carplay_configuration(device)
     release_tethering(device)
     if off:
-        # Stay out of usbmux/NCM, so the iPhone gets no CarPlay on this cable. Its USB internet interface is
-        # bound or released by release_tethering above, exactly as with CarPlay on the cable.
+        # Keep CarPlay NCM closed. USBMUX may still authenticate sharing when both receiver and owner allow it.
         release_carplay_ncm(device)
         report_tether_interface(device)
-        wait_for_unplug(device)
-        return
+        if not (USB_TETHER_MARK.exists() and os.environ.get('CARPLAY_USB_TETHER_MUX') == '1'):
+            wait_for_unplug(device)
+            return
     mux = None
     for path in sorted(device.parent.glob(f"{device.name}:{CARPLAY_CONFIGURATION}.*")):
         values = interface_values(path)
@@ -352,8 +393,8 @@ def main():
                          if (e / "type").read_text().strip() == "Bulk"]
             mux = (int(values["bInterfaceNumber"], 16), next(e for e in endpoints if not e & 0x80),
                    next(e for e in endpoints if e & 0x80))
-    functions = ncm_functions(device)
-    if mux is None or not functions:
+    functions = [] if off else ncm_functions(device)
+    if mux is None or (not off and not functions):
         raise RuntimeError(f"CarPlay configuration incomplete: usbmux={mux} ncm={functions}")
     # Two NCM functions; the iPhone picks one for CarPlay ("USB DirectLink", its en2): it connected over
     # the one we were not bridging and timed out (2026-10-12). Bridge both onto the TAP, learning which
@@ -366,6 +407,14 @@ def main():
                 ((path / "driver").resolve() / "unbind").write_text(path.name)
     fd = os.open(node(device), os.O_RDWR)
     claim(fd, device, mux[0])
+    if off:
+        # Authenticate USB sharing without opening carkit, claiming CarPlay NCM, or inviting wired CarPlay.
+        log('tethermux ready')
+        def unplugged():
+            wait_for_unplug(device)
+            os._exit(0)
+        threading.Thread(target=unplugged, daemon=True).start()
+        return relay_usbmux(fd, mux)
     for control, data, *_ in functions:
         for number in (control, data):
             claim(fd, device, number)
@@ -434,39 +483,7 @@ def main():
             threading.Thread(target=status, args=(index, function[5]), daemon=True).start()
     threading.Thread(target=tap_to_ncm, daemon=True).start()
 
-    number, out_ep, in_ep = mux
-    stdout = sys.stdout.buffer
-    stdout_lock = threading.Lock()
-
-    def from_phone():
-        while True:
-            try:
-                # A timed-out synchronous USBDEVFS_BULK can discard actual_length bytes.
-                # Keep this IN request pending; device errors/process termination still end it.
-                data = bulk(fd, in_ep, timeout=0)
-            except OSError as error:
-                if error.errno == errno.ETIMEDOUT:
-                    continue
-                log(f"USBMUX read ended: {error.strerror}")
-                os._exit(0)
-            if data:
-                with stdout_lock:
-                    stdout.write(struct.pack(">I", len(data)) + data)
-                    stdout.flush()
-
-    threading.Thread(target=from_phone, daemon=True).start()
-    stdin = sys.stdin.buffer
-    while True:
-        header = stdin.read(4)
-        if len(header) < 4:
-            return 0
-        (length,) = struct.unpack(">I", header)
-        data = stdin.read(length)
-        try:
-            bulk(fd, out_ep, data, timeout=2000)
-        except OSError as error:
-            log(f"USBMUX write failed: {error.strerror}")
-            return 0
+    return relay_usbmux(fd, mux)
 
 
 if __name__ == "__main__":

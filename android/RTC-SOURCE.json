@@ -1,0 +1,96 @@
+{
+  "libdatachannel": {
+    "version": "0.24.6",
+    "url": "https://github.com/paullouisageneau/libdatachannel",
+    "commit": "6b1e2e620f1e37f0eafeee702eaea0043cb305fd"
+  },
+  "mbedTLS": {
+    "version": "3.6.7",
+    "url": "https://github.com/Mbed-TLS/mbedtls",
+    "commit": "068ff080b369adfac81509f9b57b2afabaf82dc5"
+  },
+  "minimumAndroidApi": 21,
+  "ndk": "27.0.12077973",
+  "buildScript": "scripts/build-rtc-library.sh",
+  "abiSha256": {
+    "armeabi-v7a": "581ab3762e0a85ed61180d595116d5e6f8aead92527096452c048a61973e61bd",
+    "arm64-v8a": "a94331e17ae3acdc9b85b4a5cbed645704b4de4804a9a080b2ad9c4514201f9f"
+  },
+  "notes": [
+    "Both ABIs rebuilt with DTLS-SRTP enabled and mbedTLS 3.6.7 (DTLS ClientHello fragmentation support; upstream PR #10623).",
+    "The JNI bridge is built from app/src/main/cpp/rtc_bridge.c for both ABIs.",
+    "Host JNI fixture validates bindings, not real ICE/SRTP/video decoding."
+  ],
+  "nativeNotices": [
+    {
+      "name": "json",
+      "url": "https://github.com/nlohmann/json",
+      "commit": "55f93686c01528224f448c19128836e7df245f72",
+      "licenseUrl": "https://raw.githubusercontent.com/nlohmann/json/55f93686c01528224f448c19128836e7df245f72/LICENSE.MIT",
+      "licenseFile": "native-json-LICENSE.MIT.txt",
+      "version": "55f93686c01528224f448c19128836e7df245f72",
+      "license": "MIT",
+      "licenseSha256": "46a65cffd1ea955132d95a8dd921640714a8d6b537d2e4e482d31145ae95b603"
+    },
+    {
+      "name": "libjuice",
+      "url": "https://github.com/paullouisageneau/libjuice",
+      "commit": "b89c792e3612faf2f12cf35bcc56857313a06be3",
+      "licenseUrl": "https://raw.githubusercontent.com/paullouisageneau/libjuice/b89c792e3612faf2f12cf35bcc56857313a06be3/LICENSE",
+      "licenseFile": "native-libjuice-LICENSE.txt",
+      "version": "b89c792e3612faf2f12cf35bcc56857313a06be3",
+      "license": "MPL-2.0",
+      "licenseSha256": "fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85"
+    },
+    {
+      "name": "libsrtp",
+      "url": "https://github.com/cisco/libsrtp",
+      "commit": "24b3bf8f19b6f5ab4cd2bcceb4f4064efca86fd5",
+      "licenseUrl": "https://raw.githubusercontent.com/cisco/libsrtp/24b3bf8f19b6f5ab4cd2bcceb4f4064efca86fd5/LICENSE",
+      "licenseFile": "native-libsrtp-LICENSE.txt",
+      "version": "24b3bf8f19b6f5ab4cd2bcceb4f4064efca86fd5",
+      "license": "BSD-3-Clause",
+      "licenseSha256": "8e19d42a1eec9561f3f347253ddf2e385c55f392f025bb0fd41b88dbf38db5ae"
+    },
+    {
+      "name": "plog",
+      "url": "https://github.com/SergiusTheBest/plog",
+      "commit": "94899e0b926ac1b0f4750bfbd495167b4a6ae9ef",
+      "licenseUrl": "https://raw.githubusercontent.com/SergiusTheBest/plog/94899e0b926ac1b0f4750bfbd495167b4a6ae9ef/LICENSE",
+      "licenseFile": "native-plog-LICENSE.txt",
+      "version": "94899e0b926ac1b0f4750bfbd495167b4a6ae9ef",
+      "license": "MIT",
+      "licenseSha256": "e4d01796524cbc13b1571a1f0914823c6a23b316ba039e7014f47a4eef7fd4c3"
+    },
+    {
+      "name": "usrsctp",
+      "url": "https://github.com/paullouisageneau/usrsctp",
+      "commit": "fec583d54493f879d2ae44a743423bf8a04371ab",
+      "licenseUrl": "https://raw.githubusercontent.com/paullouisageneau/usrsctp/fec583d54493f879d2ae44a743423bf8a04371ab/LICENSE.md",
+      "licenseFile": "native-usrsctp-LICENSE.md.txt",
+      "version": "fec583d54493f879d2ae44a743423bf8a04371ab",
+      "license": "BSD-3-Clause",
+      "licenseSha256": "fa53711b25af4b9a9b8dadfea3cb38166ec4b96760c8d62b284055554537d9ef"
+    },
+    {
+      "name": "libdatachannel",
+      "url": "https://github.com/paullouisageneau/libdatachannel",
+      "commit": "6b1e2e620f1e37f0eafeee702eaea0043cb305fd",
+      "licenseUrl": "https://raw.githubusercontent.com/paullouisageneau/libdatachannel/6b1e2e620f1e37f0eafeee702eaea0043cb305fd/LICENSE",
+      "licenseFile": "native-libdatachannel-LICENSE.txt",
+      "version": "0.24.6",
+      "license": "MPL-2.0",
+      "licenseSha256": "fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85"
+    },
+    {
+      "name": "mbedtls",
+      "url": "https://github.com/Mbed-TLS/mbedtls",
+      "commit": "068ff080b369adfac81509f9b57b2afabaf82dc5",
+      "licenseUrl": "https://raw.githubusercontent.com/Mbed-TLS/mbedtls/068ff080b369adfac81509f9b57b2afabaf82dc5/LICENSE",
+      "licenseFile": "native-mbedtls-LICENSE.txt",
+      "version": "3.6.7",
+      "license": "Apache-2.0 OR GPL-2.0-or-later",
+      "licenseSha256": "9b405ef4c89342f5eae1dd828882f931747f71001cfba7d114801039b52ad09b"
+    }
+  ]
+}

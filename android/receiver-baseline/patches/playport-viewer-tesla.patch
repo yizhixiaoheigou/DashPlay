@@ -1,0 +1,517 @@
+Tesla (2026-10-14, a Tesla on our F50, Chrome 148), Tesla mode set on the box (receiver-access.json "tesla": true,
+receiver --car-voice):
+- The car's Bluetooth carries music, calls and Siri: the receiver offers no call or Siri audio and no microphone
+  (AirPlayConfig.callsAndSiri), so the iPhone keeps them on the car; the steering wheel, media card and volume are the
+  car's own. The page names no song and passes on no media key (the car took the page for a second music source,
+  paused one for the other and the two fought), and closes its audio output 3 s after the last stream (the car took
+  even a silent output for a source). Music the iPhone still sends here (after Siri from the CarPlay screen) plays.
+- Navigation prompts (audioType "default") come through the page, boosted 3x through a limiter (?promptgain=1..8);
+  microphone gain 4 instead of 16 (the car's microphone is far louder); while a voice stream sounds the page title
+  names it ("导航播报 · DashPlay").
+- Fullscreen: the car's browser ignores a page's request; it hides its address bar for pages reached through listed
+  video sites. The fullscreen button goes v.qq.com -> 1905.com -> back to this page (as tesla-kit.com does); 1905.com
+  goes on only when the address has no "/" before its "?".
+Also, for every car: auto quality picks the resolution from the screen's real pixels and H.265 once the browser shows
+it decodes fast (a codec list auto / H.264 / H.265 overrides), and the viewer log gets every key, wheel and focus
+move the page receives (ev 6): the Tesla's right scroll wheel arrives as ArrowUp/ArrowDown, its left wheel not at all.
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayConfig.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayConfig.kt
+@@ -45,6 +45,8 @@
+     val hevc: Boolean = false,
+     val disableAudioOutput: Boolean = false,
+     val microphone: Boolean = false,
++    /** false: offer no call and no Siri audio, so the iPhone keeps them on the car's own Bluetooth (DashPlay Tesla mode). */
++    val callsAndSiri: Boolean = true,
+     val manufacturer: String = "xcertplay",
+     val model: String = "xcertplay",
+     val oemLabel: String = "xcertplay",
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt
+@@ -46,7 +46,7 @@
+         )
+         if (!config.disableAudioOutput) {
+             info["audioLatencies"] = audioLatencies()
+-            info["audioFormats"] = audioFormats(config.entertainmentSampleRate, config.microphone)
++            info["audioFormats"] = audioFormats(config.entertainmentSampleRate, config.microphone, config.callsAndSiri)
+         }
+         info["extendedFeatures"] = listOf("vocoderInfo", "enhancedRequestCarUI")
+         info["displays"] = displays
+@@ -110,6 +110,7 @@
+     private fun audioFormats(
+         entertainmentRate: Int,
+         microphone: Boolean,
++        callsAndSiri: Boolean = true,
+     ): List<Map<String, Any?>> {
+         fun format(type: Int, audioType: String, outputFormats: Int, inputFormats: Int? = null): Map<String, Any?> {
+             val entry = linkedMapOf<String, Any?>(
+@@ -130,14 +131,16 @@
+         val pcmInput = if (microphone) pcmMono else null
+         val wirelessInput = if (microphone) pcmMono or opus else null
+ 
+-        return listOf(
++        // callsAndSiri false: no call and no Siri audio, the iPhone keeps them on the car's own Bluetooth (DashPlay
++        // Tesla mode, 2026-10-14); the receiver plays prompts, alerts and music only.
++        return listOfNotNull(
+             format(100, "compatibility", pcm, pcmInput),
+             format(101, "compatibility", pcm),
+             format(100, "default", pcm or opus, wirelessInput),
+             format(100, "alert", pcm or opus),
+             format(100, "media", pcm),
+-            format(100, "telephony", pcmMono or opus, wirelessInput),
+-            format(100, "speechRecognition", pcmMono or opus, wirelessInput),
++            if (callsAndSiri) format(100, "telephony", pcmMono or opus, wirelessInput) else null,
++            if (callsAndSiri) format(100, "speechRecognition", pcmMono or opus, wirelessInput) else null,
+             format(101, "default", pcm or opus),
+             format(102, "media", aacLc),
+         )
+--- a/protocol/src/test/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlistTest.kt
++++ b/protocol/src/test/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlistTest.kt
+@@ -35,6 +35,26 @@
+     }
+ 
+     @Test
++    fun callsAndSiriCanBeLeftToTheCar() {
++        fun types(callsAndSiri: Boolean) = (AirPlayInfoPlist.build(
++            AirPlayConfig(
++                deviceName = "test",
++                deviceId = "02:00:00:00:00:02",
++                btMac = "02:00:00:00:00:02",
++                sourceVersion = "366.0",
++                main = AirPlayDisplayConfig(widthPixels = 1280, heightPixels = 720),
++                microphone = callsAndSiri,
++                callsAndSiri = callsAndSiri,
++            ),
++        )["audioFormats"] as List<*>).map { (it as Map<*, *>)["audioType"] }
++        assertTrue("telephony" in types(true))
++        assertTrue("speechRecognition" in types(true))
++        assertFalse("telephony" in types(false))
++        assertFalse("speechRecognition" in types(false))
++        assertTrue("default" in types(false) && "media" in types(false))
++    }
++
++    @Test
+     fun hevcCapabilityIsAdvertisedOnlyWhenEnabled() {
+         val base = AirPlayConfig(
+             deviceName = "test",
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -126,7 +126,8 @@
+             port = config.airPlayPort,
+             entertainmentSampleRate = 48_000,
+             hevc = display.hevc,
+-            microphone = true,
++            microphone = !config.carVoice,
++            callsAndSiri = !config.carVoice,
+             manufacturer = config.manufacturer,
+             model = config.model,
+             oemLabel = "盒子设置",
+--- a/server/src/main/kotlin/com/playport/server/ServerConfig.kt
++++ b/server/src/main/kotlin/com/playport/server/ServerConfig.kt
+@@ -17,6 +17,8 @@
+     val displayFps: Int = 60,
+     val uiScale: Int = com.shilapi.xcertplay.airplay.CarPlayUiScale.DEFAULT,
+     val hevc: Boolean = false,
++    /** Calls and Siri on the car's own Bluetooth (Tesla mode, 2026-10-14): no microphone, no call or Siri audio. */
++    val carVoice: Boolean = false,
+     val rightHandDrive: Boolean = false,
+     val bindAddress: String? = null,
+     val identityDir: Path,
+@@ -75,6 +77,7 @@
+                     "--fps" -> config = config.copy(displayFps = nextValue(flag).toInt())
+                     "--ui-scale" -> config = config.copy(uiScale = com.shilapi.xcertplay.airplay.CarPlayUiScale.sanitize(nextValue(flag).toInt()))
+                     "--hevc" -> config = config.copy(hevc = true)
++                    "--car-voice" -> config = config.copy(carVoice = true)
+                     "--rhd" -> config = config.copy(rightHandDrive = true)
+                     "--bind" -> config = config.copy(bindAddress = nextValue(flag))
+                     "--identity-dir" -> config = config.copy(identityDir = Path.of(nextValue(flag)))
+--- a/web/index.html
++++ b/web/index.html
+@@ -31,7 +31,7 @@
+     <label class="cell"><span class="main"><b data-i18n="nightMode"></b><span id="night-status"></span></span><select id="night-mode"><option value="schedule" data-i18n="nightSchedule"></option><option value="system" data-i18n="nightSystem"></option><option value="day" data-i18n="nightDay"></option><option value="night" data-i18n="nightNight"></option></select></label>
+     <label class="cell"><span class="main"><b data-i18n="auto"></b></span><input id="auto-fit" class="switch" type="checkbox"/></label>
+     <details><summary class="cell"><span class="main"><b data-i18n="custom"></b></span><span id="display-status" class="value" role="status"></span><span class="chev"></span></summary>
+-      <form id="display-form" class="inner"><fieldset id="display-fields"><div class="pair"><label><span data-i18n="width"></span><input id="width" type="number" min="480" max="3840" step="2" required/></label><label><span data-i18n="height"></span><input id="height" type="number" min="480" max="3840" step="2" required/></label></div><div class="pair"><label><span data-i18n="ui"></span><select id="ui-scale"><option value="85" data-i18n="small"></option><option value="100" data-i18n="standard"></option><option value="115" data-i18n="large"></option></select></label><label><span data-i18n="fps"></span><select id="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label></div></fieldset><button id="apply" class="btn" data-i18n="apply"></button></form></details>
++      <form id="display-form" class="inner"><fieldset id="display-fields"><div class="pair"><label><span data-i18n="width"></span><input id="width" type="number" min="480" max="3840" step="2" required/></label><label><span data-i18n="height"></span><input id="height" type="number" min="480" max="3840" step="2" required/></label></div><div class="pair"><label><span data-i18n="ui"></span><select id="ui-scale"><option value="85" data-i18n="small"></option><option value="100" data-i18n="standard"></option><option value="115" data-i18n="large"></option></select></label><label><span data-i18n="fps"></span><select id="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label></div><div class="pair"><label><span data-i18n="codec"></span><select id="codec"><option value="auto" data-i18n="codecAuto"></option><option value="h264">H.264</option><option value="h265">H.265</option></select></label></div></fieldset><button id="apply" class="btn" data-i18n="apply"></button></form></details>
+   </div>
+   <p class="foot" data-i18n="autoHint"></p>
+   <div class="group"><label class="cell"><span class="main"><b data-i18n="language"></b></span><select id="language"><option value="zh">简体中文</option><option value="en">English</option></select></label></div>
+--- a/web/src/audio.ts
++++ b/web/src/audio.ts
+@@ -31,20 +31,70 @@
+       (this.context.state === 'running' && performance.now() - this.lastAudioAt < 1800);
+   }
+ 
+-  constructor(private readonly onError: (message: string) => void) {
++  /** Navigation prompts and alerts (audioType "default") boosted by this much through a limiter: in a Tesla the
++   *  music goes to the car over Bluetooth at the car's volume while prompts come through the browser, and they were
++   *  hard to hear at 1 (2026-10-14). 1 leaves them as sent. */
++  private readonly promptBoost: number;
++  private promptLimiter: DynamicsCompressorNode | null = null;
++  /** Tesla mode: music is the car's, over Bluetooth; music the iPhone still sends here is not played, so that the
++   *  two never sound together. */
++  private readonly musicOff: boolean;
++  /** Tesla mode: the car takes a browser that has an audio output open, even a silent one, for a music source and
++   *  switched its media card between it and the iPhone's Bluetooth over and over (2026-10-14). The output is closed
++   *  (context suspended) a few seconds after the last stream ends and opened again for the next prompt or call. */
++  private readonly idleClose: boolean;
++  private idleTimer = 0;
++  private sleeping = false;
++
++  constructor(private readonly onError: (message: string) => void, options: { promptBoost?: number; musicOff?: boolean; idleClose?: boolean } = {}) {
+     this.context = new AudioContext({ latencyHint: 'interactive' });
+     this.gain = this.context.createGain();
+     this.gain.connect(this.context.destination);
++    this.promptBoost = Math.min(8, Math.max(1, options.promptBoost ?? 1));
++    this.musicOff = options.musicOff ?? false;
++    this.idleClose = options.idleClose ?? false;
++  }
++
++  /** idleClose: open the output for a stream, close it again when none is left. */
++  private wake(): void {
++    if (!this.idleClose) return;
++    window.clearTimeout(this.idleTimer);
++    if (this.context.state === 'suspended' && this.unlocked) void this.context.resume().then(() => { this.sleeping = false; }).catch(() => {});
++  }
++  private sleepWhenIdle(): void {
++    if (!this.idleClose) return;
++    window.clearTimeout(this.idleTimer);
++    this.idleTimer = window.setTimeout(() => {
++      if (this.streams.size === 0 && this.context.state === 'running') { this.sleeping = true; void this.context.suspend().catch(() => { this.sleeping = false; }); }
++    }, 3000);
++  }
++
++  private streamGainValue(name: string): number {
++    return (this.streamGains.get(name) ?? 1) * (name === 'default' ? this.promptBoost : 1);
++  }
++
++  private streamOutput(name: string): AudioNode {
++    if (name !== 'default' || this.promptBoost === 1) return this.gain;
++    if (!this.promptLimiter) {
++      const limiter = this.context.createDynamicsCompressor();
++      limiter.threshold.value = -6; limiter.knee.value = 0; limiter.ratio.value = 20;
++      limiter.attack.value = 0.003; limiter.release.value = 0.1;
++      limiter.connect(this.gain);
++      this.promptLimiter = limiter;
++    }
++    return this.promptLimiter;
+   }
+ 
+   get isUnlocked(): boolean {
+-    return this.unlocked && this.context.state === 'running' && Array.from(this.streams.values()).every(s => !s.music || s.music.unlocked);
++    return this.unlocked && (this.context.state === 'running' || this.sleeping) && Array.from(this.streams.values()).every(s => !s.music || s.music.unlocked);
+   }
+ 
+   /** Must run inside a user gesture so the browser allows audio playback. */
+   async unlock(): Promise<void> {
+     await Promise.all([this.context.resume(), ...Array.from(this.streams.values()).flatMap(s => s.music ? [s.music.unlock()] : [])]);
+     this.unlocked = this.context.state === 'running';
++    this.sleeping = false;
++    if (this.streams.size === 0) this.sleepWhenIdle();
+   }
+ 
+   setVolume(volume: number): void {
+@@ -57,7 +107,7 @@
+     const gain = Math.min(1, Math.max(0, value));
+     this.streamGains.set(name, gain);
+     for (const state of this.streams.values()) {
+-      if (state.name === name) state.gain.gain.value = gain;
++      if (state.name === name) state.gain.gain.value = this.streamGainValue(name);
+     }
+   }
+ 
+@@ -67,9 +117,11 @@
+ 
+   handleConfig(message: AudioConfigMessage): void {
+     this.closeStream(message.streamType);
++    this.wake();
++    if (this.musicOff && message.name === 'media') return;   // its packets find no stream and are dropped
+     const streamGain = this.context.createGain();
+-    streamGain.gain.value = this.streamGains.get(message.name) ?? 1;
+-    streamGain.connect(this.gain);
++    streamGain.gain.value = this.streamGainValue(message.name);
++    streamGain.connect(this.streamOutput(message.name));
+     const state: StreamState = {
+       codec: message.codec,
+       sampleRate: message.sampleRate,
+@@ -171,6 +223,7 @@
+       state.music = null;
+     }
+     this.closeStream(streamType);
++    this.sleepWhenIdle();
+   }
+ 
+   /** Music element counters for the viewer log (music-output.ts). */
+--- a/web/src/boot.ts
++++ b/web/src/boot.ts
+@@ -11,9 +11,11 @@
+   try {
+     const response = await fetch('./receiver-access.json', { cache: 'no-store', credentials: 'same-origin' });
+     if (!response.ok) return;
+-    const value = await response.json() as { token?: string; settingsPort?: number };
++    const value = await response.json() as { token?: string; settingsPort?: number; tesla?: boolean };
+     if (typeof value.token === 'string' && /^[0-9a-f]{32}$/.test(value.token)) localStorage.setItem('playport-token', value.token);
+     if (Number.isInteger(value.settingsPort)) (window as unknown as { playportBoxSettingsPort?: number }).playportBoxSettingsPort = value.settingsPort;
++    // Tesla mode, set on the box (OpenWrt: uci dashplay.main.tesla_mode): music over the car's Bluetooth, prompts louder.
++    (window as unknown as { playportTeslaMode?: boolean }).playportTeslaMode = value.tesla === true;
+   } catch { /* No box behind this page, or storage blocked: the page asks for a token as before. */ }
+ }
+ start();
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -14,7 +14,7 @@
+   nightMode: ['夜间模式', 'Night mode'], nightSchedule: ['自动（18:30–06:30 为夜间）', 'Auto (night 18:30–06:30)'], nightSystem: ['跟随车机浏览器深色模式', 'Follow car browser dark mode'], nightDay: ['始终白天', 'Always day'], nightNight: ['始终夜间', 'Always night'],
+   nightNow: ['当前请求：', 'Requested now: '], nightOn: ['夜间', 'night'], nightOff: ['白天', 'day'], browserDark: ['车机浏览器报告深色模式', 'Car browser reports dark mode'], browserLight: ['车机浏览器报告浅色模式', 'Car browser reports light mode'],
+   latency: ['解码延迟', 'Decode delay'],
+-  ui: ['界面大小', 'UI size'], fps: ['帧率', 'Frame rate'], standard: ['标准', 'Standard'], large: ['大', 'Large'], small: ['小', 'Small'],
++  ui: ['界面大小', 'UI size'], fps: ['帧率', 'Frame rate'], codec: ['视频编码', 'Video codec'], codecAuto: ['自动', 'Automatic'], standard: ['标准', 'Standard'], large: ['大', 'Large'], small: ['小', 'Small'],
+   loading: ['正在读取…', 'Loading…'], applying: ['正在应用…', 'Applying…'], applied: ['已保存，正在重新连接 CarPlay。', 'Saved. Reconnecting CarPlay.'],
+   loadFail: ['读取失败，请检查盒子连接后重试。', 'Could not load settings. Check the receiver connection and retry.'],
+   applyFail: ['应用失败，请检查连接和分辨率范围。', 'Could not apply. Check connection and resolution range.'],
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -72,7 +72,34 @@
+   const size = shownSize(canvas.width, canvas.height, screen.clientWidth, screen.clientHeight);
+   surface.style.width = `${size.width}px`; surface.style.height = `${size.height}px`;
+ }
+-function error(message: string) { el('error-text').textContent = message; el('error-banner').hidden = !message; }
++function error(message: string) {
++  // This browser said it decodes H.265 but cannot: auto goes back to H.264 for good (on this browser).
++  if (message.includes('H.265/HEVC')) { saveFlag('f50-hevc-failed', '1'); lastAutoTarget = ''; scheduleAuto(); }
++  el('error-text').textContent = message; el('error-banner').hidden = !message;
++}
++/** Auto quality (2026-10-14; a Tesla decodes a frame in ~1 ms, the XPeng in 60-100 ms): once this browser has
++ *  shown it decodes fast (f50-fast-decoder, from the 10 s reports), auto picks the resolution from the screen's real
++ *  pixels (CSS size x device pixel ratio, long side 1280-1920) and H.265 when the browser decodes it; a slow decoder
++ *  keeps the CSS-size choice and H.264. The codec list (auto / H.264 / H.265) overrides. */
++function readFlag(key: string) { try { return localStorage.getItem(key) ?? ''; } catch { return ''; } }
++function saveFlag(key: string, value: string) { try { localStorage.setItem(key, value); } catch { /* Then auto stays as it was. */ } }
++let hevcDecodes = false;
++if (typeof VideoDecoder !== 'undefined') void VideoDecoder.isConfigSupported({codec:'hvc1.1.6.L120.B0',codedWidth:1920,codedHeight:1080})
++  .then(support => { hevcDecodes = support.supported === true; scheduleAuto(); }).catch(() => {});
++const fastDecoder = () => readFlag('f50-fast-decoder') === '1';
++function wantHevc() {
++  const codec = el<HTMLSelectElement>('codec').value;
++  return codec === 'h265' || (codec === 'auto' && fastDecoder() && hevcDecodes && readFlag('f50-hevc-failed') !== '1');
++}
++let fastReports = 0, slowReports = 0;
++/** Called with each 10 s report: three fast ones in a row mark this browser fast, three slow ones unmark it. */
++function judgeDecoder(decodeMs: number, fps: number) {
++  if (!(decodeMs > 0) || fps < 5) return;
++  fastReports = decodeMs < 12 ? fastReports + 1 : 0;
++  slowReports = decodeMs > 40 ? slowReports + 1 : 0;
++  if (fastReports >= 3 && !fastDecoder()) { saveFlag('f50-fast-decoder', '1'); lastAutoTarget = ''; scheduleAuto(); }
++  if (slowReports >= 3 && fastDecoder()) { saveFlag('f50-fast-decoder', '0'); lastAutoTarget = ''; scheduleAuto(); }
++}
+ function send(message: ClientMessage) { if (active) connection.send(message); }
+ const video = new VideoPlayer(canvas, error, () => {
+   if (!active) return;
+@@ -84,9 +111,32 @@
+   }
+   lastPaintAt = now;
+ }, () => send({ type:'keyframe' }), fit);
+-const audio = new AudioEngine(error);
++// Tesla mode, turned on by the person on the box (2026-10-14): the music goes to the car over Bluetooth, so the
++// steering wheel, media card and volume are the car's own; this page plays only prompts and calls, prompts boosted.
++// ?promptgain=1..8 overrides the boost.
++const teslaMode = (window as unknown as { playportTeslaMode?: boolean }).playportTeslaMode === true;
++const promptGain = Number(new URLSearchParams(location.search).get('promptgain')) || (teslaMode ? 3 : 1);
++// Music the iPhone still sends here is played: it sends music to one place at a time, and after Siri from the
++// CarPlay screen it sent it here for ~27 s before going back to the car's Bluetooth, silent while it was dropped.
++const audio = new AudioEngine(error, { promptBoost: promptGain, idleClose: teslaMode });
++/** Tesla mode: the car's media card shows the page's title and address whenever the page sounds (Siri, prompts,
++ *  calls); name it instead (2026-10-14). The last voice stream to start wins; the title goes back when none is left. */
++const voiceLabels: Record<string, string> = { speechrecognition: 'Siri', telephony: '通话', default: '导航播报' };
++const voices = new Map<number, string>();
++function showVoice() {
++  const label = Array.from(voices.values()).pop() ?? null;
++  document.title = label ? `${label} · DashPlay` : 'DashPlay';
++  media.announce(label);
++}
++function voiceStarted(streamType: number, name: string) {
++  if (!teslaMode) return;
++  voices.delete(streamType);
++  if (voiceLabels[name]) voices.set(streamType, voiceLabels[name]);
++  showVoice();
++}
++function voiceStopped(streamType: number) { if (teslaMode && voices.delete(streamType)) showVoice(); }
+ const lag = new LagProbe();
+-const media = new SystemMedia(send, () => { void audio.unlock().catch(error); }, () => audio.pauseMusic());
++const media = new SystemMedia(send, () => { void audio.unlock().catch(error); }, () => audio.pauseMusic(), teslaMode);
+ const microphone = new MicrophoneUplink((payload, opus) => {
+   const frame = new Uint8Array(payload.length + 1); frame[0] = opus ? 0x11 : 0x10; frame.set(payload, 1); connection.sendBinary(frame);
+ }, message => { el('mic-status').textContent = message; });
+@@ -95,9 +145,9 @@
+     switch (message.kind) {
+       case 'video-config': video.configure(message); break;
+       case 'video-frame': video.pushFrame(message); break;
+-      case 'audio-config': audio.handleConfig(message); break;
++      case 'audio-config': audio.handleConfig(message); voiceStarted(message.streamType, message.name); break;
+       case 'audio-packet': if (message.streamType === 102) musicBytes += message.data.length; audio.handlePacket(message); break;
+-      case 'audio-stopped': audio.stopStream(message.streamType); break;
++      case 'audio-stopped': audio.stopStream(message.streamType); voiceStopped(message.streamType); break;
+     }
+   },
+   onServer: server,
+@@ -189,7 +239,19 @@
+  *  and never reached CarPlay (2026-10-13). */
+ let restoreArmed = false;
+ const restoring = () => restoreArmed && wantFullscreen && !document.fullscreenElement && !document.hidden;
++/** A Tesla's browser ignores a page's fullscreen request; it shows a page without its address bar when it comes
++ *  through a video site it lists (in China v.qq.com and 1905.com, as tesla-kit.com does; elsewhere
++ *  youtube.com/redirect). In Tesla mode the fullscreen button takes that way back to this page (2026-10-14); the
++ *  "?www.1905.com" it ends with marks a page already shown that way. */
++const teslaBorderless = location.search.includes('www.1905.com');
++function teslaFullscreenUrl() {
++  // 1905.com goes on only when the text between "//" and the first "/" ends in "1905.com": no "/" before the "?"
++  // (with "/?" it went to its own home page, 2026-10-14); this page is the site's root anyway.
++  return 'https://v.qq.com/search_redirect.html?url=https://www.1905.com/api/redirec.html?redirect_url='
++    + `${location.origin}?www.1905.com`;
++}
+ async function toggleFullscreen() {
++  if (teslaMode && !teslaBorderless) { location.href = teslaFullscreenUrl(); return; }
+   try {
+     if (document.fullscreenElement) { wantFullscreen = false; await document.exitFullscreen(); }
+     else await document.documentElement.requestFullscreen();
+@@ -241,7 +303,8 @@
+     display = await r.json() as Display;
+     el<HTMLInputElement>('width').value = String(display.width); el<HTMLInputElement>('height').value = String(display.height);
+     el<HTMLSelectElement>('fps').value = String(display.fps); el<HTMLSelectElement>('ui-scale').value = String(display.uiScale);
+-    el('display-status').textContent = `${display.width} × ${display.height} / ${display.fps} fps`;
++    el('display-status').dataset.codec = display.hevc ? 'H.265' : 'H.264';
++    el('display-status').textContent = `${display.width} × ${display.height} / ${display.fps} fps / ${display.hevc ? 'H.265' : 'H.264'}`;
+     scheduleAuto();
+   } catch { el('display-status').textContent = t('loadFail'); }
+ }
+@@ -265,13 +328,15 @@
+   // Not for a hidden page (a covered page reports a small window) nor while fullscreen waits for its tap; a timer
+   // set just before the car covered the page fired anyway and renegotiated to 800x400 (Chrome, 2026-10-12).
+   if (!display || !autoFit.checked || displayBusy || document.hidden || (wantFullscreen && !document.fullscreenElement)) return;
+-  const target=autoTarget(),fullscreen=!!document.fullscreenElement;
+-  if (!renegotiate(display,target,fullscreen,storedFullscreenSize())) return;
+-  const key=`${target.width}x${target.height}`;
++  const target=autoTarget(),fullscreen=!!document.fullscreenElement,hevc=wantHevc();
++  // Sharper than now (a fast decoder's real pixels, or the codec changed): once; else the shape rules below.
++  const sharper=target.width*target.height>display.width*display.height*1.2||hevc!==display.hevc;
++  if (!sharper && !renegotiate(display,target,fullscreen,storedFullscreenSize())) return;
++  const key=`${target.width}x${target.height}${hevc?'-h265':''}`;
+   if (key===lastAutoTarget) return;
+   // Avoid a reconnect loop even when another viewer has a different screen shape.
+   lastAutoTarget=key;
+-  if (!(await saveDisplay({...display,...target,hevc:false}))) { error(t('autoFail')); return; }
++  if (!(await saveDisplay({...display,...target,hevc}))) { error(t('autoFail')); return; }
+   if (fullscreen) try { localStorage.setItem('f50-fullscreen-shape',key); } catch { /* Then fullscreen may renegotiate once more. */ }
+ }
+ function storedFullscreenSize() { try { return localStorage.getItem('f50-fullscreen-shape') ?? ''; } catch { return ''; } }
+@@ -280,14 +345,17 @@
+  *  black reconnect right after opening. A clearly different shape (portrait, split screen) is renegotiated at
+  *  once, as before (user 2026-10-12, replacing 2026-10-11's reconnect on every window change). */
+ function autoTarget() {
+-  return suggestedResolution(screen.clientWidth,screen.clientHeight);
++  const pixels=fastDecoder()?Math.min(2,Math.max(1,window.devicePixelRatio||1)):1;
++  return suggestedResolution(screen.clientWidth*pixels,screen.clientHeight*pixels);
+ }
++el<HTMLSelectElement>('codec').value = readFlag('f50-codec') || 'auto';
++el<HTMLSelectElement>('codec').onchange=() => { saveFlag('f50-codec', el<HTMLSelectElement>('codec').value); lastAutoTarget=''; scheduleAuto(); };
+ autoFit.onchange=() => { localStorage.setItem('f50-auto-fit',String(autoFit.checked)); lastAutoTarget=''; render(); scheduleAuto(); };
+ el<HTMLFormElement>('display-form').onsubmit=event => {
+   event.preventDefault();
+   const size=autoFit.checked?autoTarget():{width:Number(el<HTMLInputElement>('width').value),height:Number(el<HTMLInputElement>('height').value)};
+   if (![size.width,size.height].every(v=>Number.isInteger(v)&&v>=480&&v<=3840&&v%2===0)) { error(t('range')); return; }
+-  void saveDisplay({...size,fps:Number(el<HTMLSelectElement>('fps').value),uiScale:Number(el<HTMLSelectElement>('ui-scale').value),hevc:false});
++  void saveDisplay({...size,fps:Number(el<HTMLSelectElement>('fps').value),uiScale:Number(el<HTMLSelectElement>('ui-scale').value),hevc:wantHevc()});
+ };
+ new ResizeObserver(()=>{ fit(); scheduleAuto(); }).observe(screen);
+ document.addEventListener('visibilitychange',()=>{
+@@ -303,7 +371,7 @@
+   send({type:'stats',stats:{ev,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,width:screen.clientWidth,height:screen.clientHeight,want:wantFullscreen?1:0,...viewport()}});
+ }
+ /** Which page build runs (raised with each build tried in the car). */
+-const BUILD = 202610132400;
++const BUILD = 202610141550;
+ /** What the browser says of the space it gives the page, to find the car's bar over a fullscreen page (2026-10-13):
+  *  window, visual viewport (and its offset), screen, available screen, outer window, pixel ratio. */
+ function viewport(): Record<string, number> {
+@@ -312,6 +380,20 @@
+     vt:Math.round(v?.offsetTop ?? -1), sw:d.width, sh:d.height, sah:d.availHeight, oh:window.outerHeight,
+     dpr:Math.round(window.devicePixelRatio*100) };
+ }
++/** Every key, wheel and focus move the page receives, by name ("inK<code>", "inWheelUp", "inFocus"), sent within a
++ *  second as ev 6: what a car's steering-wheel buttons and scroll wheels reach the browser as (Tesla, 2026-10-14). */
++const inputSeen: Record<string, number> = {};
++let inputTimer = 0;
++function seenInput(name: string) {
++  const key = ('in' + name.replace(/[^A-Za-z]/g, '')).slice(0, 24);
++  inputSeen[key] = (inputSeen[key] ?? 0) + 1;
++  window.clearTimeout(inputTimer);
++  inputTimer = window.setTimeout(() => send({type:'stats',stats:{ev:6,...inputSeen}}), 1000);
++}
++window.addEventListener('keydown', e => seenInput('K' + (e.code || e.key || 'Unknown')), { capture: true });
++window.addEventListener('wheel', e => seenInput(Math.abs(e.deltaY) >= Math.abs(e.deltaX)
++  ? (e.deltaY < 0 ? 'WheelUp' : 'WheelDown') : (e.deltaX < 0 ? 'WheelLeft' : 'WheelRight')), { capture: true, passive: true });
++document.addEventListener('focusin', () => seenInput('Focus'), true);
+ // ev 5: the window changed size (debounced), with what the browser says of it.
+ let resizeTimer = 0;
+ window.addEventListener('resize', () => { window.clearTimeout(resizeTimer); resizeTimer = window.setTimeout(() => pageEvent(5), 400); });
+@@ -335,7 +417,8 @@
+   send({type:'stats',stats:{fps:reportFrames/seconds,decodeMs:video.decodeLatencyMs,queue:video.decodeQueueSize,
+     kbps:reportBytes*8/1000/seconds,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,
+     width:canvas.width,height:canvas.height,...(touchCount?{touchMs:touchSum/touchCount,touches:touchCount}:{}),...(musicBytes?{musicKbps:musicBytes*8/1000/seconds}:{}),
+-    chrome:chromeMajor,build:BUILD,webView,...microphone.report(),...audio.farReport(),...media.report(),...musicTimeline(),...audio.musicReport(),...video.takeStalls(),...lag.take(performance.now())}});
++    chrome:chromeMajor,build:BUILD,webView,teslaMode:teslaMode?1:0,promptGain,fastDecoder:fastDecoder()?1:0,hevcDecodes:hevcDecodes?1:0,hevc:display?.hevc?1:0,...microphone.report(),...audio.farReport(),...media.report(),...musicTimeline(),...audio.musicReport(),...video.takeStalls(),...lag.take(performance.now())}});
++  judgeDecoder(video.decodeLatencyMs, reportFrames/seconds);
+   reportFrames=0;reportBytes=0;reportStart=now;touchSum=0;touchCount=0;musicBytes=0;
+ },10000);
+ render();fit();if(token) connection.connect();
+--- a/web/src/media-session.ts
++++ b/web/src/media-session.ts
+@@ -46,7 +46,10 @@
+   private refreshMetadata() {
+     if (this.supported) navigator.mediaSession.metadata = this.active && typeof MediaMetadata !== "undefined" ? new MediaMetadata(this.info) : null;
+   }
+-  readonly supported = 'mediaSession' in navigator;
++  /** Off in Tesla mode: the car took the page for a second music source beside the iPhone on its Bluetooth, paused
++   *  one for the other (its pause reached the page and went on to the iPhone) and the two kept fighting (2026-10-14).
++   *  There the music is the car's own; the page names no song and passes on no media key. */
++  readonly supported: boolean;
+   /** Whether the iPhone says it plays; undefined while it has not said. */
+   get phoneState() { return this.phonePlaying; }
+   /** For the box's viewer log: can the OS media card take our song position at all, and which one we give it. */
+@@ -56,7 +59,8 @@
+     const actions = this.actions; this.actions = {};
+     return this.duration > 0 ? { positionState, songPos: Math.round(this.positionNow()), songDur: Math.round(this.duration), art, ...actions } : { positionState, ...actions };
+   }
+-  constructor(private readonly send: (message: ClientMessage) => void, unlock: () => void, pause: () => void = () => {}) {
++  constructor(private readonly send: (message: ClientMessage) => void, unlock: () => void, pause: () => void = () => {}, passive = false) {
++    this.supported = !passive && 'mediaSession' in navigator;
+     if (!this.supported) return;
+     const handlers: Partial<Record<MediaSessionAction, () => void>> = {
+       play: () => { unlock(); this.command(1); },
+@@ -75,6 +79,14 @@
+     }
+   }
+   private command(index: number) { if (this.active) this.send({ type: 'media', media: index }); }
++  /** While Siri, a call or a prompt sounds from this page and no music does (Tesla mode): what the car's media card
++   *  shows instead of the page address (a Tesla showed the page and its address during Siri, 2026-10-14). null
++   *  puts the song back. */
++  announce(label: string | null) {
++    if (!this.supported || typeof MediaMetadata === 'undefined') return;
++    if (label) navigator.mediaSession.metadata = new MediaMetadata({ title: label, artist: 'DashPlay' });
++    else this.refreshMetadata();
++  }
+   setActive(active: boolean) {
+     this.active = active;
+     if (!this.supported) return;
+--- a/web/src/mic.ts
++++ b/web/src/mic.ts
+@@ -213,7 +213,10 @@
+  *  not cancelled (open); ducking the microphone while the far end played only made it rough; at 1 it was faint. */
+ function micGain(): number {
+   const value = Number(new URLSearchParams(location.search).get('micgain'));
+-  return Number.isFinite(value) && value >= 1 && value <= 64 ? value : 16;
++  // A Tesla's microphone reaches the page about 90 times louder than the XPeng's (Siri peaks near full scale at 16,
++  // 2026-10-14): 4 in Tesla mode.
++  const tesla = (window as unknown as { playportTeslaMode?: boolean }).playportTeslaMode === true;
++  return Number.isFinite(value) && value >= 1 && value <= 64 ? value : tesla ? 4 : 16;
+ }
+ 
+ function describeError(error: unknown): string {

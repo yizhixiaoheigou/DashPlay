@@ -1,0 +1,327 @@
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt
+index da1c8a6..e64c681 100644
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlayInfoPlist.kt
+@@ -26,7 +26,8 @@ object AirPlayInfoPlist {
+ 
+     fun build(config: AirPlayConfig): Map<String, Any?> {
+         require(config.audioRoutes.isEmpty() || AudioRoutes.valid(config.audioRoutes))
+-        // Routing preference is not a format filter: seven/eight-entry profiles removed the entire iOS route.
++        // Routing preference is not a format filter (seven/eight-entry profiles removed the entire iOS route on a box
++        // without car Bluetooth), except Tesla mode's split (AudioRoutes.voiceOnCarBluetooth).
+         val noAudio = config.disableAudioOutput
+         fun navigationRoute(entries: List<Map<String, Any?>>) = if (config.audioRoutes["navigation"] == "bluetooth") {
+             entries.filterNot { it["type"] == 101 || (it["type"] == 100 && it["audioType"] == "default") }
+@@ -52,7 +53,9 @@ object AirPlayInfoPlist {
+         )
+         if (!noAudio) {
+             info["audioLatencies"] = navigationRoute(audioLatencies())
+-            info["audioFormats"] = navigationRoute(audioFormats(config.entertainmentSampleRate, config.microphone, config.callsAndSiri))
++            val voiceOnCar = AudioRoutes.voiceOnCarBluetooth(config.audioRoutes)
++            info["audioFormats"] = navigationRoute(audioFormats(config.entertainmentSampleRate,
++                config.microphone && !voiceOnCar, config.callsAndSiri && !voiceOnCar))
+         }
+         info["extendedFeatures"] = listOf("vocoderInfo", "enhancedRequestCarUI")
+         info["displays"] = displays
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AudioRoutes.kt b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AudioRoutes.kt
+index 4f904c2..9ba419a 100644
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AudioRoutes.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AudioRoutes.kt
+@@ -10,4 +10,11 @@ object AudioRoutes {
+         require(pairs.size == names.size && pairs.all { it.size == 2 }) { "Invalid audio routes" }
+         return pairs.associate { it[0] to it[1] }.also { require(valid(it)) { "Invalid audio routes" } }
+     }
++    /** Tesla mode (scripts/onecloud/audio_routes.resolve): music, Siri and calls on the car's Bluetooth while
++     *  navigation stays on CarPlay. Declared without call, Siri and microphone formats, as up to 2026.10.29: the
++     *  owner verified while driving that the iPhone then keeps music on the Tesla's Bluetooth and sends navigation
++     *  to the page. With all nine the iPhone sent music to the page, which a moving Tesla answers with "video is
++     *  audio-only" (2026-11-01). Nothing else produces this combination. */
++    fun voiceOnCarBluetooth(routes: Map<String, String>): Boolean =
++        routes["navigation"] == "carplay" && listOf("media", "siri", "calls").all { routes[it] == "bluetooth" }
+ }
+diff --git a/protocol/src/test/java/com/shilapi/xcertplay/airplay/AudioRoutesTest.kt b/protocol/src/test/java/com/shilapi/xcertplay/airplay/AudioRoutesTest.kt
+index 422b42d..e9a71fc 100644
+--- a/protocol/src/test/java/com/shilapi/xcertplay/airplay/AudioRoutesTest.kt
++++ b/protocol/src/test/java/com/shilapi/xcertplay/airplay/AudioRoutesTest.kt
+@@ -8,30 +8,43 @@ class AudioRoutesTest {
+         btMac = "02:00:00:00:00:02", sourceVersion = "366.0",
+         main = AirPlayDisplayConfig(widthPixels = 1280, heightPixels = 720), microphone = true)
+ 
+-    @Test fun bothSupportedModesKeepTheCompleteWorkingAudioDeclaration() {
+-        val original = AirPlayInfoPlist.build(base)
+-        for (destination in AudioRoutes.destinations) {
+-            val routes = AudioRoutes.names.associateWith { if (it in setOf("media", "siri", "calls")) destination else "carplay" }
+-            val actual = AirPlayInfoPlist.build(base.copy(audioRoutes = routes))
+-            for (key in listOf("audioFormats", "audioLatencies", "features")) assertEquals(key, original[key], actual[key])
+-            assertEquals(9, (actual["audioFormats"] as List<*>).size)
+-        }
++    private fun routes(main: String, navigation: String) = AudioRoutes.names.associateWith {
++        if (it == "navigation") navigation else if (it in setOf("media", "siri", "calls")) main else "carplay"
+     }
+-    @Test fun navigationSelectionDoesNotChangeTheSharedMediaVoiceFormats() {
++    private fun formats(info: Map<String, Any?>) = (info["audioFormats"] as List<*>).map { it as Map<*, *> }
++
++    @Test fun carPlayKeepsTheCompleteNineFormatDeclaration() {
+         val original = AirPlayInfoPlist.build(base)
+-        for (main in AudioRoutes.destinations) for (navigation in AudioRoutes.destinations) {
+-            val routes = AudioRoutes.names.associateWith {
+-                if (it == "navigation") navigation else if (it in setOf("media", "siri", "calls")) main else "carplay"
+-            }
+-            val actual = AirPlayInfoPlist.build(base.copy(audioRoutes = routes))
+-            for (key in listOf("audioFormats", "audioLatencies")) {
+-                val expected = (original[key] as List<Map<String, Any?>>).filterNot {
+-                    navigation == "bluetooth" && (it["type"] == 101 || (it["type"] == 100 && it["audioType"] == "default"))
+-                }
+-                assertEquals(key, expected, actual[key])
+-            }
+-            assertEquals(original["features"], actual["features"])
+-        }
++        val actual = AirPlayInfoPlist.build(base.copy(audioRoutes = routes("carplay", "carplay")))
++        for (key in listOf("audioFormats", "audioLatencies", "features")) assertEquals(key, original[key], actual[key])
++        assertEquals(9, formats(actual).size)
++    }
++    /** Tesla mode (2026-11-01): music, Siri and calls on the Tesla's Bluetooth, navigation on the page. The 10.29
++     *  declaration, verified by the owner while driving: no call, Siri or microphone formats, so the iPhone keeps
++     *  music on the car's Bluetooth instead of sending it to the page (the Tesla browser then showed "video is
++     *  audio-only while driving", and the page's resize renegotiated CarPlay every ~10 s). */
++    @Test fun teslaSplitDeclaresTheSevenFormatsWithoutCallsSiriOrMicrophone() {
++        val actual = formats(AirPlayInfoPlist.build(base.copy(audioRoutes = routes("bluetooth", "carplay"))))
++        assertEquals(7, actual.size)
++        assertTrue(actual.none { it["audioType"] == "telephony" || it["audioType"] == "speechRecognition" })
++        assertTrue(actual.none { it.containsKey("audioInputFormats") })
++        assertTrue(actual.any { it["type"] == 101 && it["audioType"] == "default" })
++        assertTrue(actual.any { it["type"] == 100 && it["audioType"] == "default" })
++        val plain = AirPlayInfoPlist.build(base.copy(microphone = false, callsAndSiri = false))
++        assertEquals(formats(plain), actual)
++    }
++    /** Nothing through CarPlay, Tesla or not: the six-entry declaration 31.3 shipped (no audio SETUP in the field). */
++    @Test fun navigationOnBluetoothDropsOnlyTheNavigationFormats() {
++        val original = formats(AirPlayInfoPlist.build(base))
++        val actual = formats(AirPlayInfoPlist.build(base.copy(audioRoutes = routes("bluetooth", "bluetooth"))))
++        assertEquals(original.filterNot { it["type"] == 101 || (it["type"] == 100 && it["audioType"] == "default") }, actual)
++        assertEquals(6, actual.size)
++    }
++    @Test fun voiceLeavesCarPlayOnlyForTheTeslaSplit() {
++        assertTrue(AudioRoutes.voiceOnCarBluetooth(routes("bluetooth", "carplay")))
++        assertFalse(AudioRoutes.voiceOnCarBluetooth(routes("carplay", "carplay")))
++        assertFalse(AudioRoutes.voiceOnCarBluetooth(routes("bluetooth", "bluetooth")))
++        assertFalse(AudioRoutes.voiceOnCarBluetooth(emptyMap<String, String>()))
+     }
+     @Test fun explicitDisabledAudioStillWorksIndependentlyOfRoutingPreference() {
+         val info = AirPlayInfoPlist.build(base.copy(disableAudioOutput=true))
+diff --git a/server/src/test/kotlin/com/playport/server/AudioCapabilitiesTest.kt b/server/src/test/kotlin/com/playport/server/AudioCapabilitiesTest.kt
+index 3886ccc..889f035 100644
+--- a/server/src/test/kotlin/com/playport/server/AudioCapabilitiesTest.kt
++++ b/server/src/test/kotlin/com/playport/server/AudioCapabilitiesTest.kt
+@@ -23,6 +23,18 @@ class AudioCapabilitiesTest {
+         assertEquals(formats(false), formats(true))
+     }
+ 
++    /** Tesla mode passes its routes (supervisor.car_audio_args): music, Siri and calls stay on the Tesla's Bluetooth. */
++    @Test fun teslaRoutesDeclareTheSevenFormatProfile() {
++        val root = temporary.newFolder("tesla").toPath()
++        val routes = com.shilapi.xcertplay.airplay.AudioRoutes.parse(
++            "media=bluetooth,navigation=carplay,alert=carplay,siri=bluetooth,calls=bluetooth")
++        CarPlayServer(ServerConfig(identityDir = root, stateDir = root.resolve("state"), bindAddress = "127.0.0.1",
++            carVoice = true, audioRoutes = routes)).use { server ->
++            val formats = AirPlayInfoPlist.build(server.airPlayConfig)["audioFormats"] as List<*>
++            assertEquals(7, formats.size)
++        }
++    }
++
+     @Test fun declaresDuplexFormatsForTheEnabledMicrophoneUplink() {
+         val root = temporary.root.toPath()
+         CarPlayServer(ServerConfig(identityDir = root, stateDir = root.resolve("state"), bindAddress = "127.0.0.1")).use { server ->
+diff --git a/web/check-audio-mix.mjs b/web/check-audio-mix.mjs
+index e2ca682..b9c32a6 100644
+--- a/web/check-audio-mix.mjs
++++ b/web/check-audio-mix.mjs
+@@ -85,3 +85,21 @@ for (const category of mix.AUDIO_CATEGORIES) assert.equal(routes.CATEGORY_ROUTE[
+ console.log('One sound-output switch; every slider follows it');
+ 
+ assert.equal(routes.initialRoutes({media:'carplay',navigation:'bluetooth',alert:'carplay',siri:'carplay',calls:'carplay'},false,false).navigation,'bluetooth');
++
++// Tesla mode (2026-11-01): music, Siri and calls on the Tesla's Bluetooth; only navigation is the owner's choice.
++const teslaRoutes = { media:'bluetooth', navigation:'carplay', alert:'carplay', siri:'bluetooth', calls:'bluetooth' };
++for (const category of ['media', 'speechrecognition', 'telephony']) {
++  assert.equal(routes.categoryDestination(category, teslaRoutes, true), 'bluetooth', `${category} is the Tesla's in Tesla mode`);
++  assert.equal(routes.categoryDestination(category, { ...teslaRoutes, media:'carplay', siri:'carplay', calls:'carplay' }, false), 'carplay',
++    `${category} follows the one switch elsewhere`);
++}
++for (const navigation of ['carplay', 'bluetooth']) {
++  assert.equal(routes.categoryDestination('default', { ...teslaRoutes, navigation }, true), navigation, 'navigation is the Tesla owner\'s choice');
++  assert.equal(routes.categoryDestination('alert', { ...teslaRoutes, navigation }, true), navigation);
++}
++assert.equal(routes.pageDropsMusic(true, 'media'), true, 'a Tesla page never plays music');
++for (const name of ['default', 'alert', 'telephony', 'speechrecognition']) assert.equal(routes.pageDropsMusic(true, name), false);
++assert.equal(routes.pageDropsMusic(false, 'media'), false, 'other cars keep music on the page');
++const audioSource = readFileSync(new URL('./src/audio.ts', import.meta.url), 'utf8');
++assert.match(audioSource, /pageDropsMusic\(this\.dropMusic, message\.name\)/, 'the engine consults the Tesla rule before any media element exists');
++console.log('Tesla mode: only navigation is chosen; music is never played by the page');
+diff --git a/web/check-car.mjs b/web/check-car.mjs
+index 5ceffbb..3e36b0e 100644
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -224,7 +224,7 @@ const edges=[];let music;let packets=0;
+ class Node {gain={value:1};threshold={value:0};knee={value:0};ratio={value:0};attack={value:0};release={value:0};connect(to){edges.push(to);}disconnect(){}}
+ globalThis.AudioContext=class {state='running';destination={speaker:true};createGain(){return new Node();}createDynamicsCompressor(){return new Node();}resume(){return Promise.resolve();}};
+ globalThis.TestMusic=class {static supported(){return true;}static key(c){return JSON.stringify([c.sampleRate,c.channels,Array.from(c.description)]);}constructor(config){music=this;this.configKey=JSON.stringify([config.sampleRate,config.channels,Array.from(config.description)]);}unlocked=false;playing=false;configKey="";pause(){this.playing=false;this.paused=true;}volume(){}unlock(){this.unlocked=true;this.unlocks=(this.unlocks??0)+1;return Promise.resolve();}packet(){packets++;}close(){this.closed=true;}};
+-const {AudioEngine}=await load('audio',s=>s.replace(/^import .*?;$/gm,'')+'\nconst MusicOutput=globalThis.TestMusic;const AudioCodec={AacLc:1,Opus:2,Lpcm:3};\nfunction audioStartTime(){return 0;}\nconst baseGain=(n,b)=>n===\'default\'?Math.min(8,Math.max(1,b)):1;const clampPercent=(n,p)=>Math.min(n===\'media\'?100:300,Math.max(0,p));const effectiveGain=(b,p)=>Math.min(8,Math.max(0,b*p/100));');
++const {AudioEngine}=await load('audio',s=>s.replace(/^import .*?;$/gm,'')+'\nconst MusicOutput=globalThis.TestMusic;const AudioCodec={AacLc:1,Opus:2,Lpcm:3};\nfunction audioStartTime(){return 0;}\nconst baseGain=(n,b)=>n===\'default\'?Math.min(8,Math.max(1,b)):1;const clampPercent=(n,p)=>Math.min(n===\'media\'?100:300,Math.max(0,p));const effectiveGain=(b,p)=>Math.min(8,Math.max(0,b*p/100));const pageDropsMusic=(t,n)=>t&&n===\'media\';');
+ const audio=new AudioEngine(()=>{});assert.equal(edges.length,1);assert.equal(edges[0].speaker,true);
+ audio.handleConfig({streamType:102,codec:1,name:'media',sampleRate:48000,channels:2,description:new Uint8Array([0x11,0x90])});
+ audio.handlePacket({streamType:102,timestampUs:0,data:new Uint8Array([1,2])});assert.equal(packets,1);
+@@ -243,6 +243,15 @@ assert.equal(audio.streams.get(7).out,audio.gain,'at or below 100 % it feeds the
+ audio.setCategoryPercent('media',50);
+ assert.ok(audio.streams.get(102).music,'media stays on its element');
+ audio.stopAll();assert.equal(music.closed,true);assert.equal(audio.isPlaying,false);
++{ // Tesla mode (2026-11-01): music the iPhone still sends is dropped, never a media element; prompts still play.
++  let told=0;music=null;
++  const tesla=new AudioEngine(()=>{},{dropMusic:true,onDroppedMusic:()=>told++});
++  tesla.handleConfig({streamType:102,codec:1,name:'media',sampleRate:48000,channels:2,description:new Uint8Array([0x11,0x90])});
++  const before=packets;tesla.handlePacket({streamType:102,timestampUs:0,data:new Uint8Array([1,2])});
++  assert.equal(music,null,'no media element for Tesla music');assert.equal(packets,before,'its packets go nowhere');
++  assert.equal(told,1,'the page is told');assert.equal(tesla.streams.has(102),false);
++  tesla.handleConfig({streamType:7,codec:2,name:'default',sampleRate:24000,channels:1,description:new Uint8Array()});
++  assert.ok(tesla.streams.has(7),'navigation still plays on the page'); }
+ const {aacInit,aacFragment}=await load('aac-mp4');
+ const init=aacInit(48000,2,new Uint8Array([0x11,0x90]));
+ function boxes(data){const result=[];for(let offset=0;offset<data.length;){const size=new DataView(data.buffer,data.byteOffset+offset,4).getUint32(0);assert.ok(size>=8&&offset+size<=data.length);result.push(new TextDecoder().decode(data.slice(offset+4,offset+8)));offset+=size;}return result;}
+diff --git a/web/src/audio-routes.ts b/web/src/audio-routes.ts
+index 65fdd36..ddacf6c 100644
+--- a/web/src/audio-routes.ts
++++ b/web/src/audio-routes.ts
+@@ -13,6 +13,18 @@ export function initialRoutes(value: unknown, music: boolean, _voice: boolean):
+   const destination = validRoutes(value) ? value.media : music ? 'bluetooth' : 'carplay';
+   return { media: destination, navigation: validRoutes(value) ? value.navigation : 'carplay', alert: 'carplay', siri: destination, calls: destination };
+ }
++/** Tesla mode (2026-11-01): music, Siri and calls always go over the Tesla's Bluetooth; the owner only chooses
++ *  whether navigation (and the alerts that come with it) plays on this page. Elsewhere one switch moves every sound. */
++export function categoryDestination(category: keyof typeof CATEGORY_ROUTE, routes: AudioRoutes, tesla: boolean): Destination {
++  if (tesla && (category === 'media' || category === 'speechrecognition' || category === 'telephony')) return 'bluetooth';
++  return routes[CATEGORY_ROUTE[category]];
++}
++/** A moving Tesla answers a page that plays music (a media element) with "video is audio-only while driving"; the
++ *  banner resizes the page, which renegotiated CarPlay every ~10 s (2026-11-01). Music the iPhone still sends here in
++ *  Tesla mode is dropped: it belongs on the Tesla's Bluetooth. */
++export function pageDropsMusic(tesla: boolean, name: string): boolean {
++  return tesla && name === 'media';
++}
+ export function sameRoutes(a: AudioRoutes, b: AudioRoutes): boolean {
+   return ROUTE_NAMES.every(name => a[name] === b[name]);
+ }
+diff --git a/web/src/audio.ts b/web/src/audio.ts
+index 1e9861c..c24327a 100644
+--- a/web/src/audio.ts
++++ b/web/src/audio.ts
+@@ -2,6 +2,7 @@ import { MusicOutput } from './music-output';
+ import { audioStartTime } from './audio-timing';
+ import { AudioCodec, type AudioConfigMessage, type AudioPacketMessage } from './protocol';
+ import { baseGain, clampPercent, effectiveGain } from './audio-mix';
++import { pageDropsMusic } from './audio-routes';
+ 
+ interface StreamState {
+   codec: number;
+@@ -48,7 +49,14 @@ export class AudioEngine {
+   private idleTimer = 0;
+   private sleeping = false;
+ 
+-  constructor(private readonly onError: (message: string) => void, options: { promptBoost?: number; idleClose?: boolean } = {}) {
++  /** Tesla mode: music never plays here (audio-routes.pageDropsMusic); onDroppedMusic tells the page once. */
++  private readonly dropMusic: boolean;
++  private readonly onDroppedMusic: () => void;
++
++  constructor(private readonly onError: (message: string) => void,
++    options: { promptBoost?: number; idleClose?: boolean; dropMusic?: boolean; onDroppedMusic?: () => void } = {}) {
++    this.dropMusic = options.dropMusic ?? false;
++    this.onDroppedMusic = options.onDroppedMusic ?? (() => {});
+     this.context = new AudioContext({ latencyHint: 'interactive' });
+     this.gain = this.context.createGain();
+     this.gain.connect(this.context.destination);
+@@ -144,6 +152,8 @@ export class AudioEngine {
+ 
+   handleConfig(message: AudioConfigMessage): void {
+     this.closeStream(message.streamType);
++    // No stream state: its packets are ignored (handlePacket), and no media element is ever made for it.
++    if (pageDropsMusic(this.dropMusic, message.name)) { this.onDroppedMusic(); return; }
+     this.wake();
+     const streamGain = this.context.createGain();
+     streamGain.gain.value = this.streamGainValue(message.name);
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+index 537756d..8c2cab4 100644
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -26,6 +26,13 @@ const messages = {
+   audioOnCar: ['不走 CarPlay，音量在 iPhone 或蓝牙设备上调', 'Not through CarPlay: adjust it on the iPhone or Bluetooth device'],
+   audioBluetooth: ['蓝牙', 'Bluetooth'],
+   audioOutput: ['声音输出', 'Sound output'],
++  // Tesla mode (2026-11-01): music, Siri and calls on the Tesla's Bluetooth; only navigation is chosen.
++  teslaNavOutput: ['导航播报', 'Navigation prompts'],
++  teslaNavBluetooth: ['也走特斯拉蓝牙', 'Tesla Bluetooth too'],
++  teslaNavOutputHint: ['特斯拉模式：音乐、Siri、通话走特斯拉蓝牙；导航播报默认在本页，听不到导航就改为「也走特斯拉蓝牙」', 'Tesla mode: music, Siri and calls play on the Tesla over Bluetooth; navigation plays on this page unless you hear none, then pick Tesla Bluetooth too'],
++  teslaOnCar: ['走特斯拉蓝牙，音量在车上调', 'On the Tesla over Bluetooth: adjust it in the car'],
++  teslaMixHint: ['iPhone 要先用蓝牙连上特斯拉，并在特斯拉里选它为媒体来源；没连蓝牙时这些声音会从 iPhone 自己的扬声器出来。导航播报在本页时，切到特斯拉自带的地图或应用会暂停网页，期间的播报会听不到；需要时改为「也走特斯拉蓝牙」。修改后 CarPlay 会短暂重连。音量为 0–100%，只调本页播放的声音。', 'Pair the iPhone with the Tesla over Bluetooth and pick it as the media source; without that, these sounds play on the iPhone itself. While navigation plays on this page, switching to the Tesla\'s own map or apps pauses the page and its prompts; pick Tesla Bluetooth too if that matters. CarPlay reconnects briefly after a change. Volume uses 0–100% and only adjusts what this page plays.'],
++  teslaMusicDropped: ['特斯拉模式下音乐不在网页播放（行车中特斯拉会限制网页）。请在 iPhone 控制中心把音频输出选为特斯拉。', 'Tesla mode does not play music on this page (a moving Tesla restricts it). Pick the Tesla as the output in the iPhone Control Center.'],
+   audioOffCarPlay: ['不走 CarPlay', 'Not through CarPlay'],
+   audioOutputHint: ['留在 CarPlay：音乐、Siri、通话在 iPhone 控制中心选输出，导航在本页；不走 CarPlay：全部由 iPhone 或它的蓝牙播放', 'Keep on CarPlay: pick music, Siri and call output in iPhone Control Center, navigation plays here. Not through CarPlay: every sound plays on the iPhone or its Bluetooth'],
+   audioNavVolume: ['导航播报音量', 'Navigation volume'],
+diff --git a/web/src/main.ts b/web/src/main.ts
+index 2af639c..39ff5cb 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -1,4 +1,4 @@
+-import { CATEGORY_ROUTE, initialRoutes, validRoutes, sameRoutes, displayedVolume, type AudioRoutes, type Destination, type RouteName } from './audio-routes';
++import { categoryDestination, initialRoutes, validRoutes, sameRoutes, displayedVolume, type AudioRoutes, type Destination, type RouteName } from './audio-routes';
+ import { startup, startupStats } from './startup';
+ import { AudioEngine } from './audio';
+ import { AUDIO_CATEGORIES, STORAGE_KEY as AUDIO_MIX_KEY, gainPercent, volumePercent, mixPercent, parseMix, type AudioCategory } from './audio-mix';
+@@ -311,7 +311,15 @@ let routeMessage: Key | null = null;
+ const promptGain = Number(new URLSearchParams(location.search).get('promptgain')) || (carMusic ? 3 : 1);
+ // Music the iPhone still sends here is played: it sends music to one place at a time, and after Siri from the
+ // CarPlay screen it sent it here for ~27 s before going back to the car's Bluetooth, silent while it was dropped.
+-const audio = new AudioEngine(error, { promptBoost: promptGain, idleClose: carMusic });
++// Tesla mode drops it instead (2026-11-01): a moving Tesla answers a page playing music with "video is audio-only"
++// and the banner's resize renegotiated CarPlay every ~10 s. The owner is told once per page.
++let droppedMusicShown = false;
++const audio = new AudioEngine(error, { promptBoost: promptGain, idleClose: carMusic, dropMusic: teslaMode,
++  onDroppedMusic: () => { if (!droppedMusicShown) { droppedMusicShown = true; toast(t('teslaMusicDropped')); } } });
++// Tesla mode's sound panel names the one choice it offers: where navigation plays (audio-routes.categoryDestination).
++if (teslaMode) for (const [from, to] of [['audioOutput', 'teslaNavOutput'], ['audioOutputHint', 'teslaNavOutputHint'],
++  ['audioOffCarPlay', 'teslaNavBluetooth'], ['audioMixHint', 'teslaMixHint']] as const)
++  document.querySelectorAll<HTMLElement>(`#audio-mix [data-i18n="${from}"], #audio-mix ~ [data-i18n="${from}"]`).forEach(e => { e.dataset.i18n = to; });
+ // Every visible slider uses 0–100. Keep the existing gain/storage values underneath, so opening an
+ // upgraded page never changes the sound. Navigation's existing baseline still includes its prompt boost.
+ const AUDIO_LABELS: Record<AudioCategory, Key> = {
+@@ -321,7 +329,7 @@ let audioMix = parseMix(localStorage.getItem(AUDIO_MIX_KEY));
+ for (const category of AUDIO_CATEGORIES) audio.setCategoryPercent(category, mixPercent(audioMix, category));
+ function renderAudioMix() {
+   for (const category of AUDIO_CATEGORIES) {
+-    const destination = audioRoutes[CATEGORY_ROUTE[category]];
++    const destination = categoryDestination(category, audioRoutes, teslaMode);
+     const percent = displayedVolume(destination, Math.round(volumePercent(category, mixPercent(audioMix, category))));
+     const input = el<HTMLInputElement>(`audio-${category}`);
+     input.max = '100';
+@@ -330,18 +338,20 @@ function renderAudioMix() {
+     // Over the car's Bluetooth this page plays none of it: the slider would change nothing (2026-10-29).
+     const onCar = destination === 'bluetooth';
+     input.disabled = onCar;
+-    el(`audio-${category}-base`).textContent = onCar ? t('audioOnCar') : category === 'alert' ? t('audioSystemAlert') : '';
++    el(`audio-${category}-base`).textContent = onCar ? t(teslaMode ? 'teslaOnCar' : 'audioOnCar')
++      : category === 'alert' ? t('audioSystemAlert') : '';
+     el(`audio-${category}-value`).textContent = `${percent}%`;
+   }
+   // Off CarPlay the page plays nothing at all, so the master gain would change nothing either (2026-10-31, owner).
+   const offCarPlay = audioRoutes.navigation === 'bluetooth';
+   volume.disabled = offCarPlay;
+-  el('volume-base').textContent = offCarPlay ? t('audioOnCar') : '';
++  el('volume-base').textContent = offCarPlay ? t(teslaMode ? 'teslaOnCar' : 'audioOnCar') : '';
+   for (const target of ['carplay', 'bluetooth'] as const) {
+     const button = el<HTMLButtonElement>(`route-default-${target}`);
+     button.disabled = !routesSupported || routesBusy;
+     button.setAttribute('aria-pressed', String(audioRoutes.navigation === target));
+-    button.setAttribute('aria-label', `${t('audioOutput')} · ${target === 'carplay' ? 'CarPlay' : t('audioOffCarPlay')}`);
++    button.setAttribute('aria-label', teslaMode ? `${t('teslaNavOutput')} · ${target === 'carplay' ? 'CarPlay' : t('teslaNavBluetooth')}`
++      : `${t('audioOutput')} · ${target === 'carplay' ? 'CarPlay' : t('audioOffCarPlay')}`);
+   }
+   el('audio-route-status').textContent = routeMessage ? t(routeMessage) : '';
+ }

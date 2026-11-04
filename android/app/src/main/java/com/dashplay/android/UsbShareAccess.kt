@@ -55,12 +55,12 @@ internal class UsbShareAccess internal constructor(context: Context,
         if (target != null && (target != next || !token.valid(generation))) {
             if (!recover()) return
         }
-        if (!wanted) { phase = "OFF"; message = if (settings.usbHotspotShare) "等待启用数据线借网" else "热点共享未启用"; return }
+        if (!wanted) { phase = "OFF"; message = if (settings.usbHotspotShare) "等待启用通过数据线使用 iPhone 网络" else "热点共享未启用"; return }
         if (network?.kind != LocalNetwork.Kind.HOTSPOT || settings.network != Network.THIS_HOTSPOT) {
             phase = "WAITING_HOTSPOT"; message = "请让车机连接这台安卓设备的热点；外部 Wi-Fi 的网关不由本应用控制。"; return
         }
         if (next == null || runtime.installed == null && !UsbVpnService.internetReady) {
-            phase = "WAITING_USB"; message = "等待 iPhone 数据线借网通道就绪"; return
+            phase = "WAITING_USB"; message = "等待通过数据线建立 iPhone 网络连接"; return
         }
         if (runtime.installed == null) {
             if (failedTarget == next) return
@@ -79,7 +79,7 @@ internal class UsbShareAccess internal constructor(context: Context,
         }
         active = true
         phase = if (UsbVpnService.internetReady) "READY" else "WAITING_USB"
-        message = if (UsbVpnService.internetReady) "热点 IPv4 已转接至 iPhone；外网取决于 iPhone 连接" else "iPhone 借网暂不可用，热点互联网已暂停"
+        message = if (UsbVpnService.internetReady) "热点 IPv4 已转接至 iPhone；外网取决于 iPhone 连接" else "iPhone 网络暂不可用，热点互联网已暂停"
     }
 
     private fun start(next: Target) {
@@ -87,7 +87,7 @@ internal class UsbShareAccess internal constructor(context: Context,
         if (!recover()) return
         generation = token.version()
         try {
-            val vpn = next.tunnel.internetPlan ?: error("USB 借网未启用")
+            val vpn = next.tunnel.internetPlan ?: error("尚未启用通过数据线使用 iPhone 网络")
             val local = next.network.address as Inet4Address
             val prefix = NetworkInterface.getNetworkInterfaces().toList().flatMap { it.interfaceAddresses }
                 .single { it.address == local }.networkPrefixLength.toInt()

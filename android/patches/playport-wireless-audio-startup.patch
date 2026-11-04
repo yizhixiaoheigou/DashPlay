@@ -1,0 +1,48 @@
+--- a/web/src/music-output.ts
++++ b/web/src/music-output.ts
+@@ -69,6 +69,11 @@
+     // backwards either: after a pause the buffer may be played out, and going back replayed what was heard
+     // (review 2026-10-12); then the music waits for its cushion and plays on (pump).
+     const b=this.buffer;
++    // A new wireless stream has no buffered range yet. It needs the same reserve as resume;
++    // otherwise the first 85 ms fragment starts playing and immediately runs out during a Wi-Fi burst gap.
++    if(this.kind==='aac' && this.element.paused && !b?.buffered.length){
++      this.holding=true;this.pump();return Promise.resolve();
++    }
+     if(this.element.paused && b?.buffered.length){
+       const target=b.buffered.end(b.buffered.length-1)-CUSHION[this.kind];
+       if(target>this.element.currentTime)this.element.currentTime=Math.max(b.buffered.start(0),target);
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -217,6 +217,20 @@
+   assert.equal(element.plays,1,'and plays on once a second of new audio is in');
+   element.paused=true;element.currentTime=6;buffer.ranges=[[5,12]];await resumed.unlock();
+   assert.equal(element.currentTime,11,'A stale buffer still jumps forward to 1 s before its end');
++  // A brand-new wireless stream must not play its first tiny fragment before a Wi-Fi gap.
++  buffer.ranges=[];element.paused=true;element.currentTime=0;element.plays=0;
++  const fresh=new MusicOutput({sampleRate:48000,channels:2,description:new Uint8Array()},()=>{},'aac');
++  await fresh.unlock();assert.equal(element.plays,0,'empty wireless stream waits for its initial reserve');
++  buffer.ranges=[[0,.085]];buffer.listeners.updateend();assert.equal(element.plays,0,'one AAC fragment is insufficient');
++  buffer.ranges=[[0,.99]];buffer.listeners.updateend();assert.equal(element.plays,0,'reserve has not reached one second');
++  buffer.ranges=[[0,1.024]];buffer.listeners.updateend();assert.equal(element.plays,1,'starts once the reserve is available');
++  assert.equal(element.currentTime,0,'initial buffering never replays or seeks backward');
++  fresh.close();
++  // Cancelling during initial buffering must not restart playback on a later append.
++  buffer.ranges=[];element.paused=true;element.currentTime=0;element.plays=0;
++  const cancelled=new MusicOutput({sampleRate:48000,channels:2,description:new Uint8Array()},()=>{},'aac');
++  await cancelled.unlock();cancelled.pause();buffer.ranges=[[0,1.024]];buffer.listeners.updateend();
++  assert.equal(element.plays,0,'explicit pause cancels the pending start');
+   Object.defineProperty(performance,'now',{value:realNow,configurable:true,writable:true}); }
+ media.setActive(false);assert.equal(navigator.mediaSession.playbackState,'none');assert.equal(navigator.mediaSession.metadata,null);
+ // Music must take exactly one route; voice/navigation keep the existing Web Audio path.
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -976,7 +976,7 @@
+   connection.send({type:'stats',stats:{ev,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,width:screen.clientWidth,height:screen.clientHeight,want:wantFullscreen?1:0,...viewport()}});
+ }
+ /** Which page build runs (raised with each build tried in the car). */
+-const BUILD = 2026110422;
++const BUILD = 2026110423;
+ /** What the browser says of the space it gives the page, to find the car's bar over a fullscreen page (2026-10-13):
+  *  window, visual viewport (and its offset), screen, available screen, outer window, pixel ratio. */
+ function viewport(): Record<string, number> {

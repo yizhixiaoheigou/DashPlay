@@ -172,7 +172,7 @@ def load(state: Path):
     return value
 
 
-_SAVING = threading.Lock()
+_SAVING = threading.RLock()
 
 
 def save_json(path: Path, value):
@@ -181,13 +181,46 @@ def save_json(path: Path, value):
     temporary file (a double-click on save wrote both into one .tmp and failed the second rename; review 2026-10-12)."""
     with _SAVING:
         fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as out:
-            json.dump(value, out)
-            out.flush()
-            os.fsync(out.fileno())
-        Path(name).replace(path)
-        os.sync()   # the root fs commits only every 120 s; saved settings must survive switching the car off
+        try:
+            with os.fdopen(fd, "w") as out:
+                os.fchmod(out.fileno(), 0o600)
+                json.dump(value, out)
+                out.flush()
+                os.fsync(out.fileno())
+            Path(name).replace(path)
+            os.sync()   # saved settings must survive switching the car off
+        finally:
+            Path(name).unlink(missing_ok=True)
+
+
+def save_json_many(values):
+    """Save one validated form, verify readback, and restore prior files on a synchronous failure.
+
+    Each file remains atomic; this is not a power-loss transaction across multiple files.
+    Callers place setup.json/options.json last and only restart after successful readback.
+    """
+    with _SAVING:
+        previous = {path: path.read_bytes() if path.exists() else None for path in values}
+        touched = []
+        try:
+            for path, value in values.items():
+                touched.append(path)
+                save_json(path, value)
+                if json.loads(path.read_text()) != value:
+                    raise OSError('settings readback mismatch')
+        except (OSError, ValueError):
+            failed = False
+            for path in reversed(touched):
+                try:
+                    if previous[path] is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        save_json(path, json.loads(previous[path]))
+                except (OSError, ValueError):
+                    failed = True
+            if failed:
+                raise OSError('settings rollback incomplete') from None
+            raise
 
 
 def save(state: Path, value):

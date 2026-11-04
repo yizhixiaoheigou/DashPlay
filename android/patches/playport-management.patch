@@ -42,7 +42,7 @@ diff --git a/web/src/main.ts b/web/src/main.ts
  function showBoxLinks(port: number) {
 -  const base = `http://${location.hostname}${port === 80 ? '' : `:${port}`}/`;
 +  const settingsPath = (window as unknown as { playportSettingsPath?: string }).playportSettingsPath;
-+  const base = settingsPath === '/manage' ? '/manage' : `http://${location.hostname}${port === 80 ? '' : `:${port}`}/`;
++  const base = settingsPath === '/manage' ? `http://${location.hostname}:${port || Number(location.port) || 18743}/manage` : `http://${location.hostname}${port === 80 ? '' : `:${port}`}/`;
    const links: [string, string][] = [['box-link', base], ['add-phone-panel', `${base}#phones`], ['box-settings-panel', base]];
    for (const [id, href] of links) {
      const link = el<HTMLAnchorElement>(id);

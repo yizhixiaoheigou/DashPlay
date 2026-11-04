@@ -1,0 +1,174 @@
+Compatible display for older car browsers (2026-10-17). A tester's Tesla on Chrome 113 decoded every frame - fps
+full, no error - and showed nothing: the low-latency canvas (desynchronized, playport-latency.patch) and the
+hardware-decoder preference (prefer-hardware) failed there without an error, and both fall back only on one (the
+watchdog only waits for the first decoded frame). Compatible display uses neither: about one frame later, the
+browser picks the decoder. On by default below Chrome 120, the oldest car browser seen working (XPeng G6; the
+Tesla we drove runs 148); a switch in Display turns it on or off for that browser and reloads the page. The
+viewer log carries compat=0/1 next to chrome.
+
+diff --git a/web/check-car.mjs b/web/check-car.mjs
+index 17b2ea0..889bf01 100644
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -258,3 +258,28 @@ console.log('Tesla fullscreen: only with its video sites reachable.');
+     ['No picture yet','Decode 63 ms · Queue 1 · RTT –','Sound none']);
+   assert.equal(hudLines({...sample,playing:false},true)[2].endsWith('（静音中）'),true);
+ }
++
++{ // Compatible display (2026-10-17): a Tesla on Chrome 113 decoded at full rate and showed nothing with the
++  // low-latency canvas and the hardware preference, and neither fell back without an error.
++  const {compatDisplayOn}=await load('compat-display');
++  const ua=v=>`Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${v}.0.0.0 Safari/537.36`;
++  assert.deepEqual([113,119,120,148].map(v=>compatDisplayOn('',ua(v))),[true,true,false,false],'automatic: on below Chrome 120');
++  assert.equal(compatDisplayOn('','Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15'),false,'not Chrome: as before');
++  assert.equal(compatDisplayOn('0',ua(113)),false,'the switch wins either way');assert.equal(compatDisplayOn('1',ua(148)),true);
++  const configs=[];
++  globalThis.VideoDecoder=class {constructor(){this.state='unconfigured';this.decodeQueueSize=0;}configure(c){configs.push(c);this.state='configured';}decode(){}close(){this.state='closed';}};
++  VideoDecoder.isConfigSupported=async()=>({supported:true});
++  globalThis.window=globalThis.window??{};window.setTimeout=()=>1;window.clearTimeout=()=>{};
++  const {VideoPlayer}=await load('video',s=>s.replace(/^import .*?;$/gm,'')+'\nconst VideoCodec={H264:1,H265:2};function avcCodecString(){return "avc1.640028";}function annexBToAvcc(d){return d;}');
++  const hvcC=new Uint8Array([1,1,0x60,0,0,0,0x90,0,0,0,0,0,0x5d]);
++  for (const compat of [false,true]) {
++    const contexts=[];const canvas={getContext(kind,options){contexts.push(options??null);return null;},width:0,height:0};
++    const player=new VideoPlayer(canvas,()=>{},()=>{},()=>{},()=>{},compat);
++    player.configure({codec:1,width:1280,height:846,codecData:new Uint8Array([1,0x64,0,0x28,0x40])});await Promise.resolve();
++    player.configure({codec:2,width:1280,height:846,codecData:hvcC});for(let i=0;i<5;i++)await Promise.resolve();
++    assert.deepEqual(contexts,compat?[]:[{desynchronized:true}],compat?'compatible: no low-latency canvas':'default: the low-latency canvas');
++    assert.deepEqual(configs.splice(0).map(c=>c.hardwareAcceleration),compat?['no-preference','no-preference']:['prefer-hardware','prefer-hardware'],
++      'H.264 and the first H.265 candidate');
++  }
++}
++console.log('Compatible display: automatic below Chrome 120, neither low-latency canvas nor hardware preference.');
+diff --git a/web/index.html b/web/index.html
+index 622b3d5..340baf5 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -32,6 +32,7 @@
+     <label class="cell"><span class="main"><b data-i18n="nightMode"></b><span id="night-status"></span></span><select id="night-mode"><option value="schedule" data-i18n="nightSchedule"></option><option value="system" data-i18n="nightSystem"></option><option value="day" data-i18n="nightDay"></option><option value="night" data-i18n="nightNight"></option></select></label>
+     <label class="cell"><span class="main"><b data-i18n="auto"></b></span><input id="auto-fit" class="switch" type="checkbox"/></label>
+     <label class="cell"><span class="main"><b data-i18n="debugHud"></b><span data-i18n="debugHudHint"></span></span><input id="debug-hud-on" class="switch" type="checkbox"/></label>
++    <label class="cell"><span class="main"><b data-i18n="compatDisplay"></b><span data-i18n="compatDisplayHint"></span></span><input id="compat-display-on" class="switch" type="checkbox"/></label>
+     <details><summary class="cell"><span class="main"><b data-i18n="custom"></b></span><span id="display-status" class="value" role="status"></span><span class="chev"></span></summary>
+       <form id="display-form" class="inner"><fieldset id="display-fields"><div class="pair"><label><span data-i18n="width"></span><input id="width" type="number" min="480" max="3840" step="2" required/></label><label><span data-i18n="height"></span><input id="height" type="number" min="480" max="3840" step="2" required/></label></div><div class="pair"><label><span data-i18n="ui"></span><select id="ui-scale"><option value="85" data-i18n="small"></option><option value="100" data-i18n="standard"></option><option value="115" data-i18n="large"></option></select></label><label><span data-i18n="fps"></span><select id="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label></div><div class="pair"><label><span data-i18n="codec"></span><select id="codec"><option value="auto" data-i18n="codecAuto"></option><option value="h264">H.264</option><option value="h265">H.265</option></select></label></div></fieldset><button id="apply" class="btn" data-i18n="apply"></button></form></details>
+   </div>
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+index 98bbd80..f1b66ad 100644
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -16,6 +16,7 @@ const messages = {
+   nightNow: ['当前请求：', 'Requested now: '], nightOn: ['夜间', 'night'], nightOff: ['白天', 'day'], browserDark: ['车机浏览器报告深色模式', 'Car browser reports dark mode'], browserLight: ['车机浏览器报告浅色模式', 'Car browser reports light mode'],
+   latency: ['解码延迟', 'Decode delay'],
+   debugHud: ['画面上显示调试信息', 'Debug info over the picture'], debugHudHint: ['帧率、分辨率、码率、声音，右下角', 'Frame rate, size, bitrate, sound; bottom right'],
++  compatDisplay: ['兼容显示', 'Compatible display'], compatDisplayHint: ['有声音但画面黑屏时打开（老车机浏览器默认打开）；切换后页面会刷新', 'Turn on if there is sound but no picture (on by default in older car browsers); the page reloads'],
+   ui: ['界面大小', 'UI size'], fps: ['帧率', 'Frame rate'], codec: ['视频编码', 'Video codec'], codecAuto: ['自动', 'Automatic'], standard: ['标准', 'Standard'], large: ['大', 'Large'], small: ['小', 'Small'],
+   loading: ['正在读取…', 'Loading…'], applying: ['正在应用…', 'Applying…'], applied: ['已保存，正在重新连接 CarPlay。', 'Saved. Reconnecting CarPlay.'],
+   loadFail: ['读取失败，请检查盒子连接后重试。', 'Could not load settings. Check the receiver connection and retry.'],
+diff --git a/web/src/main.ts b/web/src/main.ts
+index cfea4f3..4a3ca10 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -11,6 +11,7 @@ import { t, language, setLanguage, type Key } from './i18n';
+ import { isNight, parseNightMode } from './night';
+ import { reachable, TESLA_HOPS } from './tesla-fullscreen';
+ import { hudLines } from './debug-hud';
++import { compatDisplayOn } from './compat-display';
+ import type { ServerMessage, ClientMessage } from './protocol';
+ 
+ function el<T extends HTMLElement = HTMLElement>(id: string): T { return document.getElementById(id) as T; }
+@@ -110,6 +111,9 @@ function judgeDecoder(decodeMs: number, fps: number) {
+   if (slowReports >= 3 && fastDecoder()) { saveFlag('f50-fast-decoder', '0'); lastAutoTarget = ''; scheduleAuto(); }
+ }
+ function send(message: ClientMessage) { if (active) connection.send(message); }
++// Compatible display (compat-display.ts): automatic by the browser's version, or the switch in Display; chosen once
++// per page, since a canvas keeps the kind it was made with (the switch reloads the page).
++const compatDisplay = compatDisplayOn(readFlag('f50-compat-display'), navigator.userAgent);
+ const video = new VideoPlayer(canvas, error, () => {
+   if (!active) return;
+   if (!shownOnce) { startup.mark('firstFrameMs'); connection.send({type:'stats', stats:{ev:16,...startupStats()}}); }
+@@ -122,7 +126,7 @@ const video = new VideoPlayer(canvas, error, () => {
+     if (input.lastDownAt - lastPaintAt >= 150) { touchSum += now - input.lastDownAt; touchCount++; }
+   }
+   lastPaintAt = now;
+-}, () => send({ type:'keyframe' }), fit);
++}, () => send({ type:'keyframe' }), fit, compatDisplay);
+ // Music over the car's Bluetooth, turned on by the person on the box (found in a Tesla, 2026-10-14; any car paired
+ // with the iPhone): the steering wheel, media card and volume are the car's own; this page plays prompts (boosted)
+ // and whatever else the iPhone still sends. ?promptgain=1..8 overrides the boost. Tesla mode sets it too, and adds
+@@ -408,7 +412,7 @@ function pageEvent(ev: number) {
+   connection.send({type:'stats',stats:{ev,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,width:screen.clientWidth,height:screen.clientHeight,want:wantFullscreen?1:0,...viewport()}});
+ }
+ /** Which page build runs (raised with each build tried in the car). */
+-const BUILD = 202610161700;
++const BUILD = 202610171100;
+ /** What the browser says of the space it gives the page, to find the car's bar over a fullscreen page (2026-10-13):
+  *  window, visual viewport (and its offset), screen, available screen, outer window, pixel ratio. */
+ function viewport(): Record<string, number> {
+@@ -497,7 +501,7 @@ window.setInterval(()=>{
+   send({type:'stats',stats:{fps:reportFrames/seconds,decodeMs:video.decodeLatencyMs,queue:video.decodeQueueSize,
+     kbps:reportBytes*8/1000/seconds,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,
+     width:canvas.width,height:canvas.height,...(touchCount?{touchMs:touchSum/touchCount,touches:touchCount}:{}),...(musicBytes?{musicKbps:musicBytes*8/1000/seconds}:{}),
+-    ...startupStats(),chrome:chromeMajor,build:BUILD,webView,carMusic:carMusic?1:0,teslaMode:teslaMode?1:0,promptGain,...(revived?{revived}:{}),fastDecoder:fastDecoder()?1:0,hevcDecodes:hevcDecodes?1:0,hevc:display?.hevc?1:0,...microphone.report(),...audio.farReport(),...media.report(),...musicTimeline(),...audio.musicReport(),...video.takeStalls(),...lag.take(performance.now())}});
++    ...startupStats(),chrome:chromeMajor,compat:compatDisplay?1:0,build:BUILD,webView,carMusic:carMusic?1:0,teslaMode:teslaMode?1:0,promptGain,...(revived?{revived}:{}),fastDecoder:fastDecoder()?1:0,hevcDecodes:hevcDecodes?1:0,hevc:display?.hevc?1:0,...microphone.report(),...audio.farReport(),...media.report(),...musicTimeline(),...audio.musicReport(),...video.takeStalls(),...lag.take(performance.now())}});
+   judgeDecoder(video.decodeLatencyMs, reportFrames/seconds);
+   reportFrames=0;reportBytes=0;reportStart=now;touchSum=0;touchCount=0;musicBytes=0;
+ },10000);
+@@ -506,6 +510,9 @@ const hud = el('debug-hud'), hudSwitch = el<HTMLInputElement>('debug-hud-on');
+ hudSwitch.checked = readFlag('f50-debug-hud') === '1';
+ hudSwitch.onchange = () => { saveFlag('f50-debug-hud', hudSwitch.checked ? '1' : '0'); hud.hidden = !hudSwitch.checked; updateHud(); };
+ hud.hidden = !hudSwitch.checked;
++const compatSwitch = el<HTMLInputElement>('compat-display-on');
++compatSwitch.checked = compatDisplay;
++compatSwitch.onchange = () => { saveFlag('f50-compat-display', compatSwitch.checked ? '1' : '0'); location.reload(); };
+ function updateHud() {
+   const now = performance.now(), seconds = Math.max(0.25, (now - hudStart) / 1000);
+   if (!hud.hidden) hud.textContent = hudLines({ width: painted ? canvas.width : 0, height: canvas.height, fps: hudFrames / seconds,
+diff --git a/web/src/video.ts b/web/src/video.ts
+index 1a7e00b..a69aaa0 100644
+--- a/web/src/video.ts
++++ b/web/src/video.ts
+@@ -33,10 +33,14 @@ export class VideoPlayer {
+     private readonly onFrame: () => void,
+     private readonly onRequestKeyframe: () => void,
+     private readonly onResolutionChange: (width: number, height: number) => void = () => {},
++    compat = false,
+   ) {
++    // Compatible display (compat-display.ts): neither the low-latency canvas nor the hardware-decoder preference,
++    // which on an older car browser can fail without an error - frames decoded, nothing on the screen.
++    this.preferHardware = !compat;
+     // Low-latency canvas: frames reach the screen without waiting for the page compositor (about one
+     // frame sooner where supported). Created first, so every later getContext('2d') returns this one.
+-    this.canvas.getContext('2d', { desynchronized: true });
++    if (!compat) this.canvas.getContext('2d', { desynchronized: true });
+   }
+ 
+   get isConfigured(): boolean {
+@@ -115,7 +119,7 @@ export class VideoPlayer {
+         codec: candidate.codec,
+         codedWidth: message.width,
+         codedHeight: message.height,
+-        hardwareAcceleration: candidate.software ? 'no-preference' : 'prefer-hardware',
++        hardwareAcceleration: candidate.software || !this.preferHardware ? 'no-preference' : 'prefer-hardware',
+         optimizeForLatency: true,
+         ...(candidate.description ? { description: candidate.description } : {}),
+       };
+diff --git a/web/src/compat-display.ts b/web/src/compat-display.ts
+new file mode 100644
+index 0000000..09e59c8
+--- /dev/null
++++ b/web/src/compat-display.ts
+@@ -0,0 +1,15 @@
++/**
++ * Compatible display (2026-10-17). A tester's Tesla on Chrome 113 decoded every frame (fps full, no error) and showed
++ * nothing: the low-latency canvas (desynchronized) and the hardware-decoder preference failed there without an error,
++ * and both fall back only on one. Compatible display uses neither (about one frame later, the browser picks the
++ * decoder). On by default below Chrome 120, the oldest car browser seen working (XPeng G6); the switch in Display
++ * overrides that either way for this browser.
++ */
++export const COMPAT_BELOW_CHROME = 120;
++
++/** saved: '1' or '0' from the switch, anything else for automatic. */
++export function compatDisplayOn(saved: string, userAgent: string): boolean {
++  if (saved === '1' || saved === '0') return saved === '1';
++  const chrome = Number(/Chrome\/(\d+)/.exec(userAgent)?.[1] ?? 0);
++  return chrome > 0 && chrome < COMPAT_BELOW_CHROME;
++}

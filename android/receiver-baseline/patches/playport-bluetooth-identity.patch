@@ -1,0 +1,114 @@
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+index bf72eec..cd1be2b 100644
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -38,6 +38,12 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+
+     val identity = AirPlayIdentityStore.loadOrCreate(config.stateDir)
+     val deviceId: String = AirPlayIdentityStore.deviceId(identity)
++    // Use one adapter identity for Bluetooth bootstrap and AirPlay /info.
++    val hostBluetoothMac: String by lazy {
++        if (config.wireless) {
++            BluetoothBridge.resolvePath(config.bluetoothBridge)?.let(BluetoothBridge::localAddress) ?: deviceId
++        } else deviceId
++    }
+     val bindAddress: InetAddress = Networks.resolve(config.bindAddress)
+
+     val display = DisplayState(
+@@ -65,7 +71,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+         get() = AirPlayConfig(
+             deviceName = config.deviceName,
+             deviceId = deviceId,
+-            btMac = deviceId,
++            btMac = hostBluetoothMac,
+             sourceVersion = config.sourceVersion,
+             main = com.shilapi.xcertplay.airplay.CarPlayUiScale.apply(
+                 AirPlayDisplayConfig(
+diff --git a/server/src/main/kotlin/com/playport/server/WirelessBootstrap.kt b/server/src/main/kotlin/com/playport/server/WirelessBootstrap.kt
+index 8d0e24f..60c01be 100644
+--- a/server/src/main/kotlin/com/playport/server/WirelessBootstrap.kt
++++ b/server/src/main/kotlin/com/playport/server/WirelessBootstrap.kt
+@@ -50,7 +50,7 @@ class WirelessBootstrap(private val server: CarPlayServer) : Closeable {
+             if (!wifi.ssid.isNullOrBlank() && config.wifiPassphrase.isNullOrBlank()) {
+                 log.warn("no --wifi-passphrase configured; the phone must already know network {}", wifi.ssid)
+             }
+-            val bridgePath = resolveBridgePath(config.bluetoothBridge)
++            val bridgePath = BluetoothBridge.resolvePath(config.bluetoothBridge)
+             if (bridgePath == null) {
+                 log.warn(
+                     "wireless bootstrap skipped: bt-bridge helper not found; " +
+@@ -64,7 +64,7 @@ class WirelessBootstrap(private val server: CarPlayServer) : Closeable {
+                 log.warn("wireless bootstrap skipped: no paired iPhone found; pass --bt-address AA:BB:CC:DD:EE:FF")
+                 return
+             }
+-            val hostBluetoothMac = BluetoothBridge.localAddress(bridgePath) ?: server.deviceId
++            val hostBluetoothMac = server.hostBluetoothMac
+             log.info("wireless bootstrap: iPhone={} hostBt={} wifi={} ch={}", deviceAddress, hostBluetoothMac, wifi.ssid, wifi.channel)
+
+             val stream = BluetoothBridge.open(bridgePath, deviceAddress).also { bridgeProcess = it }
+@@ -122,15 +122,6 @@ class WirelessBootstrap(private val server: CarPlayServer) : Closeable {
+         }
+     }
+
+-    private fun resolveBridgePath(configured: Path?): Path? {
+-        val candidates = listOfNotNull(
+-            configured,
+-            Path.of("macos/bt-bridge/bt-bridge"),
+-            Path.of("macos/bt-bridge/.build/bt-bridge"),
+-        )
+-        return candidates.firstOrNull { Files.isExecutable(it) }
+-    }
+-
+     override fun close() {
+         stopped = true
+         running = false
+@@ -141,6 +132,15 @@ class WirelessBootstrap(private val server: CarPlayServer) : Closeable {
+
+ /** Helpers around the macOS bt-bridge executable. */
+ object BluetoothBridge {
++    fun resolvePath(configured: Path?): Path? {
++        val candidates = listOfNotNull(
++            configured,
++            Path.of("macos/bt-bridge/bt-bridge"),
++            Path.of("macos/bt-bridge/.build/bt-bridge"),
++        )
++        return candidates.firstOrNull { Files.isExecutable(it) }
++    }
++
+     private val log = LoggerFactory.getLogger("bt-bridge")
+
+     fun localAddress(bridgePath: Path): String? = runCatching {
+diff --git a/server/src/test/kotlin/com/playport/server/BluetoothIdentityTest.kt b/server/src/test/kotlin/com/playport/server/BluetoothIdentityTest.kt
+new file mode 100644
+index 0000000..b32e0e5
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/BluetoothIdentityTest.kt
+@@ -0,0 +1,28 @@
++package com.playport.server
++
++import com.shilapi.xcertplay.airplay.AirPlayInfoPlist
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNotEquals
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++
++class BluetoothIdentityTest {
++    @get:Rule val temporary = TemporaryFolder()
++
++    @Test fun wirelessInfoUsesActualAdapterInsteadOfGeneratedAirPlayId() {
++        val root = temporary.root.toPath()
++        val bridge = root.resolve("fake-bridge")
++        java.nio.file.Files.writeString(bridge, "#!/bin/sh\nprintf '02:11:22:33:44:55\\n'\n")
++        check(bridge.toFile().setExecutable(true))
++        val server = CarPlayServer(ServerConfig(
++            identityDir = root, stateDir = root.resolve("state"), bindAddress = "127.0.0.1",
++            wireless = true, bluetoothBridge = bridge,
++        ))
++        server.use {
++            assertNotEquals("02:11:22:33:44:55", it.deviceId)
++            assertEquals(listOf("02:11:22:33:44:55"), AirPlayInfoPlist.build(it.airPlayConfig)["bluetoothIDs"])
++            assertEquals(it.deviceId, it.airPlayConfig.deviceId)
++        }
++    }
++}

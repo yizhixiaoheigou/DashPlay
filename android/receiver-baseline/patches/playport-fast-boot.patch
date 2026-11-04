@@ -1,0 +1,193 @@
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+index 6ee206b..8c10e36 100644
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -70,6 +70,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+     private var wirelessGeneration = 0L
+     private val presenceHelper = System.getenv("CARPLAY_PRESENCE_HELPER")
+     @Volatile private var sessionEnded = false
++    private val closingForDisplay = AtomicBoolean(false)
+     @Volatile private var bootInvite = false
+     private var bootDeadline = 0L
+     @Volatile private var presenceLearned = false
+@@ -79,6 +80,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+     @Volatile private var invitedPhone: String? = null
+     @Volatile private var invitedAt = 0L
+     @Volatile private var handoffAcceptedAt = Long.MIN_VALUE / 2
++    @Volatile private var handoffRetried = false
+ 
+     /** The invited iPhone accepted the Bluetooth bootstrap and is about to join the Wi-Fi. */
+     fun handoffAccepted() {
+@@ -135,6 +137,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+             bootInvite = false
+             invitedPhone = null
+             handoffAcceptedAt = Long.MIN_VALUE / 2
++            handoffRetried = false
+             lastPeer = session.host
+             presenceLearned = false
+             hub.setSessionState(true, null)
+@@ -145,7 +148,10 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+             if (activeSession !== session) return
+             activeSession = null
+             if (presenceHelper != null) presence("idle")
+-            sessionEnded = true
++            // A session the receiver closed itself to apply a new display is already being re-invited;
++            // flagging it as ended made the supervisor start a second invitation that cut off the first
++            // (fullscreen switch took 19 s instead of ~12 s, 2026-10-11).
++            sessionEnded = !closingForDisplay.getAndSet(false)
+             bridge.endMicrophone()
+             hub.setSessionState(false, null)
+         }
+@@ -187,6 +193,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+         hub.inputHandler = ::routeInput
+         hub.onApplyDisplay = ::applyDisplay
+         hub.onMicrophoneData = { opus, payload -> bridge.sendMicrophonePayload(payload, opus) }
++        awaitBindAddress()
+         selectedPhone = presenceResult("boot")?.takeIf { it.isNotBlank() }
+         bootInvite = selectedPhone != null
+         if (!bootInvite && presenceHelper != null) selectedPhone = selectPhone()
+@@ -198,13 +205,37 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+             }
+         }
+         startAirPlayListener()
+-        advertiser = Advertisers.create(config.mdns, airPlayConfig, identity, bindAddress).also { it.start() }
++        // The handoff hands the iPhone this address directly, and it accepts the Bluetooth invitation
++        // ~5 s later, so mDNS (5.3 s to announce on the S805) need not delay the invitation.
++        Thread({
++            runCatching { Advertisers.create(config.mdns, airPlayConfig, identity, bindAddress).also { it.start() } }
++                .onSuccess { if (closed.get()) runCatching { it.close() } else advertiser = it }
++                .onFailure { log.warn("mDNS advertisement failed: {}", it.message) }
++        }, "mdns-start").apply { isDaemon = true; start() }
+         if (config.wireless && (presenceHelper == null || bootInvite || selectedPresent())) {
+             wireless = WirelessBootstrap(this).also { it.start() }
+         }
+         startSupervisor()
+     }
+ 
++    /**
++     * A receiver started before its network is up (CARPLAY_BIND_WAIT_MS, with ip_nonlocal_bind) loads
++     * while the box joins the Wi-Fi, then waits here until the address is really configured, so the
++     * presence check and the first invitation see the network. Gives up after the limit.
++     */
++    private fun awaitBindAddress() {
++        val limit = System.getenv("CARPLAY_BIND_WAIT_MS")?.toLongOrNull() ?: return
++        val deadline = System.nanoTime() / 1_000_000 + limit
++        while (runCatching { java.net.NetworkInterface.getByInetAddress(bindAddress) }.getOrNull() == null) {
++            if (System.nanoTime() / 1_000_000 >= deadline || closed.get()) {
++                log.warn("bind address {} still not configured; continuing", bindAddress.hostAddress)
++                return
++            }
++            Thread.sleep(100)
++        }
++        log.info("bind address {} configured", bindAddress.hostAddress)
++    }
++
+     private fun startAirPlayListener() {
+         val server = ServerSocket()
+         server.reuseAddress = true
+@@ -400,6 +431,16 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+                         if (wireless?.running != true && now - lastBootstrapAt >= 20_000) restartWireless()
+                         continue
+                     }
++                    if (joiningAfterHandoff(now, handoffAcceptedAt)) continue
++                    if (handoffStalled(now, handoffAcceptedAt) && !handoffRetried) {
++                        // First time on a hotspot, an iPhone joined the Wi-Fi after accepting but never
++                        // opened AirPlay; one more invitation started CarPlay at once (2026-10-11). The
++                        // phone's address on this network is not learned yet, so skip the presence check.
++                        handoffRetried = true
++                        log.info("invited phone accepted the handoff but did not connect; inviting it once more")
++                        restartWireless(confirmedPresent = true)
++                        continue
++                    }
+                     if (bootInvite && now < bootDeadline) {
+                         if (wireless?.running != true && now - lastBootstrapAt >= 5_000) restartWireless()
+                         continue
+@@ -435,7 +476,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+                     if (activeSession != null) continue
+                     selectedPhone = candidate
+                     log.info("eligible paired phone selected; restoring CarPlay")
+-                    restartWireless()
++                    restartWireless(confirmedPresent = true)
+                 } catch (interrupted: InterruptedException) {
+                     Thread.currentThread().interrupt()
+                     return@Thread
+@@ -458,13 +499,17 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+             "display changed to {}x{} @{}fps uiScale={} codec={} ({}); restarting CarPlay",
+             width, height, fps, display.uiScale, if (display.hevc) "h265" else "h264", display.orientation,
+         )
++        val wasActive = activeSession != null
++        closingForDisplay.set(wasActive)
+         activeSession?.close()
+-        restartWireless()
++        // The phone was just using CarPlay, so skip the ~2.4 s presence re-check before re-inviting it.
++        restartWireless(confirmedPresent = wasActive)
+         return null
+     }
+ 
++    /** confirmedPresent: the caller has just seen the selected phone on the network (skips a ~2.4 s re-check). */
+     @Synchronized
+-    private fun restartWireless() {
++    private fun restartWireless(confirmedPresent: Boolean = false) {
+         if (!config.wireless || closed.get()) return
+         val generation = ++wirelessGeneration
+         sessionEnded = false
+@@ -481,7 +526,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+                 Thread.sleep(750)
+                 synchronized(this@CarPlayServer) {
+                     if (closed.get() || generation != wirelessGeneration || activeSession != null) return@Thread
+-                    if (presenceHelper != null && !bootInvite && !selectedPresent()) return@Thread
++                    if (presenceHelper != null && !bootInvite && !confirmedPresent && !selectedPresent()) return@Thread
+                     wireless = WirelessBootstrap(this).also { it.start() }
+                 }
+             },
+@@ -539,6 +584,16 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+     }
+ 
+     companion object {
++        /**
++         * An iPhone that accepted the handoff is joining the Wi-Fi; a first join of an unknown hotspot took
++         * longer than the 5 s re-invite delay and was interrupted by a new invitation (2026-10-11).
++         */
++        internal fun joiningAfterHandoff(now: Long, acceptedAt: Long): Boolean = now - acceptedAt in 0 until HANDOFF_JOIN_MS
++
++        /** Shortly after the join grace: the phone accepted but no session started. */
++        internal fun handoffStalled(now: Long, acceptedAt: Long): Boolean =
++            now - acceptedAt in HANDOFF_JOIN_MS until HANDOFF_JOIN_MS + HANDOFF_RETRY_WINDOW_MS
++
+         internal fun shouldRestartWireless(active: Boolean, running: Boolean, elapsedMs: Long, present: Boolean, justEnded: Boolean = false): Boolean =
+             !active && present && (justEnded || elapsedMs >= (if (running) 15_000L else 5_000L))
+ 
+@@ -549,5 +604,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+         private const val BOOTSTRAP_STALE_MS = 60_000L
+         private const val DECLINE_AFTER_MS = 45_000L
+         private const val HANDOFF_ADMIT_MS = 30_000L
++        private const val HANDOFF_JOIN_MS = 25_000L
++        private const val HANDOFF_RETRY_WINDOW_MS = 20_000L
+     }
+ }
+diff --git a/server/src/test/kotlin/com/playport/server/WirelessReconnectTest.kt b/server/src/test/kotlin/com/playport/server/WirelessReconnectTest.kt
+index c845078..1d2bf9e 100644
+--- a/server/src/test/kotlin/com/playport/server/WirelessReconnectTest.kt
++++ b/server/src/test/kotlin/com/playport/server/WirelessReconnectTest.kt
+@@ -14,6 +14,21 @@ class WirelessReconnectTest {
+         assertFalse(CarPlayServer.shouldRestartWireless(false, false, 4_999, true))
+         assertFalse(CarPlayServer.shouldRestartWireless(true, false, 90_000, true))
+     }
++    @Test fun acceptedHandoffIsNotInterruptedWhileThePhoneJoinsTheWifi() {
++        val accepted = 100_000L
++        assertTrue(CarPlayServer.joiningAfterHandoff(accepted + 9_000, accepted))
++        assertTrue(CarPlayServer.joiningAfterHandoff(accepted + 24_999, accepted))
++        assertFalse(CarPlayServer.joiningAfterHandoff(accepted + 25_000, accepted))
++        assertFalse(CarPlayServer.joiningAfterHandoff(accepted, Long.MIN_VALUE / 2))
++    }
++    @Test fun stalledHandoffIsRetriedRightAfterTheJoinGraceOnly() {
++        val accepted = 100_000L
++        assertFalse(CarPlayServer.handoffStalled(accepted + 24_999, accepted))
++        assertTrue(CarPlayServer.handoffStalled(accepted + 25_000, accepted))
++        assertTrue(CarPlayServer.handoffStalled(accepted + 44_999, accepted))
++        assertFalse(CarPlayServer.handoffStalled(accepted + 45_000, accepted))
++        assertFalse(CarPlayServer.handoffStalled(accepted, Long.MIN_VALUE / 2))
++    }
+     @Test fun presentPhoneWithStaleBootstrapRetriesAfterBoundedHandshakeGrace() {
+         assertFalse(CarPlayServer.shouldRestartWireless(false, true, 14_999, true))
+         assertTrue(CarPlayServer.shouldRestartWireless(false, true, 15_000, true))

@@ -19,10 +19,18 @@ class CertificateNetworkProbe : Instrumentation() {
     private var vpnCrashControl = false
     private var packetBridgeProbe = false
     private var usbBootProbe = false
+    private var usbWizardProbe = false
+    private var usbDefaultsProbe = false
+    private var wifiSetupProbe = false
+    private var wifiWizardProbe = false
     override fun onCreate(arguments: Bundle?) {
         super.onCreate(arguments); checksProbe = arguments?.getString("probe") == "tesla-checks"
         packetBridgeProbe = arguments?.getString("probe") == "packet-bridge"
         usbBootProbe = arguments?.getString("probe") == "usb-boot"
+        usbDefaultsProbe = arguments?.getString("probe") == "usb-defaults"
+        usbWizardProbe = arguments?.getString("probe") == "usb-wizard"
+        wifiSetupProbe = arguments?.getString("probe") == "wifi-setup"
+        wifiWizardProbe = arguments?.getString("probe") == "wifi-wizard"
         internetProbe = arguments?.getString("probe") == "usb-internet"
         internetLanPort = arguments?.getString("lanPort")?.toIntOrNull() ?: 0
         internetShare = arguments?.getString("share") == "true"
@@ -36,6 +44,10 @@ class CertificateNetworkProbe : Instrumentation() {
     override fun onStart() {
         val results = Bundle()
         try {
+            if (usbWizardProbe) { UsbWizardProbe.run(this, results); finish(Activity.RESULT_OK, results); return }
+            if (usbDefaultsProbe) { UsbDefaultsProbe.run(targetContext, results); finish(Activity.RESULT_OK, results); return }
+            if (wifiWizardProbe) { WifiWizardProbe.run(this, results); finish(Activity.RESULT_OK, results); return }
+            if (wifiSetupProbe) { WifiSetupProbe.run(targetContext, results); finish(Activity.RESULT_OK, results); return }
             if (usbBootProbe) {
                 BootReceiverProbe.run(targetContext, results)
                 UsbBootProbe.run(targetContext, results)

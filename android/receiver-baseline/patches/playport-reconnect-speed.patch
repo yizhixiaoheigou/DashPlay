@@ -1,0 +1,153 @@
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+index 18b4298..453f490 100644
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -95,4 +95,7 @@ class CarPlayServer(
+     @Volatile private var handoffAcceptedAt = Long.MIN_VALUE / 2
+     @Volatile private var handoffRetried = false
++    /** Until when, and how many more times, a failed invitation is repeated at once (after a display change). */
++    @Volatile private var quickRetryUntil = Long.MIN_VALUE / 2
++    @Volatile private var quickRetriesLeft = 0
+ 
+     /** The invited iPhone accepted the Bluetooth bootstrap and is about to join the Wi-Fi. */
+@@ -100,4 +103,32 @@ class CarPlayServer(
+         handoffAcceptedAt = System.nanoTime() / 1_000_000
+     }
++    /**
++     * The invitation [link] failed. Right after a display change the phone is there and its Bluetooth link from the
++     * session just closed was still going down (br-connection-canceled): invite it again at once. The supervisor's
++     * next round took the reconnect from ~3 s to 11-13 s (XPeng, 2026-10-13: 3 of 9 display changes).
++     */
++    fun bootstrapFailed(link: WirelessBootstrap) {
++        val generation: Long
++        synchronized(this) {
++            if (closed.get() || link !== wireless || activeSession != null ||
++                !quickRetry(System.nanoTime() / 1_000_000, quickRetryUntil, quickRetriesLeft)) return
++            quickRetriesLeft--
++            generation = wirelessGeneration
++        }
++        log.info("invitation failed right after the display change; inviting again in {} ms", QUICK_RETRY_DELAY_MS)
++        Thread({
++            Thread.sleep(QUICK_RETRY_DELAY_MS)
++            synchronized(this@CarPlayServer) {
++                if (closed.get() || activeSession != null || generation != wirelessGeneration) return@Thread
++                restartWireless(confirmedPresent = true)
++            }
++        }, "wireless-quick-retry").apply { isDaemon = true; start() }
++    }
++
++    private fun armQuickRetry() {
++        quickRetryUntil = System.nanoTime() / 1_000_000 + QUICK_RETRY_WINDOW_MS
++        quickRetriesLeft = QUICK_RETRIES
++    }
++
+     fun wirelessPhone(): String? = if (presenceHelper == null) config.bluetoothDeviceAddress else selectedPhone
+ 
+@@ -156,4 +187,5 @@ class CarPlayServer(
+             handoffAcceptedAt = Long.MIN_VALUE / 2
+             handoffRetried = false
++            quickRetriesLeft = 0
+             lastPeer = session.host
+             presenceLearned = false
+@@ -703,4 +735,5 @@ class CarPlayServer(
+                     if (closed.get() || activeSession != null || generation != wirelessGeneration) return@Thread
+                     log.info("phone did not reopen CarPlay within {} ms after the display change; inviting it", keepLink)
++                    armQuickRetry()
+                     restartWireless(confirmedPresent = true)
+                 }
+@@ -712,4 +745,5 @@ class CarPlayServer(
+         wired?.restart()
+         // The phone was just using CarPlay, so skip the ~2.4 s presence re-check before re-inviting it.
++        if (wasActive) armQuickRetry()
+         restartWireless(confirmedPresent = wasActive)
+         return DisplayOutcome()
+@@ -759,9 +793,11 @@ class CarPlayServer(
+     override fun close() {
+         if (!closed.compareAndSet(false, true)) return
++        // The session first: the phone learns at once that CarPlay is over (it stayed open through the 10 s mDNS
++        // goodbye on every stop or restart, F50 2026-10-14).
++        runCatching { activeSession?.close() }
+         runCatching { wireless?.close() }
+         runCatching { wired?.close() }
+         runCatching { wiredSocket?.close() }
+         runCatching { advertiser?.close() }
+-        runCatching { activeSession?.close() }
+         runCatching { serverSocket?.close() }
+     }
+@@ -811,7 +847,13 @@ class CarPlayServer(
+             !active && present && (justEnded || elapsedMs >= (if (running) 15_000L else 5_000L))
+ 
++        /** A failed invitation is repeated at once while [now] is before [until] and retries are [left]. */
++        internal fun quickRetry(now: Long, until: Long, left: Int): Boolean = left > 0 && now < until
++
+         /** AirPlay pair-setup PIN advertised for first-time connections. */
+         const val PAIRING_PIN = "3939"
+         private const val SUPERVISOR_INTERVAL_MS = 2_000L
++        private const val QUICK_RETRY_DELAY_MS = 1_500L
++        internal const val QUICK_RETRY_WINDOW_MS = 15_000L
++        internal const val QUICK_RETRIES = 2
+         private const val BOOTSTRAP_COOLDOWN_MS = 20_000L
+         private const val BOOTSTRAP_STALE_MS = 60_000L
+diff --git a/server/src/main/kotlin/com/playport/server/MdnsAdvertiser.kt b/server/src/main/kotlin/com/playport/server/MdnsAdvertiser.kt
+index 448c9a6..8b2758d 100644
+--- a/server/src/main/kotlin/com/playport/server/MdnsAdvertiser.kt
++++ b/server/src/main/kotlin/com/playport/server/MdnsAdvertiser.kt
+@@ -53,6 +53,15 @@ class JmDnsAdvertiser(
+         serviceInfo = null
+         dns = null
+-        runCatching { info?.let { instance?.unregisterService(it) } }
+-        runCatching { instance?.close() }
++        if (instance == null) return
++        // JmDNS waits up to 5 s, twice, for its announcer to cancel: every stop or restart of the receiver took 10 s
++        // more (F50, 2026-10-14). The goodbye goes out first; whatever is left finishes without holding the stop.
++        Thread({
++            runCatching { info?.let { instance.unregisterService(it) } }
++            runCatching { instance.close() }
++        }, "mdns-close").apply { isDaemon = true; start() }.join(CLOSE_WAIT_MS)
++    }
++
++    private companion object {
++        const val CLOSE_WAIT_MS = 1_000L
+     }
+ }
+diff --git a/server/src/main/kotlin/com/playport/server/WirelessBootstrap.kt b/server/src/main/kotlin/com/playport/server/WirelessBootstrap.kt
+index e498fe5..4320c30 100644
+--- a/server/src/main/kotlin/com/playport/server/WirelessBootstrap.kt
++++ b/server/src/main/kotlin/com/playport/server/WirelessBootstrap.kt
+@@ -39,4 +39,5 @@ class WirelessBootstrap(private val server: CarPlayServer) : Closeable {
+ 
+     private fun run() {
++        var failed = false
+         try {
+             val config = server.config
+@@ -131,8 +132,12 @@ class WirelessBootstrap(private val server: CarPlayServer) : Closeable {
+             }
+         } catch (error: Exception) {
+-            if (!stopped) log.warn("wireless bootstrap failed: {}", error.message)
++            if (!stopped) {
++                log.warn("wireless bootstrap failed: {}", error.message)
++                failed = true
++            }
+         } finally {
+             close()
+         }
++        if (failed) server.bootstrapFailed(this)
+     }
+ 
+diff --git a/server/src/test/kotlin/com/playport/server/WirelessReconnectTest.kt b/server/src/test/kotlin/com/playport/server/WirelessReconnectTest.kt
+index 1d2bf9e..06f54f5 100644
+--- a/server/src/test/kotlin/com/playport/server/WirelessReconnectTest.kt
++++ b/server/src/test/kotlin/com/playport/server/WirelessReconnectTest.kt
+@@ -39,4 +39,12 @@ class WirelessReconnectTest {
+         assertFalse(CarPlayServer.shouldRestartWireless(true, true, 90_000, true, true))
+     }
++    @Test fun aFailedInvitationRightAfterADisplayChangeIsRepeatedAFewTimesOnly() {
++        val armed = 100_000L + CarPlayServer.QUICK_RETRY_WINDOW_MS
++        assertTrue(CarPlayServer.quickRetry(100_000L + 1_200, armed, CarPlayServer.QUICK_RETRIES))
++        assertTrue(CarPlayServer.quickRetry(100_000L + 4_000, armed, 1))
++        assertFalse("retries used up", CarPlayServer.quickRetry(100_000L + 5_000, armed, 0))
++        assertFalse("too long after the change", CarPlayServer.quickRetry(armed, armed, CarPlayServer.QUICK_RETRIES))
++        assertFalse("never armed", CarPlayServer.quickRetry(100_000L, Long.MIN_VALUE / 2, 0))
++    }
+     @Test fun bridgeCloseAllowsProfileCleanupBeforeDestroy() {
+         val child = object : Process() {

@@ -1,0 +1,101 @@
+diff --git a/server/src/main/kotlin/com/playport/server/ProcessByteStream.kt b/server/src/main/kotlin/com/playport/server/ProcessByteStream.kt
+index f7fb478..f071d0e 100644
+--- a/server/src/main/kotlin/com/playport/server/ProcessByteStream.kt
++++ b/server/src/main/kotlin/com/playport/server/ProcessByteStream.kt
+@@ -22,6 +22,8 @@ class ProcessByteStream(
+     private val output: OutputStream = process.outputStream
+     private val writeLock = Any()
+     @Volatile private var ended = false
++    private var remainder = ByteArray(0)
++    private var remainderOffset = 0
+
+     init {
+         Thread({ pump() }, "$label-reader").apply {
+@@ -67,20 +69,26 @@ class ProcessByteStream(
+         }
+     }
+
++    @Synchronized
+     override fun recv(maxBytes: Int, timeoutMillis: Long): ByteArray? {
+-        val chunk = if (timeoutMillis == Long.MAX_VALUE) {
+-            inbound.take()
+-        } else {
+-            inbound.poll(timeoutMillis, TimeUnit.MILLISECONDS) ?: return null
+-        }
+-        if (chunk.isEmpty()) {
+-            if (ended) return ByteArray(0)
+-            return recv(maxBytes, timeoutMillis)
++        require(maxBytes > 0) { "maxBytes must be positive" }
++        require(timeoutMillis >= 0) { "timeoutMillis must not be negative" }
++        if (remainderOffset == remainder.size) {
++            remainder = ByteArray(0)
++            remainderOffset = 0
++            if (ended && inbound.isEmpty()) return ByteArray(0)
++            val chunk = if (timeoutMillis == Long.MAX_VALUE) {
++                inbound.take()
++            } else {
++                inbound.poll(timeoutMillis, TimeUnit.MILLISECONDS) ?: return null
++            }
++            if (chunk.isEmpty()) return ByteArray(0)
++            remainder = chunk
+         }
+-        if (chunk.size <= maxBytes) return chunk
+-        // Push the remainder back for the next call.
+-        inbound.put(chunk.copyOfRange(maxBytes, chunk.size))
+-        return chunk.copyOf(maxBytes)
++        val end = remainderOffset + minOf(maxBytes, remainder.size - remainderOffset)
++        val result = remainder.copyOfRange(remainderOffset, end)
++        remainderOffset = end
++        return result
+     }
+
+     override fun close() {
+diff --git a/server/src/test/kotlin/com/playport/server/ProcessByteStreamTest.kt b/server/src/test/kotlin/com/playport/server/ProcessByteStreamTest.kt
+new file mode 100644
+index 0000000..aa26ebb
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/ProcessByteStreamTest.kt
+@@ -0,0 +1,43 @@
++package com.playport.server
++
++import java.io.ByteArrayInputStream
++import java.io.ByteArrayOutputStream
++import java.io.InputStream
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++import org.junit.Assert.*
++import org.junit.Test
++
++class ProcessByteStreamTest {
++    private class Child : Process() {
++        val drained = CountDownLatch(1)
++        private val chunks = ArrayDeque(listOf("abcd".toByteArray(), "EFGH".toByteArray()))
++        private val input = object : InputStream() {
++            override fun read(): Int = error("bulk reads only")
++            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
++                if (chunks.isEmpty()) { drained.countDown(); return -1 }
++                val next = chunks.removeFirst()
++                next.copyInto(buffer, offset)
++                return next.size
++            }
++        }
++        override fun getInputStream() = input
++        override fun getErrorStream() = ByteArrayInputStream(byteArrayOf())
++        override fun getOutputStream() = ByteArrayOutputStream()
++        override fun waitFor() = 0
++        override fun exitValue() = 0
++        override fun destroy() {}
++    }
++
++    @Test fun partialReadsPreserveOrderAheadOfAlreadyQueuedChunks() {
++        val child = Child()
++        ProcessByteStream(child, "test").use { stream ->
++            assertTrue(child.drained.await(2, TimeUnit.SECONDS))
++            for (expected in listOf("ab", "cd", "EF", "GH")) {
++                assertArrayEquals(expected.toByteArray(), stream.recv(2, 1000))
++            }
++            assertArrayEquals(byteArrayOf(), stream.recv(2, 1000))
++            assertArrayEquals(byteArrayOf(), stream.recv(2, 0))
++        }
++    }
++}

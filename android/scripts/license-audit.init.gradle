@@ -1,0 +1,30 @@
+import groovy.json.JsonOutput
+import org.gradle.maven.MavenModule
+import org.gradle.maven.MavenPomArtifact
+
+// Resolve the release graph itself, including desugaring; never infer it from an old debug build.
+allprojects { p ->
+    if (p.path == ':app') {
+        p.tasks.register('auditRuntimeNotices') {
+            doLast {
+                def items = []
+                ['releaseRuntimeClasspath', 'coreLibraryDesugaring'].each { cfg ->
+                    p.configurations.getByName(cfg).resolvedConfiguration.resolvedArtifacts.each { a ->
+                        def query = p.dependencies.createArtifactResolutionQuery()
+                            .forComponents(a.id.componentIdentifier)
+                            .withArtifacts(MavenModule, MavenPomArtifact).execute()
+                        def poms = query.resolvedComponents.collectMany { it.getArtifacts(MavenPomArtifact) }
+                            .findAll { it instanceof org.gradle.api.artifacts.result.ResolvedArtifactResult }
+                            .collect { it.file.absolutePath }
+                        items << [configuration: cfg, coordinate: a.moduleVersion.id.toString(),
+                                  file: a.file.absolutePath, poms: poms]
+                    }
+                }
+                def out = p.rootProject.file('../artifacts/android-product/runtime-license-artifacts.json')
+                out.parentFile.mkdirs()
+                out.text = JsonOutput.prettyPrint(JsonOutput.toJson(items))
+                println "LICENSE_AUDIT_ARTIFACTS ${items.size()}"
+            }
+        }
+    }
+}

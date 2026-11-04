@@ -1,0 +1,196 @@
+Viewer: the music element's own time and duration follow the song; album-art transfers in the log (2026-10-12).
+
+On the car the media card's time and duration were wrong although the box sent the right ones: the page's
+music element ran on from the start of the music (0 to 671 s, duration unknown) while the song was at 8 of
+269 s, and the card follows that element. The element now goes onto the song's timeline on each new song
+and whenever it is more than 3 s off (a seek on the iPhone): the buffered audio (about 0.65 s) is dropped,
+the next audio lands at the song position and the duration is the song's. Checked in desktop Chrome: 102.7 s
+three seconds after aligning to 100, 7.7 s into the next song, playback continues past the reported end.
+Covers are sometimes missing: the box now logs each transfer step and whether the cover reached the page,
+and the viewer stats say whether the page has one (art).
+
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -45,7 +45,8 @@
+   clock=12000;media.setMetadata({title:'Run',artist:'',album:'',durationMs:200000,positionMs:62000,playing:false,revision:3});
+   clock=20000;media.setPlaying(false);assert.equal(positions.at(-1).position,62,'Paused on the iPhone: the clock stands');
+   Object.defineProperty(performance,'now',{value:realNow,configurable:true,writable:true}); }
+-assert.deepEqual(media.report(),{positionState:1,songPos:62,songDur:200},'The viewer log tells whether the OS card can take our song position');
++assert.deepEqual(media.report(),{positionState:1,songPos:62,songDur:200,art:0},'The viewer log tells whether the OS card can take our song position, and whether a cover is shown');
++assert.equal(media.timeline().key,'Run|||200');assert.equal(media.timeline().position,62);
+ { // Hiccups for the viewer log: a gap in a flowing stream (network/box) apart from frames the car's decoder held long.
+   let clock=0;const realNow=performance.now;Object.defineProperty(performance,'now',{value:()=>clock,configurable:true,writable:true});
+   globalThis.EncodedVideoChunk=class {constructor(v){Object.assign(this,v);}};
+@@ -76,6 +77,31 @@
+   assert.equal(sizeWrites,writes,'but a canvas of the same size keeps showing the last picture');
+   player.configure(config(1082,1280,0x41));await Promise.resolve();
+   assert.equal(canvas.width,1082,'A new size resizes the canvas');assert.equal(canvas.height,1280); }
++{ // The music element's own timeline follows the song, which a car's media card may show instead of ours.
++  let clock=0;const realNow=performance.now;Object.defineProperty(performance,'now',{value:()=>clock,configurable:true,writable:true});
++  const log=[];
++  class Ranges {constructor(r){this.r=r;}get length(){return this.r.length;}start(i){return this.r[i][0];}end(i){return this.r[i][1];}}
++  const buffer={updating:false,ranges:[],timestampOffset:0,listeners:{},addEventListener(n,h){this.listeners[n]=h;},
++    get buffered(){return new Ranges(this.ranges);},appendBuffer(){log.push('append');},remove(a,b){log.push(`remove ${a}-${b}`);this.ranges=[];}};
++  const source={readyState:'open',duration:Infinity,addEventListener(n,h){h();},addSourceBuffer(){return buffer;}};
++  globalThis.MediaSource=class {constructor(){return source;}};globalThis.URL.createObjectURL=()=>'blob:x';
++  const element={currentTime:0,paused:true,setAttribute(){},addEventListener(){},play(){return Promise.resolve();},pause(){}};
++  globalThis.document={createElement:()=>element,body:{append(){}}};
++  const {MusicOutput}=await load('music-output',s=>'const FLAC_BLOCK=4096,FLAC_MIME="audio/mp4";function flacInit(){return new Uint8Array(1);}function aacInit(){return new Uint8Array(1);}\n'+s.replace(/^import .*?;$/gm,''));
++  const music=new MusicOutput({sampleRate:48000,channels:2,description:new Uint8Array()},()=>{},'flac');
++  assert.deepEqual(log,['append'],'init segment');
++  element.currentTime=600;buffer.ranges=[[599,600.6]];
++  music.follow({position:8,duration:269,key:'A',playing:true});
++  assert.deepEqual(log.slice(1),['remove 0-Infinity'],'A new song first drops the old timeline');
++  clock=100;buffer.listeners.updateend();
++  assert.equal(element.currentTime,8.1,'then plays from the song position');assert.equal(source.duration,269,'with the song duration');
++  assert.equal(buffer.timestampOffset,8.1,'and the next audio lands there');
++  log.length=0;element.currentTime=9;buffer.ranges=[[8.1,9.6]];
++  clock=1000;music.follow({position:9,duration:269,key:'A',playing:true});
++  assert.ok(!log.some(x=>x.startsWith('remove')),'Following the same song moves nothing');
++  clock=10000;music.follow({position:60,duration:269,key:'A',playing:true});
++  assert.ok(log.includes('remove 0-Infinity'),'A seek on the iPhone (more than 3 s off) realigns');
++  Object.defineProperty(performance,'now',{value:realNow,configurable:true,writable:true}); }
+ media.setActive(false);assert.equal(navigator.mediaSession.playbackState,'none');assert.equal(navigator.mediaSession.metadata,null);
+ // Music must take exactly one route; voice/navigation keep the existing Web Audio path.
+ const edges=[];let music;let packets=0;
+--- a/web/src/music-output.ts
++++ b/web/src/music-output.ts
+@@ -3,6 +3,8 @@
+ import type { AudioConfigMessage } from './protocol';
+ /** aac: stream 102's AAC as sent. flac: the wired iPhone's LPCM, losslessly framed (flac-mp4.ts). */
+ export type MusicKind = 'aac' | 'flac';
++/** The song as the iPhone reports it: position and duration in seconds, and what identifies the song. */
++export interface SongTimeline { position: number; duration: number; key: string; playing: boolean; }
+ const MIMES: Record<MusicKind,string> = { aac: 'audio/mp4; codecs="mp4a.40.2"', flac: FLAC_MIME };
+ /** A real HTML media timeline makes received music eligible for OS media controls. */
+ export class MusicOutput {
+@@ -22,6 +24,10 @@
+   private pcm:Uint8Array[]=[];
+   private pcmBytes=0;
+   private block=0;
++  private song:(SongTimeline&{at:number})|null=null;
++  private alignedKey='';
++  private alignedAt=-Infinity;
++  private started=false;
+   private readonly rate:number;
+   private readonly channels:number;
+   readonly configKey: string;
+@@ -74,15 +80,37 @@
+     if(this.pending.length>12){this.onError('Music buffer is not advancing');this.close();return;}
+     this.pump();
+   }
++  /** A car's media card may show this element's own timeline instead of the song's (2026-10-12 drive: it ran on
++   *  from the start of the music, 0 to 671 s, duration unknown, while the song was at 8 of 269 s). */
++  follow(song:SongTimeline|null){
++    this.song=song&&song.duration>0?{...song,at:performance.now()}:null;
++    this.pump();
++  }
++  /** Moves the element onto the song's timeline: on a new song, or when it is more than 3 s off. What is buffered
++   *  (about 0.65 s) is dropped, usually the gap between two songs. */
++  private align(b:SourceBuffer):boolean{
++    const song=this.song;if(!song||!this.started)return false;
++    const position=Math.min(song.duration,song.position+(song.playing?(performance.now()-song.at)/1000:0));
++    const now=performance.now();
++    if(song.key===this.alignedKey&&(Math.abs(this.element.currentTime-position)<=3||now-this.alignedAt<5000))return false;
++    if(b.buffered.length){b.remove(0,Infinity);return true;}
++    this.pending=[];
++    b.timestampOffset=position-this.samples/this.rate;
++    this.source.duration=Math.max(song.duration,position);
++    this.element.currentTime=position;
++    this.alignedKey=song.key;this.alignedAt=now;
++    return false;
++  }
+   private pump(){
+     const b=this.buffer;if(this.closed||!b||b.updating||this.source.readyState!=='open')return;
+     try {
++      if(this.align(b))return;
+       if(b.buffered.length){
+         const end=b.buffered.end(b.buffered.length-1),now=this.element.currentTime;
+         if(end-now>2)this.element.currentTime=Math.max(b.buffered.start(0),end-.65);
+         if(now-b.buffered.start(0)>15){b.remove(0,now-10);return;}
+       }
+-      const next=this.pending.shift();if(next)b.appendBuffer(next as Uint8Array<ArrayBuffer>);
++      const next=this.pending.shift();if(next){b.appendBuffer(next as Uint8Array<ArrayBuffer>);this.started=true;}
+     }catch(error){this.onError(String(error));}
+   }
+   close(){
+--- a/web/src/audio.ts
++++ b/web/src/audio.ts
+@@ -1,4 +1,4 @@
+-import { MusicOutput } from './music-output';
++import { MusicOutput, type SongTimeline } from './music-output';
+ import { audioStartTime } from './audio-timing';
+ import { AudioCodec, type AudioConfigMessage, type AudioPacketMessage } from './protocol';
+ 
+@@ -173,6 +173,11 @@
+     this.closeStream(streamType);
+   }
+ 
++  /** Keeps the music element's timeline on the song (music-output.ts). */
++  followMusic(song: SongTimeline | null): void {
++    for (const state of this.streams.values()) state.music?.follow(song);
++  }
++
+   pauseMusic(): void {
+     for (const state of this.streams.values()) state.music?.pause();
+   }
+--- a/web/src/media-session.ts
++++ b/web/src/media-session.ts
+@@ -38,10 +38,17 @@
+     if (this.supported) navigator.mediaSession.metadata = this.active && typeof MediaMetadata !== "undefined" ? new MediaMetadata(this.info) : null;
+   }
+   readonly supported = 'mediaSession' in navigator;
++  /** The song for the music element's own timeline; null while no song with a duration plays. */
++  timeline(): { position: number; duration: number; key: string; playing: boolean } | null {
++    if (!this.active || this.duration <= 0) return null;
++    return { position: this.positionNow(), duration: this.duration, playing: (this.phonePlaying ?? this.playing),
++      key: [this.info.title, this.info.artist, this.info.album, this.duration].join('|') };
++  }
+   /** For the box's viewer log: can the OS media card take our song position at all, and which one we give it. */
+   report(): Record<string, number> {
+     const positionState = this.supported && typeof navigator.mediaSession.setPositionState === 'function' ? 1 : 0;
+-    return this.duration > 0 ? { positionState, songPos: Math.round(this.positionNow()), songDur: Math.round(this.duration) } : { positionState };
++    const art = this.info.artwork && (this.info.artwork as MediaImage[]).length ? 1 : 0;
++    return this.duration > 0 ? { positionState, songPos: Math.round(this.positionNow()), songDur: Math.round(this.duration), art } : { positionState };
+   }
+   constructor(private readonly send: (message: ClientMessage) => void, unlock: () => void, pause: () => void = () => {}) {
+     if (!this.supported) return;
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -128,7 +128,7 @@
+   // Straight back, also before CarPlay starts: the box pauses the picture while this page lags behind.
+   if (message.type === 'mark') { connection.send({ type: 'ack', mark: message.mark ?? 0 }); return; }
+   if(message.type === 'artwork' && message.artwork) { media.setArtwork(message.revision ?? 0,message.artwork); return; }
+-  if (message.type === 'now-playing' && message.nowPlaying) { media.setMetadata(message.nowPlaying); return; }
++  if (message.type === 'now-playing' && message.nowPlaying) { media.setMetadata(message.nowPlaying); audio.followMusic(media.timeline()); return; }
+   if (message.type === 'host-ui' && active) {
+     openPanel(); return;
+   }
+@@ -264,7 +264,7 @@
+   const now=performance.now(),fps=frames*1000/Math.max(1,now-lastStats);frames=0;lastStats=now;
+   el('stats').textContent=painted?`${canvas.width} × ${canvas.height} / ${fps.toFixed(0)} fps / ${t('latency')} ${video.decodeLatencyMs.toFixed(0)} ms`:t('noStream');
+   el('audio-unlock').hidden=!active||audio.isUnlocked;
+-  el('audio-status').textContent=t(audio.isPlaying?'playing':'paused');media.setPlaying(audio.isPlaying);
++  el('audio-status').textContent=t(audio.isPlaying?'playing':'paused');media.setPlaying(audio.isPlaying);audio.followMusic(media.timeline());
+ },750);
+ // Which browser the car runs and the music element's own timeline, which an OS media card may show instead of the song's.
+ const chromeMajor=Number(/Chrome\/(\d+)/.exec(navigator.userAgent)?.[1] ?? 0),webView=/; wv\)/.test(navigator.userAgent)?1:0;
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -421,10 +421,14 @@
+         val artwork = com.shilapi.xcertplay.iap2.message.Iap2ArtworkReceiver(
+             send = { channel.sendFileTransfer(it) { current() } },
+             complete = { revision, id, bytes ->
+-                current() && metadata.value.revision == revision && metadata.artworkId == id && hub.artwork(revision, bytes)
++                (current() && metadata.value.revision == revision && metadata.artworkId == id && hub.artwork(revision, bytes)).also {
++                    log.info("artwork id={} revision={} bytes={} sent to the page={} (song revision now {})",
++                        id, revision, bytes.size, it, metadata.value.revision)
++                }
+             },
+             clock = { System.nanoTime() / 1_000_000 },
+-            onDiagnostic = { log.debug(it) },
++            // A few lines a song: covers are sometimes missing on the car, and the debug log is not kept.
++            onDiagnostic = { log.info(it) },
+         )
+         Thread({
+             try {

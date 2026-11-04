@@ -1,0 +1,1084 @@
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/transport/LockdownCarKitClient.kt b/protocol/src/main/java/com/shilapi/xcertplay/transport/LockdownCarKitClient.kt
+index 0e554f4..cdaf83d 100644
+--- a/protocol/src/main/java/com/shilapi/xcertplay/transport/LockdownCarKitClient.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/transport/LockdownCarKitClient.kt
+@@ -19,45 +19,24 @@ class LockdownCarKitClient(
+         open(pairedRecord.pairRecord, label)
+ 
+     @Throws(IphoneUsbException::class, GeneralSecurityException::class)
+-    fun open(pairRecord: LockdownPairRecord, label: String): BlockingDuplexByteStream =
+-        openService(pairRecord, label, CARKIT_SERVICE)
++    fun open(pairRecord: LockdownPairRecord, label: String,
++             onSession: ((LockdownPlistChannel) -> Unit)? = null): BlockingDuplexByteStream =
++        openService(pairRecord, label, CARKIT_SERVICE, onSession)
+ 
+-    fun openService(pairRecord: LockdownPairRecord, label: String, serviceName: String): BlockingDuplexByteStream {
++    /** USB trust session only: no carkit service, iAP2, or CarPlay start request. */
++    fun openSession(pairRecord: LockdownPairRecord, label: String): LockdownPlistChannel {
+         require(label.isNotBlank()) { "label must not be blank" }
+-        require(serviceName.isNotBlank()) { "serviceName must not be blank" }
+-
+-        val lockdownConnection = host.connect(
+-            destinationPort = Iap2UsbMuxHost.LOCKDOWN_PORT,
+-            timeoutMillis = STEP_TIMEOUT_MILLIS,
+-        )
+-        val sessionTls = LockdownPlistChannel(lockdownConnection).use { plaintext ->
+-            val response = plaintext.request(
+-                LockdownPlistValue.Dictionary(
+-                    linkedMapOf(
+-                        "Label" to LockdownPlistValue.Text(label),
+-                        "Request" to LockdownPlistValue.Text("StartSession"),
+-                        "HostID" to LockdownPlistValue.Text(pairRecord.hostId),
+-                        "SystemBUID" to LockdownPlistValue.Text(pairRecord.systemBuid),
+-                    ),
+-                ),
+-                STEP_TIMEOUT_MILLIS,
+-            )
+-            rejectError(response, "StartSession")
+-            val enableSessionSsl = (response.entries["EnableSessionSSL"] as? LockdownPlistValue.Boolean)?.value
+-                ?: throw IphoneUsbException.Protocol("StartSession response omitted boolean EnableSessionSSL")
+-            if (!enableSessionSsl) {
+-                throw IphoneUsbException.Protocol("StartSession did not enable TLS")
+-            }
+-            TlsDuplexChannel.open(
+-                underlying = plaintext.detach(),
+-                pairRecord = pairRecord,
+-                handshakeTimeoutMillis = STEP_TIMEOUT_MILLIS,
+-            )
+-        }
++        return startSession(host.connect(Iap2UsbMuxHost.LOCKDOWN_PORT, STEP_TIMEOUT_MILLIS), pairRecord, label)
++    }
+ 
+-        val secureLockdown = LockdownPlistChannel(sessionTls)
++    fun openService(pairRecord: LockdownPairRecord, label: String, serviceName: String,
++                    onSession: ((LockdownPlistChannel) -> Unit)? = null): BlockingDuplexByteStream {
++        require(serviceName.isNotBlank()) { "serviceName must not be blank" }
++        val secureLockdown = openSession(pairRecord, label)
++        var transferred = false
+         var serviceStream: BlockingDuplexByteStream? = null
+         try {
++            onSession?.invoke(secureLockdown)
+             val response = secureLockdown.request(
+                 LockdownPlistValue.Dictionary(
+                     linkedMapOf(
+@@ -80,6 +59,7 @@ class LockdownCarKitClient(
+                 destinationPort = port.toInt(),
+                 timeoutMillis = STEP_TIMEOUT_MILLIS,
+             )
++            serviceStream = serviceConnection
+             val readyStream = if (enableServiceSsl) {
+                 TlsDuplexChannel.open(
+                     underlying = serviceConnection,
+@@ -92,14 +72,11 @@ class LockdownCarKitClient(
+             serviceStream = readyStream
+             val ownedStream = CarkitServiceStream(readyStream, secureLockdown)
+             serviceStream = null
++            transferred = true
+             return ownedStream
+         } finally {
+-            if (serviceStream != null) {
+-                try {
+-                    serviceStream.close()
+-                } finally {
+-                    secureLockdown.close()
+-                }
++            if (!transferred) {
++                try { serviceStream?.close() } finally { secureLockdown.close() }
+             }
+         }
+     }
+@@ -126,18 +103,49 @@ class LockdownCarKitClient(
+         }
+     }
+ 
+-    private fun rejectError(response: LockdownPlistValue.Dictionary, request: String) {
+-        val code = when (val error = response.entries["Error"] ?: return) {
+-            is LockdownPlistValue.Text -> error.value
+-            is LockdownPlistValue.Integer -> (response.entries["ErrorString"] as? LockdownPlistValue.Text)?.value
+-                ?: error.value.toString()
+-            else -> throw IphoneUsbException.Protocol("$request response Error was not text or integer")
++    companion object {
++        private fun rejectError(response: LockdownPlistValue.Dictionary, request: String) {
++            val code = when (val error = response.entries["Error"] ?: return) {
++                is LockdownPlistValue.Text -> error.value
++                is LockdownPlistValue.Integer -> (response.entries["ErrorString"] as? LockdownPlistValue.Text)?.value
++                    ?: error.value.toString()
++                else -> throw IphoneUsbException.Protocol("$request response Error was not text or integer")
++            }
++            throw IphoneUsbException.Protocol("Lockdown $request failed: $code")
++        }
++
++        internal fun startSession(connection: BlockingDuplexByteStream, pairRecord: LockdownPairRecord,
++                                  label: String,
++                                  secure: (BlockingDuplexByteStream, LockdownPairRecord) -> BlockingDuplexByteStream =
++                                      { stream, record -> TlsDuplexChannel.open(stream, record, STEP_TIMEOUT_MILLIS) }
++        ): LockdownPlistChannel {
++            val sessionTls = LockdownPlistChannel(connection).use { plaintext ->
++                val response = plaintext.request(
++                    LockdownPlistValue.Dictionary(
++                        linkedMapOf(
++                            "Label" to LockdownPlistValue.Text(label),
++                            "Request" to LockdownPlistValue.Text("StartSession"),
++                            "HostID" to LockdownPlistValue.Text(pairRecord.hostId),
++                            "SystemBUID" to LockdownPlistValue.Text(pairRecord.systemBuid),
++                        ),
++                    ),
++                    STEP_TIMEOUT_MILLIS,
++                )
++                rejectError(response, "StartSession")
++                val enableSessionSsl = (response.entries["EnableSessionSSL"] as? LockdownPlistValue.Boolean)?.value
++                    ?: throw IphoneUsbException.Protocol("StartSession response omitted boolean EnableSessionSSL")
++                if (!enableSessionSsl) {
++                    throw IphoneUsbException.Protocol("StartSession did not enable TLS")
++                }
++                val detached = plaintext.detach()
++                try { secure(detached, pairRecord) }
++                catch (error: Throwable) { detached.close(); throw error }
++            }
++
++            return LockdownPlistChannel(sessionTls)
+         }
+-        throw IphoneUsbException.Protocol("Lockdown $request failed: $code")
+-    }
+ 
+-    private companion object {
+-        const val STEP_TIMEOUT_MILLIS = 5_000L
+-        const val CARKIT_SERVICE = "com.apple.carkit.service"
++        private const val STEP_TIMEOUT_MILLIS = 5_000L
++        private const val CARKIT_SERVICE = "com.apple.carkit.service"
+     }
+ }
+diff --git a/protocol/src/test/java/com/shilapi/xcertplay/transport/LockdownSharingTest.kt b/protocol/src/test/java/com/shilapi/xcertplay/transport/LockdownSharingTest.kt
+new file mode 100644
+index 0000000..5c658f4
+--- /dev/null
++++ b/protocol/src/test/java/com/shilapi/xcertplay/transport/LockdownSharingTest.kt
+@@ -0,0 +1,56 @@
++package com.shilapi.xcertplay.transport
++
++import java.nio.ByteBuffer
++import org.junit.Assert.*
++import org.junit.Test
++
++class LockdownSharingTest {
++    private val dummy = byteArrayOf(1) // Synthetic material; TLS is tested separately, never deployed.
++    private val record = LockdownPairRecord.restore("test-host", "test-buid", "02:00:00:00:00:01",
++        dummy, dummy, dummy, dummy, dummy, dummy)
++    private class Stream(body: String) : BlockingDuplexByteStream {
++        private val xml = "<plist version=\"1.0\"><dict>$body</dict></plist>".toByteArray()
++        private val input = ByteBuffer.allocate(xml.size + 4).putInt(xml.size).put(xml).array()
++        private var offset = 0
++        var closed = false
++        val sent = mutableListOf<ByteArray>()
++        override fun send(data: ByteArray) { sent.add(data.copyOf()) }
++        override fun recv(maxBytes: Int, timeoutMillis: Long): ByteArray {
++            val end = minOf(offset + maxBytes, input.size)
++            return input.copyOfRange(offset, end).also { offset = end }
++        }
++        override fun close() { closed = true }
++    }
++    @Test fun sharingStartsTrustWithoutOpeningAnyServiceOrCarPlay() {
++        val stream = Stream("<key>EnableSessionSSL</key><true/>")
++        var tlsCalls = 0
++        val channel = LockdownCarKitClient.startSession(stream, record, "test") { wire, pair ->
++            assertSame(record, pair); tlsCalls++; wire
++        }
++        assertEquals(1, tlsCalls)
++        assertEquals(1, stream.sent.size)
++        val request = String(stream.sent.single().drop(4).toByteArray())
++        assertTrue(request.contains("StartSession"))
++        assertFalse(request.contains("StartService"))
++        assertFalse(request.contains("carkit"))
++        assertFalse(stream.closed)
++        channel.close()
++        assertTrue(stream.closed)
++    }
++    @Test fun invalidPairRecordClosesTheConnectionAndRemainsDistinguishableForRepair() {
++        val stream = Stream("<key>Error</key><string>InvalidHostID</string>")
++        try {
++            LockdownCarKitClient.startSession(stream, record, "test") { _, _ -> error("must not use TLS") }
++            fail("invalid record accepted")
++        } catch (error: IphoneUsbException.Protocol) { assertTrue(error.message!!.contains("InvalidHostID")) }
++        assertTrue(stream.closed)
++    }
++    @Test fun failedTlsHandshakeClosesDetachedTransport() {
++        val stream = Stream("<key>EnableSessionSSL</key><true/>")
++        try {
++            LockdownCarKitClient.startSession(stream, record, "test") { _, _ -> throw IllegalStateException("TLS test failure") }
++            fail("TLS failure ignored")
++        } catch (_: IllegalStateException) { }
++        assertTrue(stream.closed)
++    }
++}
+diff --git a/server/src/main/kotlin/com/playport/server/CableRecovery.kt b/server/src/main/kotlin/com/playport/server/CableRecovery.kt
+new file mode 100644
+index 0000000..9179054
+--- /dev/null
++++ b/server/src/main/kotlin/com/playport/server/CableRecovery.kt
+@@ -0,0 +1,25 @@
++package com.playport.server
++
++/** A physical unplug is fresh presence evidence for one paired phone, for a bounded time only. */
++internal class CableRecovery {
++    private var phone: String? = null
++    private var until = 0L
++    private var next = 0L
++    private var remaining = 0
++
++    @Synchronized fun begin(target: String?, now: Long) {
++        phone = target
++        until = now + 45_000
++        next = now + 5_000
++        remaining = if (target == null) 0 else 3
++    }
++    @Synchronized fun cancel() { phone = null; remaining = 0 }
++    @Synchronized fun active(target: String?, now: Long): Boolean =
++        phone != null && phone == target && now < until
++    @Synchronized fun take(target: String?, now: Long, running: Boolean): Boolean {
++        if (!active(target, now) || remaining == 0 || now < next || running) return false
++        remaining--
++        next = now + 5_000
++        return true
++    }
++}
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+index cac73b7..1fe7ce4 100644
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -104,6 +104,13 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+     @Volatile private var presenceLearned = false
+     @Volatile private var lastPeer: String? = null
+ 
++    private val cableRecovery = CableRecovery()
++    @Volatile private var cableWirelessPhone: String? = null
++    /** Learned from this cable's authenticated Lockdown session, never from a display name. */
++    fun rememberCablePhone(address: String?) {
++        cableWirelessPhone = address?.let(PhoneList::normalize)?.takeIf { PhoneList.ADDRESS.matches(it) }
++    }
++
+     @Volatile private var selectedPhone: String? = null
+     @Volatile private var invitedPhone: String? = null
+     @Volatile private var invitedAt = 0L
+@@ -194,6 +201,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+                 wiredName = null
+                 wired?.reselect()
+             }
++            cableRecovery.cancel()
+             selectedPhone = phone
+             switchingTo = phone
+             // Only the chosen phone's own handoff may admit an unidentified peer; an old boot grant or the
+@@ -232,6 +240,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+     @Synchronized
+     private fun disconnectPhone(phone: String): Boolean {
+         if (closed.get() || cablePhone || selectedPhone != phone) return false
++        cableRecovery.cancel()
+         bootInvite = false
+         switchingTo = null
+         invitedPhone = null
+@@ -295,8 +304,10 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+ 
+     private val listener = object : AirPlaySessionListener {
+         override fun onSessionActive(session: AirPlaySession) {
++            cableRecovery.cancel()
+             log.info("CarPlay session active peer={}", session.host)
+             activeSession = session
++            connectedWirelessPhone = if (session === wiredSession) null else selectedPhone ?: config.bluetoothDeviceAddress
+             connectedSession = session
+             bootInvite = false
+             invitedPhone = null
+@@ -313,7 +324,10 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+             log.info("CarPlay session ended peer={}", session.host)
+             if (activeSession !== session) return
+             activeSession = null
+-            if (connectedSession === session) connectedSession = null
++            if (connectedSession === session) {
++                connectedSession = null
++                connectedWirelessPhone = null
++            }
+             if (presenceHelper != null) presence("idle")
+             // A session the receiver closed itself to apply a new display is already being re-invited;
+             // flagging it as ended made the supervisor start a second invitation that cut off the first
+@@ -423,11 +437,13 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+     @Volatile private var wiredSession: AirPlaySession? = null
+     /** The session reached RECORD, rather than merely opening a control socket. */
+     @Volatile private var connectedSession: AirPlaySession? = null
++    /** Owner captured when RECORD arrives; invitation and presence state may change independently. */
++    @Volatile private var connectedWirelessPhone: String? = null
+     /** The wired iPhone's name from its CarPlay device info (for the settings' phone list). */
+     @Volatile private var wiredName: String? = null
+ 
+     /** The iPhone on the cable has opened CarPlay (AirPlay over its NCM link) and is the active session. */
+-    fun wiredSessionActive(): Boolean = wiredSession.let { it != null && it === activeSession }
++    fun wiredSessionActive(): Boolean = wiredSession.let { it != null && it === activeSession && it === connectedSession }
+ 
+     /** Called before the helper changes USB mode; false keeps the cable for power/internet only. */
+     fun prepareCablePhone(): Boolean {
+@@ -445,7 +461,11 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+     }
+ 
+     fun setCablePhone(present: Boolean) {
+-        if (present) cablePresent = true
++        if (present) {
++            cablePresent = true
++            cableRecovery.cancel()
++            if (!cablePhone) cableWirelessPhone = null
++        }
+         if (cablePhone == present) return
+         cablePhone = present
+         if (!config.wireless) return
+@@ -465,10 +485,15 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+             // below (2026-10-12): end it now, the cable is gone.
+             wiredSession?.takeIf { it === activeSession }?.let { runCatching { it.close() } }
+             wiredSession = null
+-            // Whom to invite: a phone used on the cable only is not the presence helper's last phone.
+-            if (presenceHelper != null && selectedPhone == null) {
+-                selectedPhone = presenceResult("unplugged")?.takeIf { it.matches(Regex("(?:[0-9A-F]{2}:){5}[0-9A-F]{2}")) }
++            // Re-evaluate on every unplug: the cable phone can differ from the old wireless owner.
++            if (presenceHelper != null) {
++                selectedPhone = presenceResult("unplugged", cableWirelessPhone.orEmpty())
++                    ?.takeIf { PhoneList.ADDRESS.matches(it) }
+             }
++            cableWirelessPhone = null
++            handoffAcceptedAt = Long.MIN_VALUE / 2
++            handoffRetried = false
++            cableRecovery.begin(wirelessPhone(), System.nanoTime() / 1_000_000)
+             // Invite at once, as at boot: someone who just pulled the cable is in the car with the phone.
+             log.info("no iPhone on the USB cable; wireless invitations resume")
+             restartWireless(confirmedPresent = true)
+@@ -487,6 +512,8 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+         cableName = null
+         cableRole.unplugged()
+         setCablePhone(false)
++        // Also clear when the user had already switched away from wired CarPlay before unplugging.
++        cableWirelessPhone = null
+     }
+ 
+     /** An iPhone is plugged in but the cable carries no CarPlay ("tether"): wireless keeps running. */
+@@ -509,6 +536,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+             if (closed.get()) return "closed"
+             // Paused before the helper confirms, so neither the supervisor nor a quick retry invites a phone
+             // over Wi-Fi in between; setCablePhone(true) then finds it already done.
++            cableRecovery.cancel()
+             cablePhone = true
+             switchingTo = null
+             invitedPhone = null
+@@ -525,11 +553,15 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+ 
+     /** The paired phones plus the wired row (see [CableRole.wiredRow]); a live cable session is the one in use. */
+     private fun withWiredRow(body: String): String {
++        val current = activeSession
++        val wirelessPhone = if (current != null && current === connectedSession && current !== wiredSession)
++            connectedWirelessPhone else null
++        val selected = PhoneList.withActiveWireless(body, wirelessPhone)
+         // Only the Linux USB helper reports the cable's states; other platforms keep the plain "cable" name.
+-        if (wired == null) return body
++        if (wired == null) return selected
+         val live = wiredSessionActive()
+         val row = CableRole.wiredRow(cablePresent || cablePhone, cableRole.carPlayOnCable(), live, cableRole.staticOff)
+-        return PhoneList.withWired(body, row, cableName ?: wiredName)
++        return PhoneList.withWired(selected, row, cableName ?: wiredName)
+     }
+ 
+     /**
+@@ -863,6 +895,17 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+                         restartWireless(confirmedPresent = true)
+                         continue
+                     }
++                    if (cableRecovery.active(wirelessPhone(), now)) {
++                        if (selectedPhone == null || !presence("allowed", selectedPhone!!)) {
++                            cableRecovery.cancel()
++                        } else {
++                            if (cableRecovery.take(wirelessPhone(), now, wireless?.running == true)) {
++                                log.info("retrying wireless after cable unplug; waiting for the phone to join Wi-Fi")
++                                restartWireless(confirmedPresent = true)
++                            }
++                            continue
++                        }
++                    }
+                     if (bootInvite && now < bootDeadline) {
+                         if (wireless?.running != true && now - lastBootstrapAt >= 5_000) restartWireless()
+                         continue
+@@ -1025,6 +1068,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+ 
+     override fun close() {
+         if (!closed.compareAndSet(false, true)) return
++        cableRecovery.cancel()
+         // The session first: the phone learns at once that CarPlay is over (it stayed open through the 10 s mDNS
+         // goodbye on every stop or restart, F50 2026-10-14).
+         runCatching { activeSession?.close() }
+diff --git a/server/src/main/kotlin/com/playport/server/WebHub.kt b/server/src/main/kotlin/com/playport/server/WebHub.kt
+index 01651d8..dd9d133 100644
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -131,6 +131,14 @@ object PhoneList {
+         else entry.copy(address = address, name = entry.name.take(64).ifBlank { address })
+     }.distinctBy { it.address }.take(MAX_PHONES)
+ 
++    /** The live session owns selection; the presence helper can lag behind reconnects or session release. */
++    fun withActiveWireless(body: String, address: String?): String {
++        val parsed = runCatching { json.decodeFromString(PhoneListBody.serializer(), body) }.getOrNull() ?: return body
++        val active = address?.let(::normalize)
++        return json.encodeToString(PhoneListBody.serializer(), parsed.copy(
++            phones = parsed.phones.map { it.copy(active = it.address == active) }))
++    }
++
+     /**
+      * Adds the wired row to a phone list body. While CarPlay is live on the cable no wireless row is "in use":
+      * the presence helper may still name the last wireless phone as active.
+diff --git a/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt b/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt
+index ca35493..e96e440 100644
+--- a/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt
++++ b/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt
+@@ -8,6 +8,8 @@ import com.shilapi.xcertplay.transport.Iap2UsbSession
+ import com.shilapi.xcertplay.transport.Iap2WiredCarPlayEndpoint
+ import com.shilapi.xcertplay.transport.Iap2WiredControlClient
+ import com.shilapi.xcertplay.transport.LockdownCarKitClient
++import com.shilapi.xcertplay.transport.LockdownPlistChannel
++import com.shilapi.xcertplay.transport.LockdownPlistValue
+ import com.shilapi.xcertplay.transport.LockdownPairRecord
+ import com.shilapi.xcertplay.transport.LockdownPairingClient
+ import java.io.Closeable
+@@ -21,6 +23,7 @@ import java.nio.file.Path
+ import java.util.Properties
+ import java.util.UUID
+ import java.util.concurrent.ArrayBlockingQueue
++import java.util.concurrent.CountDownLatch
+ import java.util.concurrent.TimeUnit
+ import org.slf4j.LoggerFactory
+ 
+@@ -36,8 +39,8 @@ class WiredBootstrap(private val server: CarPlayServer, private val helper: Path
+     private val log = LoggerFactory.getLogger("wired")
+     @Volatile private var stopped = false
+     @Volatile private var pipe: UsbBridgePipe? = null
+-    @Volatile private var mux: Iap2UsbMuxHost? = null
+-    @Volatile private var session: Iap2Session? = null
++    @Volatile private var link: WiredRunResources? = null
++    private val retryDelay = WiredRetryDelay()
+     @Volatile private var serial: String? = null   // USB serial (UDID) of the iPhone on the cable
+     @Volatile private var sawDevice = false        // this run reached an iPhone (see the retry ladder in start())
+     private val statusFile = System.getenv("CARPLAY_WIRED_STATUS")?.takeIf { it.isNotBlank() }?.let { Path.of(it) }
+@@ -54,15 +57,14 @@ class WiredBootstrap(private val server: CarPlayServer, private val helper: Path
+                 } finally {
+                     closeLink()
+                     pipe = null
+-                    mux = null
+-                    session = null
++                    link = null
+                 }
+                 // Back off only while the helper keeps ending before any iPhone shows up (a phone or MiFi on
+                 // the port giving the box internet, a broken cable): 2, 5, 10, 15, 20 then 30 s. A run that
+                 // saw an iPhone — including the normal unplug — starts again at 2 s, so replugging stays quick
+                 // (2026-10-31: with an Android sharing internet the 2 s loop competed with the wireless invite).
+                 step = if (sawDevice) 0 else minOf(step + 1, RETRY_DELAYS_MS.size - 1)
+-                if (!stopped) Thread.sleep(RETRY_DELAYS_MS[step])
++                if (!stopped) retryDelay.await(RETRY_DELAYS_MS[step])
+             }
+         }, "wired-bootstrap").apply { isDaemon = true; start() }
+     }
+@@ -82,13 +84,14 @@ class WiredBootstrap(private val server: CarPlayServer, private val helper: Path
+                 "iphone" -> { serial = parts.getOrNull(1); sawDevice = true; server.setCablePhone(true); status("starting") }
+                 "tether" -> { serial = parts.getOrNull(1); sawDevice = true; server.cableWithoutCarPlay(); status("") }
+             }
+-        }.also { pipe = it }
++        }.also { pipe = it; link = WiredRunResources(it) }
++        val resources = checkNotNull(link)
+         // The helper exits when the iPhone is unplugged, but the iAP2 session blocked in recv never
+         // noticed (2026-10-12: replugging then did nothing). End this run as soon as the helper is gone.
+         bridge.onExit {
+             if (!stopped && pipe === bridge) {
+                 log.info("wired: USB helper exited; ending this wired run")
+-                closeLink()
++                resources.close()
+             }
+         }
+         val ncm = bridge.awaitNcm(Long.MAX_VALUE)
+@@ -97,13 +100,13 @@ class WiredBootstrap(private val server: CarPlayServer, private val helper: Path
+             // It stays alive until the unplug (or [reselect] ends it): wait for that, not a retry loop.
+             if (bridge.tether) {
+                 log.info("wired: iPhone plugged in, no CarPlay on the cable")
+-                bridge.awaitExit()
++                if (bridge.awaitTetherMux()) prepareTether(bridge, resources)
+                 return
+             }
+-            throw EOFException("USB helper exited before an iPhone appeared")
++            throw EOFException(bridge.beforeNcmFailure())
+         }
+         log.info("wired: iPhone in its CarPlay configuration, NCM interface {}", ncm)
+-        val mux = Iap2UsbMuxHost.open(bridge).also { this.mux = it }
++        val mux = resources.add(Iap2UsbMuxHost.open(bridge))
+         log.info("wired: USBMUX open")
+         // One record per iPhone (its USB serial): a second iPhone must not replace the first one's
+         // "Trust" (2026-10-12). The single file of the first version is still tried.
+@@ -112,20 +115,19 @@ class WiredBootstrap(private val server: CarPlayServer, private val helper: Path
+             ?.let { PairRecordStore(server.config.stateDir.resolve("lockdown-pair-record-$it.properties")) } ?: legacy
+         var record = pairing.load() ?: legacy.load() ?: pairNew(mux, pairing)
+         val carkit = try {
+-            LockdownCarKitClient(mux).open(record, LABEL)
++            LockdownCarKitClient(mux).open(record, LABEL) { rememberCablePhone(it, bridge, resources) }
+         } catch (error: Exception) {
+             // InvalidHostID: an iPhone that never trusted this box (another phone's record was tried).
+             if (error.message?.contains(Regex("InvalidPairRecord|InvalidHostID", RegexOption.IGNORE_CASE)) != true) throw error
+             log.info("wired: the iPhone does not know this box ({}); pairing", error.message)
+             record = pairNew(mux, pairing)
+-            LockdownCarKitClient(mux).open(record, LABEL)
++            LockdownCarKitClient(mux).open(record, LABEL) { rememberCablePhone(it, bridge, resources) }
+         }
+         log.info("wired: com.apple.carkit.service open")
+         // Diagnostics only: filtering the iPhone's log took a whole CPU core and shared the cable with
+         // the video, adding ~0.3 s to every touch (2026-10-12).
+         if (System.getenv("CARPLAY_WIRED_PHONE_LOG") == "1") phoneLog(mux, record)
+-        val session = Iap2Session.open(carkit, traceContext = "wired", onTrace = { log.debug(it) })
+-            .also { this.session = it }
++        val session = resources.add(Iap2Session.open(carkit, traceContext = "wired", onTrace = { log.debug(it) }))
+         val linkLocal = waitLinkLocal(ncm)
+         server.listenWired(linkLocal)
+         val identification = Iap2IdentificationConfig(
+@@ -151,9 +153,9 @@ class WiredBootstrap(private val server: CarPlayServer, private val helper: Path
+             endpoint = endpoint,
+             availableCurrentMilliAmps = 1000,
+             timeoutMillis = Iap2WiredControlClient.NO_TIMEOUT_MILLIS,
+-            onReady = { log.info("wired: iAP2 identified and authenticated; CarPlay available"); awaitSession(bridge) },
++            onReady = { log.info("wired: iAP2 identified and authenticated; CarPlay available"); awaitSession(bridge, resources) },
+             // Song, artist, album and artwork for the browser's media session, as over the wireless tunnel.
+-            onIncoming = server.nowPlayingFeed(session, "wired") { !stopped && this.session === session },
++            onIncoming = server.nowPlayingFeed(session, "wired") { !stopped && !resources.closed && pipe === bridge },
+             // NowPlaying updates arrive every ~0.45 s while music plays: debug only.
+             onProgress = { if (it.startsWith("iap2 rx=0x5001")) log.debug("wired {}", it) else log.info("wired {}", it) },
+         )
+@@ -194,9 +196,47 @@ class WiredBootstrap(private val server: CarPlayServer, private val helper: Path
+         }, "wired-iphone-log").apply { isDaemon = true; start() }
+     }
+ 
+-    private fun pairNew(mux: Iap2UsbMuxHost, store: PairRecordStore): LockdownPairRecord {
++    private fun rememberCablePhone(channel: LockdownPlistChannel, bridge: UsbBridgePipe, resources: WiredRunResources) {
++        val response = channel.request(LockdownPlistValue.Dictionary(mapOf(
++            "Request" to LockdownPlistValue.Text("GetValue"),
++            "Key" to LockdownPlistValue.Text("BluetoothAddress"),
++        )))
++        if (!resources.closed && pipe === bridge)
++            server.rememberCablePhone((response.entries["Value"] as? LockdownPlistValue.Text)?.value)
++    }
++
++    /** Sharing has its own USB trust session; it must never open carkit or pause wireless. */
++    private fun prepareTether(bridge: UsbBridgePipe, resources: WiredRunResources) {
++        val mux = resources.add(Iap2UsbMuxHost.open(bridge))
++        val legacy = PairRecordStore(server.config.stateDir.resolve("lockdown-pair-record.properties"))
++        val store = serial?.takeIf { it.matches(Regex("[0-9A-Za-z-]{8,64}")) }
++            ?.let { PairRecordStore(server.config.stateDir.resolve("lockdown-pair-record-$it.properties")) } ?: legacy
++        var record = store.load() ?: legacy.load() ?: pairNew(mux, store, tether = true)
++        val channel = resources.add(try {
++            LockdownCarKitClient(mux).openSession(record, LABEL)
++        } catch (error: Exception) {
++            if (error.message?.contains(Regex("InvalidPairRecord|InvalidHostID", RegexOption.IGNORE_CASE)) != true) throw error
++            record = pairNew(mux, store, tether = true)
++            LockdownCarKitClient(mux).openSession(record, LABEL)
++        })
++        log.info("USB sharing trust session ready; wireless CarPlay retained")
++        // Read-only requests keep the session usable and detect failures without touching the network.
++        // A failed request ends this run; the existing bounded backoff reopens trust on the same cable.
++        while (!stopped && !resources.closed && pipe === bridge) {
++            channel.request(LockdownPlistValue.Dictionary(mapOf(
++                "Request" to LockdownPlistValue.Text("GetValue"),
++                "Key" to LockdownPlistValue.Text("DeviceName"),
++            )))
++            repeat(40) {
++                if (stopped || resources.closed || pipe !== bridge) return
++                Thread.sleep(250)
++            }
++        }
++    }
++
++    private fun pairNew(mux: Iap2UsbMuxHost, store: PairRecordStore, tether: Boolean = false): LockdownPairRecord {
+         log.info("wired: pairing with the iPhone; tap Trust on its screen")
+-        status("trust")
++        if (!tether) status("trust")
+         val paired = LockdownPairingClient(mux).pair(
+             label = LABEL,
+             hostId = UUID.randomUUID().toString().uppercase(),
+@@ -206,7 +246,7 @@ class WiredBootstrap(private val server: CarPlayServer, private val helper: Path
+         )
+         store.save(paired.pairRecord)
+         log.info("wired: paired; record saved")
+-        status("starting")
++        if (!tether) status("starting")
+         return paired.pairRecord
+     }
+ 
+@@ -229,7 +269,7 @@ class WiredBootstrap(private val server: CarPlayServer, private val helper: Path
+      * "live" once the iPhone has opened CarPlay on the cable. An iPhone plugged in right after a wireless
+      * session accepted the start but never connected (2026-10-12); starting the run over fixes that.
+      */
+-    private fun awaitSession(bridge: UsbBridgePipe) {
++    private fun awaitSession(bridge: UsbBridgePipe, resources: WiredRunResources) {
+         Thread({
+             val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(SESSION_WAIT_SECONDS)
+             var live = false
+@@ -254,14 +294,14 @@ class WiredBootstrap(private val server: CarPlayServer, private val helper: Path
+                 if (System.nanoTime() - goneSince >= TimeUnit.SECONDS.toNanos(SESSION_END_GRACE_SECONDS)) {
+                     log.info("wired: the CarPlay session ended and did not come back within {} s; starting over",
+                              SESSION_END_GRACE_SECONDS)
+-                    closeLink()
++                    resources.close()
+                     return@Thread
+                 }
+                 Thread.sleep(250)
+             }
+             if (!stopped && pipe === bridge && !live) {
+                 log.info("wired: the iPhone did not open CarPlay within {} s; starting over", SESSION_WAIT_SECONDS)
+-                closeLink()
++                resources.close()
+             }
+         }, "wired-session-wait").apply { isDaemon = true; start() }
+     }
+@@ -293,18 +333,18 @@ class WiredBootstrap(private val server: CarPlayServer, private val helper: Path
+     fun reselect() {
+         log.info("wired: the cable's role changed; starting the USB helper again")
+         closeLink()
++        retryDelay.request()
+     }
+ 
+     /** The iAP2 session blocks in recv without noticing a closed pipe (2026-10-12), so close it too. */
+     private fun closeLink() {
+-        runCatching { session?.close() }
+-        runCatching { mux?.close() }
+-        runCatching { pipe?.close() }
++        link?.close()
+     }
+ 
+     override fun close() {
+         stopped = true
+         closeLink()
++        retryDelay.request()
+     }
+ 
+     private companion object {
+@@ -318,6 +358,23 @@ class WiredBootstrap(private val server: CarPlayServer, private val helper: Path
+     }
+ }
+ 
++/** Each callback owns only its run; an old timeout must never close a replacement USB link. */
++internal class WiredRunResources(first: AutoCloseable) : AutoCloseable {
++    private val resources = mutableListOf(first)
++    @Volatile var closed = false
++        private set
++    @Synchronized fun <T : AutoCloseable> add(resource: T): T {
++        if (closed) { runCatching { resource.close() }; throw EOFException("USB run ended") }
++        resources.add(resource)
++        return resource
++    }
++    @Synchronized override fun close() {
++        if (closed) return
++        closed = true
++        resources.asReversed().forEach { runCatching { it.close() } }
++    }
++}
++
+ /** Lockdown pair record in the state directory (owner-only), hex PEM fields as in the Android app. */
+ internal class PairRecordStore(private val file: Path) {
+     fun load(): LockdownPairRecord? = runCatching {
+@@ -372,6 +429,10 @@ internal class UsbBridgePipe private constructor(
+     private val received = ArrayBlockingQueue<ByteArray>(256)
+     private val ncm = ArrayBlockingQueue<Triple<String, Int, String?>>(1)
+     @Volatile private var ended = false
++    @Volatile private var tetherMuxReady = false
++    @Volatile private var stage = "waiting"
++    @Volatile private var failure: String? = null
++    private val stderrDone = CountDownLatch(1)
+     var ncmInterfaceNumber: Int = 0
+         private set
+ 
+@@ -385,8 +446,14 @@ internal class UsbBridgePipe private constructor(
+ 
+     init {
+         Thread({
+-            process.errorStream.bufferedReader().forEachLine { line ->
++            try { process.errorStream.bufferedReader().forEachLine { line ->
+                 if (line.startsWith("usb ")) {
++                    stage = when (line.substringAfter("usb ").substringBefore(' ')) {
++                        "prepare" -> "preparing"
++                        "iphone" -> "device-detected"
++                        "tether" -> "sharing-only"
++                        else -> "waiting"
++                    }
+                     log.info(line)
+                     if (line.startsWith("usb tether")) tether = true
+                     runCatching {
+@@ -398,13 +465,21 @@ internal class UsbBridgePipe private constructor(
+                         log.warn("USB preparation failed: {}", it.message)
+                         process.destroy()
+                     }
++                } else if (line == "tethermux ready") {
++                    stage = "sharing-mux-ready"
++                    tetherMuxReady = true
+                 } else if (line.startsWith("ncm ")) {
++                    stage = "ncm-ready"
+                     val parts = line.split(" ")
+                     ncm.offer(Triple(parts[1], parts.getOrNull(2)?.toIntOrNull() ?: 0, parts.getOrNull(3)))
++                } else if (line.startsWith("USB bridge stopped:") || line.startsWith("USBMUX read ended:") ||
++                           line.startsWith("USBMUX write failed:")) {
++                    failure = line.take(300)
++                    log.warn("{}", failure) // Kept by the diagnostic log, unlike routine USB INFO lines.
+                 } else {
+                     log.info(line)
+                 }
+-            }
++            } } finally { stderrDone.countDown() }
+         }, "usb-bridge-stderr").apply { isDaemon = true; start() }
+         Thread({
+             try {
+@@ -435,6 +510,22 @@ internal class UsbBridgePipe private constructor(
+         return null
+     }
+ 
++    fun beforeNcmFailure(): String {
++        if (!process.isAlive) stderrDone.await(250, TimeUnit.MILLISECONDS)
++        val exit = if (process.isAlive) "running" else process.exitValue().toString()
++        return "USB helper ended before CarPlay NCM was ready (stage=$stage, exit=$exit)" +
++            (failure?.let { ": $it" } ?: "")
++    }
++
++    /** Old or charging-only helpers never report readiness; wait for their physical unplug. */
++    fun awaitTetherMux(): Boolean {
++        while (process.isAlive && !ended) {
++            if (tetherMuxReady) return true
++            Thread.sleep(50)
++        }
++        return false
++    }
++
+     /** Block until the helper exits: the iPhone was unplugged, or [close] ended it. */
+     fun awaitExit() {
+         runCatching { process.waitFor() }
+@@ -475,6 +566,7 @@ internal class UsbBridgePipe private constructor(
+         fun start(helper: Path, onState: (String) -> Unit = {}): UsbBridgePipe =
+             UsbBridgePipe(ProcessBuilder("python3", helper.toString()).apply {
+                 environment()["CARPLAY_USB_STATE_ACK"] = "1"
++                environment()["CARPLAY_USB_TETHER_MUX"] = "1"
+             }.start(), onState)
+     }
+ }
+diff --git a/server/src/main/kotlin/com/playport/server/WiredRetryDelay.kt b/server/src/main/kotlin/com/playport/server/WiredRetryDelay.kt
+new file mode 100644
+index 0000000..9c5f2b9
+--- /dev/null
++++ b/server/src/main/kotlin/com/playport/server/WiredRetryDelay.kt
+@@ -0,0 +1,12 @@
++package com.playport.server
++
++import java.util.concurrent.Semaphore
++import java.util.concurrent.TimeUnit
++
++internal class WiredRetryDelay {
++    private val wake = Semaphore(0)
++    @Synchronized fun request() {
++        if (wake.availablePermits() == 0) wake.release()
++    }
++    fun await(delayMillis: Long): Boolean = wake.tryAcquire(delayMillis, TimeUnit.MILLISECONDS)
++}
+diff --git a/server/src/test/kotlin/com/playport/server/CableRecoveryTest.kt b/server/src/test/kotlin/com/playport/server/CableRecoveryTest.kt
+new file mode 100644
+index 0000000..13efffd
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/CableRecoveryTest.kt
+@@ -0,0 +1,32 @@
++package com.playport.server
++
++import org.junit.Assert.*
++import org.junit.Test
++
++class CableRecoveryTest {
++    @Test fun failedFirstInviteCanRetryWithoutWifiPresenceButNotForever() {
++        val recovery = CableRecovery()
++        recovery.begin("A", 0)
++        assertFalse(recovery.take("A", 4999, false))
++        assertTrue(recovery.take("A", 5000, false))
++        assertTrue(recovery.take("A", 10000, false))
++        assertTrue(recovery.take("A", 15000, false))
++        assertFalse(recovery.take("A", 20000, false))
++        assertFalse(recovery.active("A", 45000))
++    }
++    @Test fun slowBluetoothHandshakeIsNotInterruptedAndDoesNotConsumeAnAttempt() {
++        val recovery = CableRecovery()
++        recovery.begin("A", 0)
++        assertFalse(recovery.take("A", 5000, true))
++        assertTrue(recovery.take("A", 10000, false))
++    }
++    @Test fun newCableManualChoiceSuccessOrPauseCancelsTheGrant() {
++        val recovery = CableRecovery()
++        recovery.begin("A", 0)
++        assertFalse(recovery.take("B", 5000, false))
++        recovery.cancel()
++        assertFalse(recovery.take("A", 6000, false))
++        recovery.begin(null, 7000)
++        assertFalse(recovery.active(null, 7001))
++    }
++}
+diff --git a/server/src/test/kotlin/com/playport/server/ConnectionSelectionTest.kt b/server/src/test/kotlin/com/playport/server/ConnectionSelectionTest.kt
+new file mode 100644
+index 0000000..385872f
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/ConnectionSelectionTest.kt
+@@ -0,0 +1,134 @@
++package com.playport.server
++
++import com.shilapi.xcertplay.airplay.*
++import java.net.Socket
++import java.nio.file.Path
++import kotlinx.serialization.json.*
++import org.junit.Assert.*
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++
++class ConnectionSelectionTest {
++    @get:Rule val temporary = TemporaryFolder()
++    private val phoneA = "02:00:00:00:00:0A"
++    private val phoneB = "02:00:00:00:00:0B"
++    private fun field(server: CarPlayServer, name: String) =
++        CarPlayServer::class.java.getDeclaredField(name).also { it.isAccessible = true }
++    private fun set(server: CarPlayServer, name: String, value: Any?) = field(server, name).set(server, value)
++    private fun listener(server: CarPlayServer) = field(server, "listener").get(server) as AirPlaySessionListener
++    private fun session(server: CarPlayServer) = AirPlaySession(Socket(), server.airPlayConfig,
++        server.identity, PairingStore(), null, listener(server), object : AirPlayMediaHandler {})
++    private fun rows(server: CarPlayServer): JsonObject {
++        val body = PhoneList.body(true, """[{"address":"$phoneA","name":"A","active":false},{"address":"$phoneB","name":"B","active":true}]""")
++        val method = CarPlayServer::class.java.getDeclaredMethod("withWiredRow", String::class.java)
++        method.isAccessible = true
++        return Json.parseToJsonElement(method.invoke(server, body) as String).jsonObject
++    }
++    private fun selected(body: JsonObject) = body["phones"]!!.jsonArray.filter {
++        it.jsonObject["active"]!!.jsonPrimitive.boolean
++    }.map { it.jsonObject["address"]!!.jsonPrimitive.content }
++    private fun run(block: (CarPlayServer) -> Unit) {
++        val root = temporary.newFolder().toPath()
++        CarPlayServer(ServerConfig(identityDir=root, stateDir=root.resolve("state"), bindAddress="127.0.0.1")).use {
++            set(it, "wired", WiredBootstrap(it, Path.of("unused-helper.py")))
++            block(it)
++        }
++    }
++
++    @Test fun liveWirelessOverridesStalePresenceAndSelectionIntent() = run { server ->
++        set(server, "selectedPhone", phoneA)
++        val live = session(server)
++        listener(server).onSessionActive(live)
++        set(server, "selectedPhone", phoneB) // Invitation intent is not the live session owner.
++        assertEquals(listOf(phoneA), selected(rows(server)))
++        live.close()
++        assertTrue(selected(rows(server)).isEmpty())
++    }
++
++    @Test fun availableCableDoesNotHideTheActiveWirelessPhone() = run { server ->
++        val role = CableRole(temporary.newFolder().toPath().resolve("off"), false)
++        role.turnOff()
++        set(server, "cableRole", role)
++        set(server, "cablePresent", true)
++        set(server, "selectedPhone", phoneA)
++        val live = session(server)
++        listener(server).onSessionActive(live)
++        val body = rows(server)
++        assertEquals("available", body["wired"]!!.jsonPrimitive.content)
++        assertEquals(listOf(phoneA), selected(body))
++        live.close()
++    }
++
++    @Test fun negotiationAndDisconnectedStatesDoNotSelectStaleWirelessRows() = run { server ->
++        set(server, "selectedPhone", phoneA)
++        val negotiating = session(server)
++        set(server, "activeSession", negotiating)
++        assertTrue(selected(rows(server)).isEmpty())
++        negotiating.close()
++    }
++
++    @Test fun lateCloseOfOldSessionDoesNotClearNewSelection() = run { server ->
++        set(server, "selectedPhone", phoneA)
++        val old = session(server)
++        listener(server).onSessionActive(old)
++        set(server, "selectedPhone", phoneB)
++        val next = session(server)
++        listener(server).onSessionActive(next)
++        old.close()
++        assertEquals(listOf(phoneB), selected(rows(server)))
++        next.close()
++    }
++
++    @Test fun wiredSessionIsTheOnlySelection() = run { server ->
++        val live = session(server)
++        set(server, "cablePresent", true)
++        set(server, "wiredSession", live)
++        listener(server).onSessionActive(live)
++        val body = rows(server)
++        assertEquals("live", body["wired"]!!.jsonPrimitive.content)
++        assertTrue(selected(body).isEmpty())
++        live.close()
++    }
++
++    @Test fun activeWirelessKeepsItsSessionOnPlug() = run { server ->
++        val role = CableRole(temporary.newFolder().toPath().resolve("off"), false)
++        set(server, "cableRole", role)
++        val live = session(server)
++        listener(server).onSessionActive(live)
++        assertFalse(server.prepareCablePhone())
++        assertFalse(role.carPlayOnCable())
++        live.close()
++    }
++
++    @Test fun unplugClearsCableIdentityEvenAfterUserAlreadySwitchedToWireless() = run { server ->
++        server.rememberCablePhone(phoneA)
++        set(server, "cablePhone", false)
++        server.cableUnplugged()
++        assertNull(field(server, "cableWirelessPhone").get(server))
++    }
++
++    @Test fun unplugUsesAuthenticatedCableTargetAndArmsRecoveryEvenWithoutWifi() {
++        val root = temporary.newFolder().toPath()
++        val helper = root.resolve("presence.py")
++        java.nio.file.Files.writeString(helper, """
++            import sys
++            if sys.argv[1] == 'unplugged':
++                print(sys.argv[2])
++            else:
++                sys.exit(1)
++        """.trimIndent())
++        CarPlayServer(ServerConfig(identityDir=root, stateDir=root.resolve("state"), bindAddress="127.0.0.1", wireless=true)).use { server ->
++            set(server, "presenceHelper", helper.toString())
++            set(server, "selectedPhone", phoneA)
++            set(server, "cablePhone", true)
++            server.rememberCablePhone(phoneB)
++            server.cableUnplugged()
++            assertEquals(phoneB, server.wirelessPhone())
++            val recovery = field(server, "cableRecovery").get(server) as CableRecovery
++            assertTrue(recovery.active(phoneB, System.nanoTime() / 1_000_000))
++            server.prepareCablePhone()
++            assertFalse(recovery.active(phoneB, System.nanoTime() / 1_000_000))
++        }
++    }
++}
+diff --git a/server/src/test/kotlin/com/playport/server/UsbPrepareTest.kt b/server/src/test/kotlin/com/playport/server/UsbPrepareTest.kt
+index cfebe71..ed624c6 100644
+--- a/server/src/test/kotlin/com/playport/server/UsbPrepareTest.kt
++++ b/server/src/test/kotlin/com/playport/server/UsbPrepareTest.kt
+@@ -7,6 +7,27 @@ import org.junit.Assert.*
+ import org.junit.Test
+ 
+ class UsbPrepareTest {
++    @Test fun failedPreparationReportsItsStageAndHelperCauseWithoutClaimingNoPhone() {
++        val helper = Files.createTempFile("usb-failure", ".py")
++        Files.writeString(helper, """
++            import sys
++            print('usb prepare synthetic-phone', file=sys.stderr, flush=True)
++            assert sys.stdin.buffer.read(4) == b'RDY!'
++            print('USB bridge stopped: RuntimeError: synthetic configuration failed', file=sys.stderr, flush=True)
++            sys.exit(3)
++        """.trimIndent())
++        val pipe = UsbBridgePipe.start(helper)
++        try {
++            assertNull(pipe.awaitNcm(2000))
++            val message = pipe.beforeNcmFailure()
++            assertTrue(message, message.contains("stage=preparing"))
++            assertTrue(message, message.contains("exit=3"))
++            assertTrue(message, message.contains("synthetic configuration failed"))
++            assertFalse(message, message.contains("synthetic-phone"))
++            assertFalse(message, message.contains("before an iPhone appeared"))
++        } finally { pipe.close(); Files.deleteIfExists(helper) }
++    }
++
+     @Test fun usbModeChangeWaitsForWirelessTeardownToFinish() {
+         val dir = Files.createTempDirectory("usb-prepare")
+         val changed = dir.resolve("configured")
+@@ -65,4 +86,22 @@ class UsbPrepareTest {
+             Files.deleteIfExists(helper)
+         }
+     }
++    @Test fun tetherMuxReadinessIsSeparateFromCarplayNcm() {
++        val helper = Files.createTempFile("tether-mux", ".py")
++        Files.writeString(helper, """
++            import os, sys
++            assert os.environ['CARPLAY_USB_TETHER_MUX'] == '1'
++            print('usb tether test-phone', file=sys.stderr, flush=True)
++            print('tethermux ready', file=sys.stderr, flush=True)
++            sys.stdin.buffer.read()
++        """.trimIndent())
++        val states = java.util.Collections.synchronizedList(mutableListOf<String>())
++        val pipe = UsbBridgePipe.start(helper) { states.add(it) }
++        try {
++            assertNull(pipe.awaitNcm(2000))
++            assertTrue(pipe.awaitTetherMux())
++            assertTrue(pipe.tether)
++            assertEquals(listOf("tether test-phone"), states)
++        } finally { pipe.close(); Files.deleteIfExists(helper) }
++    }
+ }
+diff --git a/server/src/test/kotlin/com/playport/server/WiredRetryDelayTest.kt b/server/src/test/kotlin/com/playport/server/WiredRetryDelayTest.kt
+new file mode 100644
+index 0000000..7b63ebb
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/WiredRetryDelayTest.kt
+@@ -0,0 +1,35 @@
++package com.playport.server
++
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++import kotlin.concurrent.thread
++import org.junit.Assert.*
++import org.junit.Test
++
++class WiredRetryDelayTest {
++    @Test fun selectionBeforeWaitIsNotLost() {
++        val delay = WiredRetryDelay()
++        delay.request()
++        assertTrue(delay.await(0))
++        assertFalse(delay.await(0))
++    }
++    @Test fun requestsCoalesceAndDoNotDisableLaterFailureBackoff() {
++        val delay = WiredRetryDelay()
++        repeat(10) { delay.request() }
++        assertTrue(delay.await(0))
++        assertFalse(delay.await(0))
++    }
++    @Test fun selectionWakesAnExistingWait() {
++        val delay = WiredRetryDelay()
++        val entered = CountDownLatch(1)
++        val done = CountDownLatch(1)
++        val worker = thread(isDaemon=true) {
++            entered.countDown()
++            if (delay.await(5000)) done.countDown()
++        }
++        assertTrue(entered.await(1, TimeUnit.SECONDS))
++        delay.request()
++        assertTrue(done.await(1, TimeUnit.SECONDS))
++        worker.join(1000)
++    }
++}
+diff --git a/server/src/test/kotlin/com/playport/server/WiredRunResourcesTest.kt b/server/src/test/kotlin/com/playport/server/WiredRunResourcesTest.kt
+new file mode 100644
+index 0000000..4068418
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/WiredRunResourcesTest.kt
+@@ -0,0 +1,27 @@
++package com.playport.server
++
++import java.io.EOFException
++import org.junit.Assert.*
++import org.junit.Test
++
++class WiredRunResourcesTest {
++    @Test fun oldTimeoutCannotCloseNewRunAndRepeatedCloseIsHarmless() {
++        val closed = mutableListOf<String>()
++        val old = WiredRunResources(AutoCloseable { closed.add("old-pipe") })
++        old.add(AutoCloseable { closed.add("old-session") })
++        val next = WiredRunResources(AutoCloseable { closed.add("next-pipe") })
++        old.close()
++        old.close()
++        assertEquals(listOf("old-session", "old-pipe"), closed)
++        assertFalse(next.closed)
++        next.close()
++        assertEquals("next-pipe", closed.last())
++    }
++    @Test fun resourceOpenedDuringCancellationIsClosed() {
++        val run = WiredRunResources(AutoCloseable {})
++        run.close()
++        var closed = false
++        try { run.add(AutoCloseable { closed = true }); fail("Cancelled run accepted resource") }
++        catch (_: EOFException) { assertTrue(closed) }
++    }
++}

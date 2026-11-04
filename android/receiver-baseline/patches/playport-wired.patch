@@ -1,0 +1,3364 @@
+Wired CarPlay: the iPhone on the box's USB port, the box as USB host (2026-10-12).
+
+Transport classes (Iap2UsbMuxHost, Lockdown*, TlsDuplexChannel, Iap2WiredControlClient,
+Iap2ControlDeadline) are taken from WheelPlay (https://github.com/fython/wheelplay, GPL-3.0,
+commit c1bd077, shared/src/main/java/com/shilapi/xcertplay/transport) with android.util.Log,
+android.util.Xml and SuppressLint replaced (UsbMuxPipe.kt, kxml2) and the pair certificates named
+(the desktop JDK rejects an empty issuer DN). WiredBootstrap runs them over iphone-usb-bridge.py;
+CarPlayServer.listenWired accepts the iPhone on the NCM link.
+--- a/protocol/build.gradle.kts
++++ b/protocol/build.gradle.kts
+@@ -7,6 +7,8 @@
+ dependencies {
+     implementation("org.bouncycastle:bcprov-jdk18on:1.79")
+     implementation("org.slf4j:slf4j-api:2.0.20")
++    // Lockdown plists (wired CarPlay); the Android app used the platform XmlPullParser.
++    implementation("net.sf.kxml:kxml2:2.3.0")
+     testImplementation("junit:junit:4.13.2")
+     testRuntimeOnly("org.slf4j:slf4j-simple:2.0.20")
+ }
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -193,31 +193,74 @@
+         hub.inputHandler = ::routeInput
+         hub.onApplyDisplay = ::applyDisplay
+         hub.onMicrophoneData = { opus, payload -> bridge.sendMicrophonePayload(payload, opus) }
+-        awaitBindAddress()
+-        selectedPhone = presenceResult("boot")?.takeIf { it.isNotBlank() }
+-        bootInvite = selectedPhone != null
+-        if (!bootInvite && presenceHelper != null) selectedPhone = selectPhone()
+-        bootDeadline = System.nanoTime() / 1_000_000 + BOOTSTRAP_STALE_MS
+         hub.onViewerJoined = { streamType ->
+             if (bridge.hasRecoveryHandler) {
+                 log.info("requesting keyframe for stream {}", streamType)
+                 bridge.requestKeyFrame(streamType)
+             }
+         }
++        // Wired CarPlay needs no Wi-Fi: bring the cable up while the box is still joining the car hotspot
++        // (22-37 s on the Xpeng), so the picture is there when the head unit's browser connects.
++        config.usbBridge?.let { wired = WiredBootstrap(this, it).also(WiredBootstrap::start) }
++        awaitBindAddress()
++        selectedPhone = presenceResult("boot")?.takeIf { it.isNotBlank() }
++        bootInvite = selectedPhone != null
++        if (!bootInvite && presenceHelper != null) selectedPhone = selectPhone()
++        bootDeadline = System.nanoTime() / 1_000_000 + BOOTSTRAP_STALE_MS
+         startAirPlayListener()
+         // The handoff hands the iPhone this address directly, and it accepts the Bluetooth invitation
+-        // ~5 s later, so mDNS (5.3 s to announce on the S805) need not delay the invitation.
+-        Thread({
++        // ~5 s later, so mDNS (5.3 s to announce on the S805) need not delay the invitation. Without
++        // wireless CarPlay nothing looks for the AirPlay service: the cable carries the address over iAP2.
++        if (config.wireless) Thread({
+             runCatching { Advertisers.create(config.mdns, airPlayConfig, identity, bindAddress).also { it.start() } }
+                 .onSuccess { if (closed.get()) runCatching { it.close() } else advertiser = it }
+                 .onFailure { log.warn("mDNS advertisement failed: {}", it.message) }
+         }, "mdns-start").apply { isDaemon = true; start() }
+-        if (config.wireless && (presenceHelper == null || bootInvite || selectedPresent())) {
++        if (config.wireless && !cablePhone && (presenceHelper == null || bootInvite || selectedPresent())) {
+             wireless = WirelessBootstrap(this).also { it.start() }
+         }
+         startSupervisor()
+     }
+ 
++    @Volatile private var wired: WiredBootstrap? = null
++
++    /** An iPhone on the USB cable (WiredBootstrap): no wireless invitations until it is unplugged. */
++    @Volatile private var cablePhone = false
++    @Volatile private var wiredSession: AirPlaySession? = null
++
++    /** The iPhone on the cable has opened CarPlay (AirPlay over its NCM link) and is the active session. */
++    fun wiredSessionActive(): Boolean = wiredSession.let { it != null && it === activeSession }
++
++    fun setCablePhone(present: Boolean) {
++        if (cablePhone == present) return
++        cablePhone = present
++        if (!config.wireless) return
++        if (present) {
++            synchronized(this) {
++                ++wirelessGeneration
++                val previous = wireless
++                wireless = null
++                previous?.close()
++                // End a wireless session now: an iPhone switched from Wi-Fi straight to the cable's
++                // CarPlay start ignored the first start (2026-10-12, 28 s to picture).
++                activeSession?.takeIf { it !== wiredSession }?.let { runCatching { it.close() } }
++            }
++            log.info("iPhone on the USB cable; wireless invitations paused")
++        } else {
++            // The cable's session would only end on its 15 s keep-alive timeout and blocked the invitation
++            // below (2026-10-12): end it now, the cable is gone.
++            wiredSession?.takeIf { it === activeSession }?.let { runCatching { it.close() } }
++            wiredSession = null
++            // Whom to invite: a phone used on the cable only is not the presence helper's last phone.
++            if (presenceHelper != null && selectedPhone == null) {
++                selectedPhone = presenceResult("unplugged")?.takeIf { it.matches(Regex("(?:[0-9A-F]{2}:){5}[0-9A-F]{2}")) }
++            }
++            // Invite at once, as at boot: someone who just pulled the cable is in the car with the phone.
++            log.info("no iPhone on the USB cable; wireless invitations resume")
++            restartWireless(confirmedPresent = true)
++        }
++    }
++
+     /**
+      * A receiver started before its network is up (CARPLAY_BIND_WAIT_MS, with ip_nonlocal_bind) loads
+      * while the box joins the Wi-Fi, then waits here until the address is really configured, so the
+@@ -248,17 +291,48 @@
+         log.info("AirPlay RTSP listening on {}:{}", bindAddress.hostAddress, config.airPlayPort)
+     }
+ 
+-    private fun acceptLoop(server: ServerSocket) {
+-        while (!closed.get()) {
++    @Volatile private var wiredSocket: ServerSocket? = null
++
++    /**
++     * Wired CarPlay: listen on the iPhone's NCM link (see WiredBootstrap). Whoever connects there is
++     * the phone on the cable, so there is no network admission; a wired phone replaces a session.
++     */
++    @Synchronized
++    fun listenWired(address: java.net.InetAddress) {
++        val current = wiredSocket
++        // Each helper run creates the TAP again with a new interface index: InetAddress.equals ignores
++        // the scope, and a listener left on the old index never saw the iPhone (2026-10-12).
++        val scope = (address as? java.net.Inet6Address)?.scopeId
++        if (current != null && !current.isClosed && current.inetAddress == address &&
++            (current.inetAddress as? java.net.Inet6Address)?.scopeId == scope) return
++        runCatching { current?.close() }
++        val server = ServerSocket()
++        server.reuseAddress = true
++        server.bind(InetSocketAddress(address, config.airPlayPort))
++        wiredSocket = server
++        Thread({ acceptLoop(server, wired = true) }, "airplay-accept-wired").apply {
++            isDaemon = true
++            start()
++        }
++        log.info("AirPlay RTSP listening on [{}]:{} for wired CarPlay", address.hostAddress, config.airPlayPort)
++    }
++
++    private fun acceptLoop(server: ServerSocket, wired: Boolean = false) {
++        while (!closed.get() && !server.isClosed) {
+             val socket: Socket = try {
+                 server.accept()
+             } catch (error: Exception) {
+-                if (closed.get()) return
++                if (closed.get() || server.isClosed) return
+                 log.warn("AirPlay accept failed: {}", error.message)
+                 continue
+             }
+             try {
+-                if (presenceHelper != null) {
++                if (wired) {
++                    activeSession?.let { current ->
++                        log.info("wired iPhone connected; replacing the current session")
++                        runCatching { current.close() }
++                    }
++                } else if (presenceHelper != null) {
+                     val incomingPhone = presenceResult("admit", socket.inetAddress.hostAddress)
+                     val current = activeSession
+                     if (current != null) {
+@@ -299,6 +373,7 @@
+                     media = media,
+                 )
+                 activeSession = session
++                if (wired) wiredSession = session
+                 session.start()
+             } catch (error: Exception) {
+                 log.warn("AirPlay session bring-up failed: {}", error.message)
+@@ -337,6 +412,39 @@
+     }
+ 
+     /** Opens the tunneled iAP2 link after the phone hands the session over to Wi-Fi. */
++    /**
++     * NowPlaying metadata and artwork arriving on an iAP2 link (the wireless tunnel or the USB cable),
++     * forwarded to the browser's media session while [current] holds. Returns the link's frame handler.
++     */
++    fun nowPlayingFeed(channel: Iap2Session, name: String, current: () -> Boolean): (com.shilapi.xcertplay.iap2.wire.Iap2Frame) -> Unit {
++        val metadata = NowPlayingState()
++        val artwork = com.shilapi.xcertplay.iap2.message.Iap2ArtworkReceiver(
++            send = { channel.sendFileTransfer(it) { current() } },
++            complete = { revision, id, bytes ->
++                current() && metadata.value.revision == revision && metadata.artworkId == id && hub.artwork(revision, bytes)
++            },
++            clock = { System.nanoTime() / 1_000_000 },
++            onDiagnostic = { log.debug(it) },
++        )
++        Thread({
++            try {
++                while (current() && !channel.isClosed) {
++                    channel.recvFileTransfer(250)?.let(artwork::receive)
++                    artwork.expire()
++                }
++            } catch (_: Exception) { log.debug("Artwork transport ended") }
++        }, "$name-artwork").apply { isDaemon = true; start() }
++        return { frame ->
++            if (current()) {
++                try { metadata.accept(frame)?.let {
++                    hub.nowPlaying(it)
++                    artwork.expect(metadata.artworkId, it.revision)
++                } }
++                catch (_: Exception) { log.debug("Ignoring malformed NowPlaying update") }
++            }
++        }
++    }
++
+     fun handleWirelessTunnel(
+         stream: BlockingDuplexByteStream,
+         identification: Iap2IdentificationConfig,
+@@ -349,25 +457,9 @@
+             log.warn("could not open tunneled iAP2 link: {}", error.message)
+             return false
+         }
+-        val metadata = NowPlayingState()
+         val tunnelSession = activeSession
+         val tunnelDone = java.util.concurrent.atomic.AtomicBoolean(false)
+-        val artwork = com.shilapi.xcertplay.iap2.message.Iap2ArtworkReceiver(
+-            send = { channel.sendFileTransfer(it) { !tunnelDone.get() && activeSession === tunnelSession } },
+-            complete = { revision, id, bytes ->
+-                activeSession === tunnelSession && metadata.value.revision == revision && metadata.artworkId == id && hub.artwork(revision, bytes)
+-            },
+-            clock = { System.nanoTime() / 1_000_000 },
+-            onDiagnostic = { log.debug(it) },
+-        )
+-        Thread({
+-            try {
+-                while (!tunnelDone.get() && activeSession === tunnelSession && !channel.isClosed) {
+-                    channel.recvFileTransfer(250)?.let(artwork::receive)
+-                    artwork.expire()
+-                }
+-            } catch (_: Exception) { log.debug("Artwork transport ended") }
+-        }, "wireless-artwork").apply { isDaemon = true; start() }
++        val nowPlaying = nowPlayingFeed(channel, "wireless") { !tunnelDone.get() && activeSession === tunnelSession }
+         Thread(
+             {
+                 try {
+@@ -379,15 +471,7 @@
+                         endpoint = endpoint,
+                         timeoutMillis = Iap2WirelessControlClient.NO_TIMEOUT_MILLIS,
+                         onReady = { log.info("wireless iAP2 tunnel ready; CarPlay is live") },
+-                        onIncoming = { frame ->
+-                            if (activeSession === tunnelSession) {
+-                                try { metadata.accept(frame)?.let {
+-                                    hub.nowPlaying(it)
+-                                    artwork.expect(metadata.artworkId, it.revision)
+-                                } }
+-                                catch (_: Exception) { log.debug("Ignoring malformed NowPlaying update") }
+-                            }
+-                        },
++                        onIncoming = nowPlaying,
+                         onProgress = { log.debug("iAP tunnel $it") },
+                     )
+                     when (result.terminal) {
+@@ -416,6 +500,8 @@
+                     Thread.sleep(SUPERVISOR_INTERVAL_MS)
+                     if (closed.get()) return@Thread
+                     val now = System.nanoTime() / 1_000_000
++                    // The phone on the cable owns CarPlay; its session is no Wi-Fi presence either.
++                    if (cablePhone) continue
+                     if (activeSession != null) {
+                         lastBootstrapAt = now
+                         absentChecks = 0
+@@ -519,6 +605,8 @@
+             return null
+         }
+         activeSession?.close()
++        // Wired: start the USB side over (identification, then CarPlayStartSession with the new display).
++        wired?.restart()
+         // The phone was just using CarPlay, so skip the ~2.4 s presence re-check before re-inviting it.
+         restartWireless(confirmedPresent = wasActive)
+         return null
+@@ -530,7 +618,7 @@
+     /** confirmedPresent: the caller has just seen the selected phone on the network (skips a ~2.4 s re-check). */
+     @Synchronized
+     private fun restartWireless(confirmedPresent: Boolean = false) {
+-        if (!config.wireless || closed.get()) return
++        if (!config.wireless || closed.get() || cablePhone) return
+         val generation = ++wirelessGeneration
+         sessionEnded = false
+         lastBootstrapAt = System.nanoTime() / 1_000_000
+@@ -568,6 +656,8 @@
+     override fun close() {
+         if (!closed.compareAndSet(false, true)) return
+         runCatching { wireless?.close() }
++        runCatching { wired?.close() }
++        runCatching { wiredSocket?.close() }
+         runCatching { advertiser?.close() }
+         runCatching { activeSession?.close() }
+         runCatching { serverSocket?.close() }
+--- a/server/src/main/kotlin/com/playport/server/ServerConfig.kt
++++ b/server/src/main/kotlin/com/playport/server/ServerConfig.kt
+@@ -30,6 +30,8 @@
+     val wifiSecurity: Iap2WirelessSecurity = Iap2WirelessSecurity.WPA_WPA2,
+     val bluetoothDeviceAddress: String? = null,
+     val bluetoothBridge: Path? = null,
++    /** iphone-usb-bridge.py: also accept CarPlay from an iPhone on the USB cable (WiredBootstrap). */
++    val usbBridge: Path? = null,
+     val mdns: String = "auto",
+     val insecureHttp: Boolean = false,
+     val accessToken: String = generateToken(),
+@@ -94,6 +96,7 @@
+                     )
+                     "--bt-address" -> config = config.copy(bluetoothDeviceAddress = nextValue(flag))
+                     "--bt-bridge" -> config = config.copy(bluetoothBridge = Path.of(nextValue(flag)))
++                    "--usb-bridge" -> config = config.copy(usbBridge = Path.of(nextValue(flag)))
+                     "--mdns" -> config = config.copy(mdns = nextValue(flag).lowercase())
+                     "--http" -> config = config.copy(insecureHttp = true)
+                     "--token" -> config = config.copy(accessToken = nextValue(flag))
+--- /dev/null
++++ b/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2UsbMuxHost.kt
+@@ -0,0 +1,557 @@
++package com.shilapi.xcertplay.transport
++
++import java.io.Closeable
++import java.util.ArrayDeque
++
++/**
++ * USBMUX version-2 host over an already claimed iPhone bulk pipe.
++ *
++ * This is deliberately limited to USBMUX framing and one minimal outbound TCP connection. It
++ * does not parse lockdown messages, iAP2, TLS, NCM, AirPlay, or any media protocol. All calls
++ * may block and must run away from Android's main thread.
++ */
++class Iap2UsbMuxHost private constructor(
++    private val pipe: Iap2UsbSession,
++    private val readTimeoutMillis: Long,
++) : Closeable {
++    private val stateLock = Any()
++    private val writeLock = Any()
++    private val connections = mutableMapOf<Int, Iap2UsbMuxTcpConnection>()
++    private var closed = false
++    private var failure: IphoneUsbException? = null
++    private var nextMuxSequence = 0
++    private var nextMuxAcknowledgement = 0
++    private var nextSourcePort = FIRST_SOURCE_PORT
++    private lateinit var readerThread: Thread
++    private var receiveBuffer = ByteArray(0)
++
++    private data class MuxFrame(
++        val protocol: Int,
++        val length: Int,
++        val word8: Int,
++        val payload: ByteArray,
++    )
++
++    /** Opens a TCP byte stream to the iPhone service on [destinationPort]. */
++    fun connect(
++        destinationPort: Int = LOCKDOWN_PORT,
++        timeoutMillis: Long = CONNECT_TIMEOUT_MILLIS,
++    ): Iap2UsbMuxTcpConnection {
++        require(destinationPort in 1..0xffff) { "destinationPort must be a valid TCP port" }
++        require(timeoutMillis > 0) { "timeoutMillis must be positive" }
++
++        val connection = synchronized(stateLock) {
++            checkOpenLocked()
++            val sourcePort = allocateSourcePortLocked()
++            Iap2UsbMuxTcpConnection(this, sourcePort, destinationPort).also {
++                connections[sourcePort] = it
++            }
++        }
++        try {
++            connection.beginConnect()
++            if (!connection.awaitConnected(timeoutMillis)) {
++                connection.abort()
++                throw IphoneUsbException.TimedOut("USBMUX TCP connection to port $destinationPort timed out")
++            }
++            return connection
++        } catch (error: IphoneUsbException) {
++            removeConnection(connection)
++            throw error
++        }
++    }
++
++    override fun close() {
++        val activeConnections = synchronized(stateLock) {
++            if (closed) return
++            closed = true
++            connections.values.toList().also { connections.clear() }
++        }
++        activeConnections.forEach(Iap2UsbMuxTcpConnection::closeFromHost)
++        pipe.close()
++        if (::readerThread.isInitialized && Thread.currentThread() !== readerThread) {
++            try {
++                readerThread.join(readTimeoutMillis + CLOSE_JOIN_MARGIN_MILLIS)
++            } catch (_: InterruptedException) {
++                Thread.currentThread().interrupt()
++            }
++        }
++    }
++
++    internal fun sendTcp(
++        sourcePort: Int,
++        destinationPort: Int,
++        sequence: Int,
++        acknowledgement: Int,
++        flags: Int,
++        payload: ByteArray,
++    ) {
++        if (payload.size > 512) Log.i("xcertplay-usb", "usbmux TX source=$sourcePort destination=$destinationPort bytes=${payload.size} seq=$sequence ack=$acknowledgement")
++        val tcp = ByteArray(TCP_HEADER_BYTES + payload.size)
++        putU16(tcp, 0, sourcePort)
++        putU16(tcp, 2, destinationPort)
++        putU32(tcp, 4, sequence)
++        putU32(tcp, 8, acknowledgement)
++        tcp[12] = (TCP_HEADER_BYTES / 4 shl 4).toByte()
++        tcp[13] = flags.toByte()
++        putU16(tcp, 14, TCP_WINDOW_FIELD)
++        payload.copyInto(tcp, TCP_HEADER_BYTES)
++        sendFrame(PROTOCOL_TCP, tcp)
++    }
++
++    internal fun removeConnection(connection: Iap2UsbMuxTcpConnection) {
++        synchronized(stateLock) {
++            if (connections[connection.sourcePort] === connection) {
++                connections.remove(connection.sourcePort)
++            }
++        }
++    }
++
++    private fun begin() {
++        val version = ByteArray(VERSION_MESSAGE_BYTES)
++        putU32(version, 0, PROTOCOL_VERSION)
++        putU32(version, 4, VERSION_MESSAGE_BYTES)
++        putU32(version, 8, USBMUX_VERSION)
++        pipe.write(version, HANDSHAKE_TIMEOUT_MILLIS.toInt())
++        // The phone replies with the same proto=0, length=20, version=2 packet. Protocol 1 is not
++        // a distinct "version reply" here; waiting for it discards the valid reply and times out.
++        val deadline = System.nanoTime() + HANDSHAKE_TIMEOUT_MILLIS * NANOS_PER_MILLISECOND
++        var staleFrames = 0
++        var reply: MuxFrame
++        while (true) {
++            val remainingNanos = deadline - System.nanoTime()
++            if (remainingNanos <= 0) {
++                throw IphoneUsbException.TimedOut("Timed out waiting for the USBMUX version reply")
++            }
++            val remainingMillis = (remainingNanos + NANOS_PER_MILLISECOND - 1) / NANOS_PER_MILLISECOND
++            reply = takeFrame(remainingMillis)
++                ?: throw IphoneUsbException.TimedOut("Timed out waiting for the USBMUX version reply")
++            if (
++                reply.protocol == PROTOCOL_VERSION &&
++                reply.length == VERSION_MESSAGE_BYTES &&
++                reply.word8 == USBMUX_VERSION
++            ) {
++                break
++            }
++            // Android can leave already-received TCP payloads queued in the bulk endpoint when
++            // an app process is replaced. They belong to the previous host instance and must not
++            // be mistaken for the version reply sent in response to the new handshake.
++            if (reply.protocol != PROTOCOL_TCP || ++staleFrames > MAX_STALE_HANDSHAKE_FRAMES) {
++                throw IphoneUsbException.Protocol(
++                    "Invalid USBMUX version reply: proto=${reply.protocol} " +
++                        "length=${reply.length} version=${reply.word8}",
++                )
++            }
++            Log.i("xcertplay-usb", "discarding stale usbmux TCP frame before version reply")
++        }
++        Log.i("xcertplay-usb", "usbmux version accepted: ${reply.word8}")
++        sendFrame(PROTOCOL_SETUP, byteArrayOf(SETUP_VALUE.toByte()))
++        readerThread = Thread(::readerLoop, "iap2-usbmux-reader").apply {
++            isDaemon = true
++            start()
++        }
++    }
++
++    /** Reads one complete USBMUX frame, keeping partial data buffered across reads. */
++    private fun takeFrame(timeoutMillis: Long): MuxFrame? {
++        val deadline = System.nanoTime() + timeoutMillis * NANOS_PER_MILLISECOND
++        while (true) {
++            synchronized(stateLock) {
++                if (closed) throw IphoneUsbException.DeviceUnavailable("USBMUX host is closed")
++                if (receiveBuffer.size >= MUX_HEADER_BYTES) {
++                    val length = readU32(receiveBuffer, 4)
++                    if (length < MUX_HEADER_BYTES || length > MAX_FRAME_BYTES) {
++                        throw IphoneUsbException.Protocol("Invalid USBMUX frame length $length")
++                    }
++                    if (receiveBuffer.size >= length) {
++                        // LIVI only trusts the length field on receive: iPhone replies do not
++                        // carry the 0xFEEDFACE word in the header's fourth field.
++                        Log.d(   // every frame (~2/s while music plays): debug only
++                            "xcertplay-usb",
++                            "usbmux rx proto=${readU32(receiveBuffer, 0)} length=$length word8=0x" +
++                                readU32(receiveBuffer, 8).toUInt().toString(16),
++                        )
++                        val protocol = readU32(receiveBuffer, 0)
++                        val word8 = readU32(receiveBuffer, 8)
++                        nextMuxAcknowledgement = readU16(receiveBuffer, 12)
++                        val payload = receiveBuffer.copyOfRange(MUX_HEADER_BYTES, length)
++                        receiveBuffer = receiveBuffer.copyOfRange(length, receiveBuffer.size)
++                        return MuxFrame(protocol, length, word8, payload)
++                    }
++                }
++            }
++            val remainingNanos = deadline - System.nanoTime()
++            if (remainingNanos <= 0) return null
++            val remainingMillis = (remainingNanos + NANOS_PER_MILLISECOND - 1) / NANOS_PER_MILLISECOND
++            val bytes = pipe.read(remainingMillis) ?: continue
++            synchronized(stateLock) {
++                receiveBuffer += bytes
++            }
++        }
++    }
++
++    private fun sendFrame(protocol: Int, payload: ByteArray) = synchronized(writeLock) {
++        val sequenceAndAcknowledgement = synchronized(stateLock) {
++            checkOpenLocked()
++            nextMuxSequence to nextMuxAcknowledgement
++        }
++        val frame = ByteArray(MUX_HEADER_BYTES + payload.size)
++        putU32(frame, 0, protocol)
++        putU32(frame, 4, frame.size)
++        putU32(frame, 8, MUX_MAGIC)
++        putU16(frame, 12, sequenceAndAcknowledgement.first)
++        putU16(frame, 14, sequenceAndAcknowledgement.second)
++        payload.copyInto(frame, MUX_HEADER_BYTES)
++        try {
++            pipe.write(frame, WRITE_TIMEOUT_MILLIS)
++        } catch (error: IphoneUsbException) {
++            fail(error)
++            throw error
++        }
++        synchronized(stateLock) {
++            nextMuxSequence = (nextMuxSequence + 1) and 0xffff
++        }
++    }
++
++    private fun readerLoop() {
++        try {
++            while (true) {
++                synchronized(stateLock) {
++                    if (closed) return
++                }
++                val frame = takeFrame(readTimeoutMillis) ?: continue
++                if (frame.protocol == PROTOCOL_TCP) dispatchTcp(frame.payload)
++            }
++        } catch (error: IphoneUsbException) {
++            fail(error)
++        } catch (error: RuntimeException) {
++            fail(IphoneUsbException.DeviceUnavailable("USBMUX reader failed", error))
++        }
++    }
++
++    private fun dispatchTcp(frame: ByteArray) {
++        val offset = 0
++        val length = frame.size
++        if (length < TCP_HEADER_BYTES) {
++            throw IphoneUsbException.Protocol("USBMUX TCP frame is shorter than its header")
++        }
++        val tcpHeaderBytes = ((frame[offset + 12].toInt() ushr 4) and 0x0f) * 4
++        if (tcpHeaderBytes < TCP_HEADER_BYTES || tcpHeaderBytes > length) {
++            throw IphoneUsbException.Protocol("Invalid USBMUX TCP header length")
++        }
++        val destinationPort = readU16(frame, offset + 2)
++        if (length == tcpHeaderBytes) Log.i("xcertplay-usb", "usbmux TCP control destination=$destinationPort flags=${frame[13].toInt() and 0xff} ack=${readU32(frame, 8)} window=${readU16(frame, 14)}")
++        val connection = synchronized(stateLock) { connections[destinationPort] } ?: return
++        connection.onPacket(
++            flags = frame[offset + 13].toInt() and 0xff,
++            sequence = readU32(frame, offset + 4),
++            payload = frame.copyOfRange(offset + tcpHeaderBytes, offset + length),
++        )
++    }
++
++    private fun fail(error: IphoneUsbException) {
++        val activeConnections = synchronized(stateLock) {
++            if (closed) return
++            failure = failure ?: error
++            closed = true
++            connections.values.toList().also { connections.clear() }
++        }
++        activeConnections.forEach { it.closeFromHost(error) }
++        pipe.close()
++    }
++
++    private fun allocateSourcePortLocked(): Int {
++        repeat(0xffff) {
++            val candidate = nextSourcePort
++            nextSourcePort = if (candidate == 0xffff) FIRST_SOURCE_PORT else candidate + 1
++            if (candidate !in connections) return candidate
++        }
++        throw IphoneUsbException.DeviceUnavailable("USBMUX has no free TCP source ports")
++    }
++
++    private fun checkOpenLocked() {
++        failure?.let { throw it }
++        if (closed) throw IphoneUsbException.DeviceUnavailable("USBMUX host is closed")
++    }
++
++    companion object {
++        const val LOCKDOWN_PORT = 62078
++
++        private const val PROTOCOL_VERSION = 0
++        private const val PROTOCOL_SETUP = 2
++        private const val PROTOCOL_TCP = 6
++        private const val USBMUX_VERSION = 2
++        private const val SETUP_VALUE = 0x07
++        private const val MUX_MAGIC = 0xfeedface.toInt()
++        private const val VERSION_MESSAGE_BYTES = 20
++        private const val NANOS_PER_MILLISECOND = 1_000_000L
++        private const val MUX_HEADER_BYTES = 16
++        private const val TCP_HEADER_BYTES = 20
++        private const val TCP_WINDOW_FIELD = 512
++        private const val MAX_FRAME_BYTES = 65_536
++        private const val FIRST_SOURCE_PORT = 1
++        private const val HANDSHAKE_TIMEOUT_MILLIS = 60_000L
++        private const val MAX_STALE_HANDSHAKE_FRAMES = 32
++        private const val CONNECT_TIMEOUT_MILLIS = 5_000L
++        private const val WRITE_TIMEOUT_MILLIS = 2_000
++        private const val CLOSE_JOIN_MARGIN_MILLIS = 100L
++
++        /** Performs the USBMUX v2 handshake and starts the framed reader. */
++        fun open(
++            pipe: Iap2UsbSession,
++            readTimeoutMillis: Long = 1_000,
++        ): Iap2UsbMuxHost {
++            require(readTimeoutMillis > 0) { "readTimeoutMillis must be positive" }
++            return Iap2UsbMuxHost(pipe, readTimeoutMillis).also {
++                try {
++                    it.begin()
++                } catch (error: Throwable) {
++                    it.close()
++                    throw error
++                }
++            }
++        }
++
++        private fun putU16(target: ByteArray, offset: Int, value: Int) {
++            target[offset] = (value ushr 8).toByte()
++            target[offset + 1] = value.toByte()
++        }
++
++        private fun putU32(target: ByteArray, offset: Int, value: Int) {
++            target[offset] = (value ushr 24).toByte()
++            target[offset + 1] = (value ushr 16).toByte()
++            target[offset + 2] = (value ushr 8).toByte()
++            target[offset + 3] = value.toByte()
++        }
++
++        private fun readU16(source: ByteArray, offset: Int): Int =
++            ((source[offset].toInt() and 0xff) shl 8) or (source[offset + 1].toInt() and 0xff)
++
++        private fun readU32(source: ByteArray, offset: Int): Int =
++            ((source[offset].toInt() and 0xff) shl 24) or
++                ((source[offset + 1].toInt() and 0xff) shl 16) or
++                ((source[offset + 2].toInt() and 0xff) shl 8) or
++                (source[offset + 3].toInt() and 0xff)
++    }
++}
++
++/** A blocking TCP byte stream carried by [Iap2UsbMuxHost]. */
++class Iap2UsbMuxTcpConnection internal constructor(
++    private val host: Iap2UsbMuxHost,
++    internal val sourcePort: Int,
++    private val destinationPort: Int,
++) : BlockingDuplexByteStream {
++    private val stateLock = Object()
++    private val writeLock = Any()
++    private val received = ArrayDeque<ByteArray>()
++    private var nextSequence = 0
++    private var nextAcknowledgement = 0
++    private var connected = false
++    private var closed = false
++    private var failure: IphoneUsbException? = null
++
++    /** Sends [data] as an ordered byte stream, split into USBMUX TCP payloads of at most 16 KiB. */
++    override fun send(data: ByteArray) {
++        synchronized(stateLock) { checkConnectedLocked() }
++        var offset = 0
++        while (offset < data.size) {
++            val count = minOf(MAX_SEND_PAYLOAD_BYTES, data.size - offset)
++            val chunk = data.copyOfRange(offset, offset + count)
++            synchronized(writeLock) {
++                val sequenceAndAck = synchronized(stateLock) {
++                    checkConnectedLocked()
++                    nextSequence to nextAcknowledgement
++                }
++                host.sendTcp(
++                    sourcePort,
++                    destinationPort,
++                    sequenceAndAck.first,
++                    sequenceAndAck.second,
++                    TCP_ACK,
++                    chunk,
++                )
++                synchronized(stateLock) { nextSequence += count }
++            }
++            offset += count
++        }
++    }
++
++    /**
++     * Receives up to [maxBytes] from the byte stream. Returns null on timeout and an empty array
++     * after FIN or local close; a peer RST is reported as a transport failure.
++     */
++    override fun recv(maxBytes: Int, timeoutMillis: Long): ByteArray? {
++        require(maxBytes > 0) { "maxBytes must be positive" }
++        require(timeoutMillis > 0) { "timeoutMillis must be positive" }
++        val deadline = System.nanoTime() + timeoutMillis * NANOS_PER_MILLISECOND
++        synchronized(stateLock) {
++            while (received.isEmpty() && !closed) {
++                val remainingNanos = deadline - System.nanoTime()
++                if (remainingNanos <= 0) return null
++                try {
++                    stateLock.wait(remainingNanos / NANOS_PER_MILLISECOND, (remainingNanos % NANOS_PER_MILLISECOND).toInt())
++                } catch (_: InterruptedException) {
++                    Thread.currentThread().interrupt()
++                    throw IphoneUsbException.DeviceUnavailable("Interrupted while waiting for USBMUX TCP data")
++                }
++            }
++            failure?.let { throw it }
++            if (received.isEmpty()) {
++                return ByteArray(0)
++            }
++            val packet = received.removeFirst()
++            return if (packet.size <= maxBytes) {
++                packet
++            } else {
++                received.addFirst(packet.copyOfRange(maxBytes, packet.size))
++                packet.copyOf(maxBytes)
++            }
++        }
++    }
++
++    override fun close() {
++        val shouldSendFin = synchronized(stateLock) {
++            if (closed) return
++            closed = true
++            stateLock.notifyAll()
++            connected
++        }
++        if (shouldSendFin) {
++            try {
++                synchronized(writeLock) {
++                    val sequenceAndAck = synchronized(stateLock) { nextSequence to nextAcknowledgement }
++                    host.sendTcp(
++                        sourcePort,
++                        destinationPort,
++                        sequenceAndAck.first,
++                        sequenceAndAck.second,
++                        TCP_FIN or TCP_ACK,
++                        ByteArray(0),
++                    )
++                }
++            } catch (_: IphoneUsbException) {
++                // The host may have already closed its USB pipe; the closed state remains final.
++            }
++        }
++        host.removeConnection(this)
++    }
++
++    internal fun beginConnect() {
++        sendControl(TCP_SYN)
++    }
++
++    internal fun awaitConnected(timeoutMillis: Long): Boolean {
++        val deadline = System.nanoTime() + timeoutMillis * NANOS_PER_MILLISECOND
++        synchronized(stateLock) {
++            while (!connected && !closed) {
++                val remainingNanos = deadline - System.nanoTime()
++                if (remainingNanos <= 0) return false
++                try {
++                    stateLock.wait(remainingNanos / NANOS_PER_MILLISECOND, (remainingNanos % NANOS_PER_MILLISECOND).toInt())
++                } catch (_: InterruptedException) {
++                    Thread.currentThread().interrupt()
++                    throw IphoneUsbException.DeviceUnavailable("Interrupted while connecting USBMUX TCP")
++                }
++            }
++            failure?.let { throw it }
++            return connected && !closed
++        }
++    }
++
++    internal fun abort() {
++        val shouldSendReset = synchronized(stateLock) {
++            if (closed) return
++            closed = true
++            stateLock.notifyAll()
++            true
++        }
++        if (shouldSendReset) {
++            try {
++                sendControl(TCP_RST or TCP_ACK)
++            } catch (_: IphoneUsbException) {
++                // A failed reset cannot make the local connection usable again.
++            }
++        }
++        host.removeConnection(this)
++    }
++
++    internal fun closeFromHost(error: IphoneUsbException? = null) = synchronized(stateLock) {
++        if (closed) return@synchronized
++        failure = error ?: failure
++        closed = true
++        stateLock.notifyAll()
++    }
++
++    internal fun onPacket(flags: Int, sequence: Int, payload: ByteArray) {
++        if ((flags and TCP_RST) != 0) {
++            synchronized(stateLock) {
++                failure = IphoneUsbException.DeviceUnavailable("USBMUX TCP connection was reset by the peer")
++                closed = true
++                stateLock.notifyAll()
++            }
++            host.removeConnection(this)
++            return
++        }
++        if ((flags and TCP_SYN) != 0 && (flags and TCP_ACK) != 0) {
++            synchronized(stateLock) {
++                if (closed) return
++                nextSequence += 1
++                nextAcknowledgement = sequence + 1
++            }
++            sendControl(TCP_ACK)
++            synchronized(stateLock) {
++                if (!closed) {
++                    connected = true
++                    stateLock.notifyAll()
++                }
++            }
++            return
++        }
++        if (payload.isNotEmpty()) {
++            synchronized(stateLock) {
++                if (closed) return
++                nextAcknowledgement += payload.size
++                received.addLast(payload)
++                stateLock.notifyAll()
++            }
++            sendControl(TCP_ACK)
++        }
++        if ((flags and TCP_FIN) != 0) {
++            synchronized(stateLock) {
++                if (closed) return
++                nextAcknowledgement += 1
++            }
++            sendControl(TCP_ACK)
++            synchronized(stateLock) {
++                closed = true
++                stateLock.notifyAll()
++            }
++            host.removeConnection(this)
++        }
++    }
++
++    private fun sendControl(flags: Int) = synchronized(writeLock) {
++        val sequenceAndAck = synchronized(stateLock) { nextSequence to nextAcknowledgement }
++        host.sendTcp(
++            sourcePort,
++            destinationPort,
++            sequenceAndAck.first,
++            sequenceAndAck.second,
++            flags,
++            ByteArray(0),
++        )
++    }
++
++    private fun checkConnectedLocked() {
++        failure?.let { throw it }
++        if (!connected || closed) throw IphoneUsbException.DeviceUnavailable("USBMUX TCP connection is not open")
++    }
++
++    private companion object {
++        const val TCP_FIN = 0x01
++        const val TCP_SYN = 0x02
++        const val TCP_RST = 0x04
++        const val TCP_ACK = 0x10
++        const val MAX_SEND_PAYLOAD_BYTES = 16 * 1024
++        const val NANOS_PER_MILLISECOND = 1_000_000L
++    }
++}
+--- /dev/null
++++ b/protocol/src/main/java/com/shilapi/xcertplay/transport/LockdownPairingClient.kt
+@@ -0,0 +1,250 @@
++package com.shilapi.xcertplay.transport
++
++import java.io.IOException
++import java.security.GeneralSecurityException
++
++/**
++ * Blocking, plaintext Lockdown pairing over an already-open USBMUX host.
++ *
++ * Call [pair] from a worker thread, never Android's main thread. This client owns only the
++ * connection it creates: it closes the plist channel (and therefore that connection) after every
++ * outcome, but leaves [Iap2UsbMuxHost] open for its caller. It neither persists material nor
++ * starts a session, negotiates TLS, starts a service, or establishes any CarPlay/iAP2 session.
++ */
++class LockdownPairingClient(
++    private val host: Iap2UsbMuxHost,
++) {
++    /**
++     * Fetches the two pairing inputs, generates the local record, and sends plaintext Pair.
++     *
++     * [totalTimeoutMillis] covers the entire operation, including a pending pairing dialog.
++     * [isCancelled] is checked between blocking protocol operations and while waiting to retry a
++     * pending dialog; it cannot interrupt an already-blocking plist read, which is bounded to
++     * five seconds. It is intentionally a small synchronous callback rather than a coroutine.
++     */
++    @Throws(IphoneUsbException::class, LockdownPairingException::class, GeneralSecurityException::class)
++    fun pair(
++        label: String,
++        hostId: String,
++        systemBuid: String,
++        totalTimeoutMillis: Long,
++        isCancelled: () -> Boolean = { false },
++    ): PairedRecord {
++        require(label.isNotBlank()) { "label must not be blank" }
++        require(hostId.isNotBlank()) { "hostId must not be blank" }
++        require(systemBuid.isNotBlank()) { "systemBuid must not be blank" }
++        require(totalTimeoutMillis in 1..MAXIMUM_TOTAL_TIMEOUT_MILLIS) {
++            "totalTimeoutMillis must be between 1 and $MAXIMUM_TOTAL_TIMEOUT_MILLIS"
++        }
++
++        val deadline = Deadline(totalTimeoutMillis)
++        var pairRecord: LockdownPairRecord? = null
++        var attempt = 0
++        while (true) {
++            checkCancelled(isCancelled)
++            attempt += 1
++            val connection = host.connect(
++                destinationPort = Iap2UsbMuxHost.LOCKDOWN_PORT,
++                timeoutMillis = stepTimeoutMillis(deadline),
++            )
++            var pending = false
++            LockdownPlistChannel(connection).use { channel ->
++                setUntrustedHostBuid(channel, label, systemBuid, deadline, isCancelled)
++                val record = pairRecord ?: generatePairRecord(
++                    channel = channel,
++                    label = label,
++                    hostId = hostId,
++                    systemBuid = systemBuid,
++                    deadline = deadline,
++                    isCancelled = isCancelled,
++                ).also {
++                    pairRecord = it
++                    Log.i(
++                        TAG,
++                        "lockdown pair prepared hostId=uuid systemBuid=uuid " +
++                            "deviceKey=${it.devicePublicKeyPem.size} deviceCert=${it.deviceCertificatePem.size} " +
++                            "hostCert=${it.hostCertificatePem.size} rootCert=${it.rootCertificatePem.size}",
++                    )
++                }
++                Log.i(TAG, "lockdown pair attempt=$attempt")
++                val response = channel.request(pairRequest(label, record), stepTimeoutMillis(deadline))
++                checkCancelled(isCancelled)
++                when (val error = response.errorCodeOrNull()) {
++                    null -> return PairedRecord(record, response.entries["EscrowBag"].asOptionalData())
++                    "PairingDialogResponsePending" -> pending = true
++                    "UserDeniedPairing" -> throw LockdownPairingException.UserDeniedPairing
++                    "PasswordProtected" -> throw LockdownPairingException.PasswordProtected
++                    else -> throw LockdownPairingException.RemoteError(error)
++                }
++            }
++            if (pending) {
++                Log.i(TAG, "lockdown trust pending; reconnecting before retry")
++                waitForRetry(deadline, isCancelled)
++            }
++        }
++    }
++
++    private fun generatePairRecord(
++        channel: LockdownPlistChannel,
++        label: String,
++        hostId: String,
++        systemBuid: String,
++        deadline: Deadline,
++        isCancelled: () -> Boolean,
++    ): LockdownPairRecord {
++        val devicePublicKey = getValue(channel, label, "DevicePublicKey", deadline, isCancelled)
++            as? LockdownPlistValue.Data
++            ?: throw LockdownPairingException.InvalidResponse("DevicePublicKey was not data")
++        val wifiAddress = getValue(channel, label, "WiFiAddress", deadline, isCancelled)
++            as? LockdownPlistValue.Text
++            ?: throw LockdownPairingException.InvalidResponse("WiFiAddress was not text")
++        return LockdownPairRecordGenerator.generate(
++            devicePublicKeyPkcs1Pem = devicePublicKey.bytes,
++            wifiAddress = wifiAddress.value,
++            hostId = hostId,
++            systemBuid = systemBuid,
++        )
++    }
++
++    private fun pairRequest(
++        label: String,
++        pairRecord: LockdownPairRecord,
++    ): LockdownPlistValue.Dictionary = LockdownPlistValue.Dictionary(
++        linkedMapOf(
++            "Label" to LockdownPlistValue.Text(label),
++            "PairRecord" to pairRecord.toPairRequestDictionary(),
++            "Request" to LockdownPlistValue.Text("Pair"),
++            "ProtocolVersion" to LockdownPlistValue.Text("2"),
++            "PairingOptions" to LockdownPlistValue.Dictionary(
++                linkedMapOf("ExtendedPairingErrors" to LockdownPlistValue.Boolean(true)),
++            ),
++        ),
++    )
++
++    private fun setUntrustedHostBuid(
++        channel: LockdownPlistChannel,
++        label: String,
++        systemBuid: String,
++        deadline: Deadline,
++        isCancelled: () -> Boolean,
++    ) {
++        checkCancelled(isCancelled)
++        val response = channel.request(
++            LockdownPlistValue.Dictionary(
++                linkedMapOf(
++                    "Label" to LockdownPlistValue.Text(label),
++                    "Request" to LockdownPlistValue.Text("SetValue"),
++                    "Key" to LockdownPlistValue.Text("UntrustedHostBUID"),
++                    "Value" to LockdownPlistValue.Text(systemBuid),
++                ),
++            ),
++            stepTimeoutMillis(deadline),
++        )
++        checkCancelled(isCancelled)
++        response.errorCodeOrNull()?.let { throw LockdownPairingException.RemoteError(it) }
++        Log.i(TAG, "lockdown UntrustedHostBUID set")
++    }
++
++    private fun getValue(
++        channel: LockdownPlistChannel,
++        label: String,
++        key: String,
++        deadline: Deadline,
++        isCancelled: () -> Boolean,
++    ): LockdownPlistValue {
++        checkCancelled(isCancelled)
++        val response = channel.request(
++            LockdownPlistValue.Dictionary(
++                linkedMapOf(
++                    "Label" to LockdownPlistValue.Text(label),
++                    "Request" to LockdownPlistValue.Text("GetValue"),
++                    "Key" to LockdownPlistValue.Text(key),
++                ),
++            ),
++            stepTimeoutMillis(deadline),
++        )
++        checkCancelled(isCancelled)
++        response.errorCodeOrNull()?.let { throw LockdownPairingException.RemoteError(it) }
++        return response.entries["Value"]
++            ?: throw LockdownPairingException.InvalidResponse("GetValue response omitted Value")
++    }
++
++    private fun LockdownPlistValue?.asOptionalData(): ByteArray? = when (this) {
++        null -> null
++        is LockdownPlistValue.Data -> bytes
++        else -> throw LockdownPairingException.InvalidResponse("EscrowBag was not data")
++    }
++
++    private fun LockdownPlistValue.Dictionary.errorCodeOrNull(): String? {
++        return when (val error = entries["Error"] ?: return null) {
++            is LockdownPlistValue.Text -> error.value
++            is LockdownPlistValue.Integer -> (entries["ErrorString"] as? LockdownPlistValue.Text)?.value
++                ?: error.value.toString()
++            else -> throw LockdownPairingException.InvalidResponse("Error was not text or integer")
++        }
++    }
++
++    private fun checkCancelled(isCancelled: () -> Boolean) {
++        if (isCancelled()) throw LockdownPairingException.Cancelled
++    }
++
++    private fun stepTimeoutMillis(deadline: Deadline): Long =
++        minOf(MAXIMUM_STEP_TIMEOUT_MILLIS, deadline.remainingMillis())
++
++    private fun waitForRetry(deadline: Deadline, isCancelled: () -> Boolean) {
++        var remaining = RETRY_INTERVAL_MILLIS
++        while (remaining > 0) {
++            checkCancelled(isCancelled)
++            val sleepMillis = minOf(RETRY_CHECK_MILLIS, remaining, deadline.remainingMillis())
++            try {
++                Thread.sleep(sleepMillis)
++            } catch (_: InterruptedException) {
++                Thread.currentThread().interrupt()
++                throw LockdownPairingException.Cancelled
++            }
++            remaining -= sleepMillis
++        }
++    }
++
++    private class Deadline(timeoutMillis: Long) {
++        private val deadlineNanos = System.nanoTime() + timeoutMillis * NANOS_PER_MILLISECOND
++
++        fun remainingMillis(): Long {
++            val remainingNanos = deadlineNanos - System.nanoTime()
++            if (remainingNanos <= 0) throw LockdownPairingException.TimedOut
++            return (remainingNanos + NANOS_PER_MILLISECOND - 1) / NANOS_PER_MILLISECOND
++        }
++    }
++
++    private companion object {
++        const val TAG = "xcertplay-usb"
++        const val RETRY_INTERVAL_MILLIS = 1_000L
++        const val RETRY_CHECK_MILLIS = 100L
++        const val NANOS_PER_MILLISECOND = 1_000_000L
++        const val MAXIMUM_STEP_TIMEOUT_MILLIS = 5_000L
++        const val MAXIMUM_TOTAL_TIMEOUT_MILLIS = 5 * 60_000L
++    }
++}
++
++/** Successful pairing material kept in memory only. Byte-array accessors return defensive copies. */
++class PairedRecord internal constructor(
++    val pairRecord: LockdownPairRecord,
++    escrowBag: ByteArray?,
++) {
++    private val storedEscrowBag = escrowBag?.copyOf()
++
++    val escrowBag: ByteArray?
++        get() = storedEscrowBag?.copyOf()
++
++    override fun toString(): String = "PairedRecord(redacted)"
++}
++
++/** Typed pairing failures; their messages never include pairing keys, certificates, or escrow data. */
++sealed class LockdownPairingException(message: String) : IOException(message) {
++    data object Cancelled : LockdownPairingException("Lockdown pairing was cancelled")
++    data object TimedOut : LockdownPairingException("Lockdown pairing timed out")
++    data object UserDeniedPairing : LockdownPairingException("The user denied Lockdown pairing")
++    data object PasswordProtected : LockdownPairingException("The iPhone is password protected")
++    class RemoteError(val code: String) : LockdownPairingException("Lockdown pairing failed: $code")
++    class InvalidResponse(message: String) : LockdownPairingException("Invalid Lockdown pairing response: $message")
++}
+--- /dev/null
++++ b/protocol/src/main/java/com/shilapi/xcertplay/transport/LockdownCarKitClient.kt
+@@ -0,0 +1,143 @@
++package com.shilapi.xcertplay.transport
++
++import java.io.Closeable
++import java.security.GeneralSecurityException
++import java.util.concurrent.atomic.AtomicBoolean
++
++/**
++ * Blocking minimum Lockdown path that opens the `com.apple.carkit.service` byte stream.
++ *
++ * Connect, plist receive, and TLS engine budgets are five seconds; writes retain the underlying
++ * transport's bounded timeout. The returned stream is owned by the caller. This client never
++ * closes its caller-owned [Iap2UsbMuxHost], persists a record, sends iAP2, or performs UI work.
++ */
++class LockdownCarKitClient(
++    private val host: Iap2UsbMuxHost,
++) {
++    @Throws(IphoneUsbException::class, GeneralSecurityException::class)
++    fun open(pairedRecord: PairedRecord, label: String): BlockingDuplexByteStream =
++        open(pairedRecord.pairRecord, label)
++
++    @Throws(IphoneUsbException::class, GeneralSecurityException::class)
++    fun open(pairRecord: LockdownPairRecord, label: String): BlockingDuplexByteStream =
++        openService(pairRecord, label, CARKIT_SERVICE)
++
++    fun openService(pairRecord: LockdownPairRecord, label: String, serviceName: String): BlockingDuplexByteStream {
++        require(label.isNotBlank()) { "label must not be blank" }
++        require(serviceName.isNotBlank()) { "serviceName must not be blank" }
++
++        val lockdownConnection = host.connect(
++            destinationPort = Iap2UsbMuxHost.LOCKDOWN_PORT,
++            timeoutMillis = STEP_TIMEOUT_MILLIS,
++        )
++        val sessionTls = LockdownPlistChannel(lockdownConnection).use { plaintext ->
++            val response = plaintext.request(
++                LockdownPlistValue.Dictionary(
++                    linkedMapOf(
++                        "Label" to LockdownPlistValue.Text(label),
++                        "Request" to LockdownPlistValue.Text("StartSession"),
++                        "HostID" to LockdownPlistValue.Text(pairRecord.hostId),
++                        "SystemBUID" to LockdownPlistValue.Text(pairRecord.systemBuid),
++                    ),
++                ),
++                STEP_TIMEOUT_MILLIS,
++            )
++            rejectError(response, "StartSession")
++            val enableSessionSsl = (response.entries["EnableSessionSSL"] as? LockdownPlistValue.Boolean)?.value
++                ?: throw IphoneUsbException.Protocol("StartSession response omitted boolean EnableSessionSSL")
++            if (!enableSessionSsl) {
++                throw IphoneUsbException.Protocol("StartSession did not enable TLS")
++            }
++            TlsDuplexChannel.open(
++                underlying = plaintext.detach(),
++                pairRecord = pairRecord,
++                handshakeTimeoutMillis = STEP_TIMEOUT_MILLIS,
++            )
++        }
++
++        val secureLockdown = LockdownPlistChannel(sessionTls)
++        var serviceStream: BlockingDuplexByteStream? = null
++        try {
++            val response = secureLockdown.request(
++                LockdownPlistValue.Dictionary(
++                    linkedMapOf(
++                        "Request" to LockdownPlistValue.Text("StartService"),
++                        "Service" to LockdownPlistValue.Text(serviceName),
++                    ),
++                ),
++                STEP_TIMEOUT_MILLIS,
++            )
++            rejectError(response, "StartService")
++            val port = (response.entries["Port"] as? LockdownPlistValue.Integer)?.value
++                ?: throw IphoneUsbException.Protocol("StartService response omitted integer Port")
++            if (port !in 1..0xffff) {
++                throw IphoneUsbException.Protocol("StartService returned an invalid Port")
++            }
++            val enableServiceSsl = (response.entries["EnableServiceSSL"] as? LockdownPlistValue.Boolean)?.value
++                ?: false
++
++            val serviceConnection = host.connect(
++                destinationPort = port.toInt(),
++                timeoutMillis = STEP_TIMEOUT_MILLIS,
++            )
++            val readyStream = if (enableServiceSsl) {
++                TlsDuplexChannel.open(
++                    underlying = serviceConnection,
++                    pairRecord = pairRecord,
++                    handshakeTimeoutMillis = STEP_TIMEOUT_MILLIS,
++                )
++            } else {
++                serviceConnection
++            }
++            serviceStream = readyStream
++            val ownedStream = CarkitServiceStream(readyStream, secureLockdown)
++            serviceStream = null
++            return ownedStream
++        } finally {
++            if (serviceStream != null) {
++                try {
++                    serviceStream.close()
++                } finally {
++                    secureLockdown.close()
++                }
++            }
++        }
++    }
++
++    /** Keeps the Lockdown session that created carkit alive for the service stream's lifetime. */
++    private class CarkitServiceStream(
++        private val service: BlockingDuplexByteStream,
++        private val lockdown: Closeable,
++    ) : BlockingDuplexByteStream {
++        private val closed = AtomicBoolean(false)
++
++        override fun send(data: ByteArray) = service.send(data)
++
++        override fun recv(maxBytes: Int, timeoutMillis: Long): ByteArray? =
++            service.recv(maxBytes, timeoutMillis)
++
++        override fun close() {
++            if (!closed.compareAndSet(false, true)) return
++            try {
++                service.close()
++            } finally {
++                lockdown.close()
++            }
++        }
++    }
++
++    private fun rejectError(response: LockdownPlistValue.Dictionary, request: String) {
++        val code = when (val error = response.entries["Error"] ?: return) {
++            is LockdownPlistValue.Text -> error.value
++            is LockdownPlistValue.Integer -> (response.entries["ErrorString"] as? LockdownPlistValue.Text)?.value
++                ?: error.value.toString()
++            else -> throw IphoneUsbException.Protocol("$request response Error was not text or integer")
++        }
++        throw IphoneUsbException.Protocol("Lockdown $request failed: $code")
++    }
++
++    private companion object {
++        const val STEP_TIMEOUT_MILLIS = 5_000L
++        const val CARKIT_SERVICE = "com.apple.carkit.service"
++    }
++}
+--- /dev/null
++++ b/protocol/src/main/java/com/shilapi/xcertplay/transport/LockdownPairRecord.kt
+@@ -0,0 +1,436 @@
++package com.shilapi.xcertplay.transport
++
++import java.io.ByteArrayOutputStream
++import java.math.BigInteger
++import java.nio.charset.StandardCharsets
++import java.security.GeneralSecurityException
++import java.security.KeyFactory
++import java.security.KeyPairGenerator
++import java.security.MessageDigest
++import java.security.PrivateKey
++import java.security.PublicKey
++import java.security.Signature
++import java.security.interfaces.RSAPublicKey
++import java.security.spec.RSAPublicKeySpec
++import java.text.SimpleDateFormat
++import java.util.Base64
++import java.util.Date
++import java.util.Locale
++import java.util.TimeZone
++
++/**
++ * Pairing material assembled locally from Lockdown values already obtained by the caller.
++ *
++ * It deliberately has no transport dependency: it neither requests values nor sends Pair.
++ */
++class LockdownPairRecord private constructor(
++    val hostId: String,
++    val systemBuid: String,
++    val wifiMacAddress: String,
++    devicePublicKeyPem: ByteArray,
++    deviceCertificatePem: ByteArray,
++    hostPrivateKeyPem: ByteArray,
++    hostCertificatePem: ByteArray,
++    rootPrivateKeyPem: ByteArray,
++    rootCertificatePem: ByteArray,
++) {
++    private val storedDevicePublicKeyPem = devicePublicKeyPem.copyOf()
++    private val storedDeviceCertificatePem = deviceCertificatePem.copyOf()
++    private val storedHostPrivateKeyPem = hostPrivateKeyPem.copyOf()
++    private val storedHostCertificatePem = hostCertificatePem.copyOf()
++    private val storedRootPrivateKeyPem = rootPrivateKeyPem.copyOf()
++    private val storedRootCertificatePem = rootCertificatePem.copyOf()
++
++    val devicePublicKeyPem: ByteArray get() = storedDevicePublicKeyPem.copyOf()
++    val deviceCertificatePem: ByteArray get() = storedDeviceCertificatePem.copyOf()
++    val hostPrivateKeyPem: ByteArray get() = storedHostPrivateKeyPem.copyOf()
++    val hostCertificatePem: ByteArray get() = storedHostCertificatePem.copyOf()
++    val rootPrivateKeyPem: ByteArray get() = storedRootPrivateKeyPem.copyOf()
++    val rootCertificatePem: ByteArray get() = storedRootCertificatePem.copyOf()
++
++    /** Builds only the nested Pair request value; EscrowBag is intentionally unavailable yet. */
++    fun toPairRequestDictionary(): LockdownPlistValue.Dictionary = LockdownPlistValue.Dictionary(
++        linkedMapOf(
++            "DeviceCertificate" to LockdownPlistValue.Data(deviceCertificatePem),
++            "HostCertificate" to LockdownPlistValue.Data(hostCertificatePem),
++            "HostID" to LockdownPlistValue.Text(hostId),
++            "RootCertificate" to LockdownPlistValue.Data(rootCertificatePem),
++            "SystemBUID" to LockdownPlistValue.Text(systemBuid),
++        ),
++    )
++
++    override fun toString(): String = "LockdownPairRecord(redacted)"
++
++    companion object {
++        /** Rebuilds a record from previously persisted material; all PEM buffers are copied. */
++        fun restore(
++            hostId: String,
++            systemBuid: String,
++            wifiMacAddress: String,
++            devicePublicKeyPem: ByteArray,
++            deviceCertificatePem: ByteArray,
++            hostPrivateKeyPem: ByteArray,
++            hostCertificatePem: ByteArray,
++            rootPrivateKeyPem: ByteArray,
++            rootCertificatePem: ByteArray,
++        ): LockdownPairRecord {
++            require(hostId.isNotBlank()) { "hostId must not be blank" }
++            require(systemBuid.isNotBlank()) { "systemBuid must not be blank" }
++            require(wifiMacAddress.isNotBlank()) { "wifiMacAddress must not be blank" }
++            listOf(
++                devicePublicKeyPem,
++                deviceCertificatePem,
++                hostPrivateKeyPem,
++                hostCertificatePem,
++                rootPrivateKeyPem,
++                rootCertificatePem,
++            ).forEach { require(it.isNotEmpty()) { "PEM material must not be empty" } }
++            return LockdownPairRecord(
++                hostId = hostId,
++                systemBuid = systemBuid,
++                wifiMacAddress = wifiMacAddress,
++                devicePublicKeyPem = devicePublicKeyPem,
++                deviceCertificatePem = deviceCertificatePem,
++                hostPrivateKeyPem = hostPrivateKeyPem,
++                hostCertificatePem = hostCertificatePem,
++                rootPrivateKeyPem = rootPrivateKeyPem,
++                rootCertificatePem = rootCertificatePem,
++            )
++        }
++
++        internal fun create(
++            hostId: String,
++            systemBuid: String,
++            wifiMacAddress: String,
++            devicePublicKeyPem: ByteArray,
++            material: CertificateMaterial,
++        ) = LockdownPairRecord(
++            hostId = hostId,
++            systemBuid = systemBuid,
++            wifiMacAddress = wifiMacAddress,
++            devicePublicKeyPem = devicePublicKeyPem,
++            deviceCertificatePem = material.deviceCertificatePem,
++            hostPrivateKeyPem = material.hostPrivateKeyPem,
++            hostCertificatePem = material.hostCertificatePem,
++            rootPrivateKeyPem = material.rootPrivateKeyPem,
++            rootCertificatePem = material.rootCertificatePem,
++        )
++    }
++}
++
++/** Generates a Lockdown PairRecord from values supplied by the caller, without any USB I/O. */
++object LockdownPairRecordGenerator {
++    @Throws(GeneralSecurityException::class, IllegalArgumentException::class)
++    fun generate(
++        devicePublicKeyPkcs1Pem: ByteArray,
++        wifiAddress: String,
++        hostId: String,
++        systemBuid: String,
++    ): LockdownPairRecord {
++        require(devicePublicKeyPkcs1Pem.isNotEmpty()) { "devicePublicKeyPkcs1Pem must not be empty" }
++        require(wifiAddress.isNotBlank()) { "wifiAddress must not be blank" }
++        require(hostId.isNotBlank()) { "hostId must not be blank" }
++        require(systemBuid.isNotBlank()) { "systemBuid must not be blank" }
++
++        val copiedDeviceKey = devicePublicKeyPkcs1Pem.copyOf()
++        val material = CertificateMaterialGenerator.generate(copiedDeviceKey)
++        return LockdownPairRecord.create(
++            hostId = hostId,
++            systemBuid = systemBuid,
++            wifiMacAddress = wifiAddress,
++            devicePublicKeyPem = copiedDeviceKey,
++            material = material,
++        )
++    }
++}
++
++internal class CertificateMaterial(
++    deviceCertificatePem: ByteArray,
++    hostPrivateKeyPem: ByteArray,
++    hostCertificatePem: ByteArray,
++    rootPrivateKeyPem: ByteArray,
++    rootCertificatePem: ByteArray,
++) {
++    private val storedDeviceCertificatePem = deviceCertificatePem.copyOf()
++    private val storedHostPrivateKeyPem = hostPrivateKeyPem.copyOf()
++    private val storedHostCertificatePem = hostCertificatePem.copyOf()
++    private val storedRootPrivateKeyPem = rootPrivateKeyPem.copyOf()
++    private val storedRootCertificatePem = rootCertificatePem.copyOf()
++
++    val deviceCertificatePem: ByteArray get() = storedDeviceCertificatePem.copyOf()
++    val hostPrivateKeyPem: ByteArray get() = storedHostPrivateKeyPem.copyOf()
++    val hostCertificatePem: ByteArray get() = storedHostCertificatePem.copyOf()
++    val rootPrivateKeyPem: ByteArray get() = storedRootPrivateKeyPem.copyOf()
++    val rootCertificatePem: ByteArray get() = storedRootCertificatePem.copyOf()
++}
++
++/** Minimal Android/JCA implementation of the certificate profile used by the locked dependency. */
++private object CertificateMaterialGenerator {
++    private const val RSA_KEY_BITS = 2048
++    private const val CERTIFICATE_LIFETIME_SECONDS = 10L * 365 * 24 * 60 * 60
++    private const val MILLIS_PER_SECOND = 1_000L
++    private const val UTC_TIME_LAST_YEAR = 2049
++    private val sha256WithRsa = algorithmIdentifier("1.2.840.113549.1.1.11")
++    private val rsaEncryption = algorithmIdentifier("1.2.840.113549.1.1.1")
++
++    fun generate(devicePublicKeyPem: ByteArray): CertificateMaterial {
++        val devicePublicKey = parsePkcs1RsaPublicKey(devicePublicKeyPem)
++        val rootKeyPair = KeyPairGenerator.getInstance("RSA").apply { initialize(RSA_KEY_BITS) }.generateKeyPair()
++        val hostKeyPair = KeyPairGenerator.getInstance("RSA").apply { initialize(RSA_KEY_BITS) }.generateKeyPair()
++        val rootPublicKey = rootKeyPair.public as? RSAPublicKey
++            ?: throw GeneralSecurityException("Generated root key is not RSA")
++        val hostPublicKey = hostKeyPair.public as? RSAPublicKey
++            ?: throw GeneralSecurityException("Generated host key is not RSA")
++        val now = System.currentTimeMillis()
++        // Android's Conscrypt took libimobiledevice-style empty names; the desktop JDK rejects an empty
++        // issuer DN both for our TLS identity and for the device certificate the iPhone presents, so
++        // the box names them (wired CarPlay on the OneCloud, 2026-10-12).
++        val rootName = distinguishedName("DashPlay Root")
++        val rootDer = certificate(
++            issuer = rootName,
++            subject = rootName,
++            certificatePublicKey = rootPublicKey,
++            signingKey = rootKeyPair.private,
++            signingPublicKey = rootPublicKey,
++            nowMillis = now,
++            extensions = rootExtensions(),
++        )
++        val hostDer = certificate(
++            issuer = rootName,
++            subject = distinguishedName("DashPlay Host"),
++            certificatePublicKey = hostPublicKey,
++            signingKey = rootKeyPair.private,
++            signingPublicKey = rootPublicKey,
++            nowMillis = now,
++            extensions = leafExtensions(hostPublicKey, includeSubjectKeyIdentifier = false),
++        )
++        val deviceDer = certificate(
++            issuer = rootName,
++            subject = distinguishedName("Device"),
++            certificatePublicKey = devicePublicKey,
++            signingKey = rootKeyPair.private,
++            signingPublicKey = rootPublicKey,
++            nowMillis = now,
++            extensions = leafExtensions(devicePublicKey, includeSubjectKeyIdentifier = true),
++        )
++        return CertificateMaterial(
++            deviceCertificatePem = pem("CERTIFICATE", deviceDer),
++            hostPrivateKeyPem = pem("PRIVATE KEY", hostKeyPair.private.encoded),
++            hostCertificatePem = pem("CERTIFICATE", hostDer),
++            rootPrivateKeyPem = pem("PRIVATE KEY", rootKeyPair.private.encoded),
++            rootCertificatePem = pem("CERTIFICATE", rootDer),
++        )
++    }
++
++    private fun certificate(
++        issuer: ByteArray,
++        subject: ByteArray,
++        certificatePublicKey: RSAPublicKey,
++        signingKey: PrivateKey,
++        signingPublicKey: PublicKey,
++        nowMillis: Long,
++        extensions: ByteArray,
++    ): ByteArray {
++        val publicKeyBits = pkcs1PublicKey(certificatePublicKey)
++        val notAfterMillis = nowMillis + CERTIFICATE_LIFETIME_SECONDS * MILLIS_PER_SECOND
++        require(nowMillis in 0 until notAfterMillis) { "Invalid certificate validity" }
++        val tbs = sequence(
++            explicit(0, integer(BigInteger.valueOf(2))),
++            integer(BigInteger.ZERO),
++            sha256WithRsa,
++            issuer,
++            sequence(
++                certificateTime(nowMillis),
++                certificateTime(notAfterMillis),
++            ),
++            subject,
++            sequence(rsaEncryption, bitString(publicKeyBits)),
++            explicit(3, extensions),
++        )
++        val signer = Signature.getInstance("SHA256withRSA").apply {
++            initSign(signingKey)
++            update(tbs)
++        }
++        val signature = signer.sign()
++        val encoded = sequence(tbs, sha256WithRsa, bitString(signature))
++        verifyGeneratedCertificate(tbs, signature, signingPublicKey)
++        return encoded
++    }
++
++    /** JBR's CertificateFactory rejects the locked empty issuer DN, so verify the signed TBS directly. */
++    private fun verifyGeneratedCertificate(tbs: ByteArray, signature: ByteArray, signingPublicKey: PublicKey) {
++        val verifier = Signature.getInstance("SHA256withRSA").apply {
++            initVerify(signingPublicKey)
++            update(tbs)
++        }
++        if (!verifier.verify(signature)) throw GeneralSecurityException("Generated certificate signature does not verify")
++    }
++
++    private fun rootExtensions(): ByteArray = sequence(
++        extension("2.5.29.19", critical = true, value = sequence(boolean(true))),
++    )
++
++    private fun leafExtensions(
++        publicKey: RSAPublicKey,
++        includeSubjectKeyIdentifier: Boolean,
++    ): ByteArray {
++        val extensions = mutableListOf(
++            extension("2.5.29.19", critical = true, value = sequence()),
++        )
++        if (includeSubjectKeyIdentifier) {
++            extensions += extension(
++                "2.5.29.14",
++                critical = false,
++                value = octetString(MessageDigest.getInstance("SHA-1").digest(pkcs1PublicKey(publicKey))),
++            )
++        }
++        extensions += extension(
++            "2.5.29.15",
++            critical = true,
++            value = bitString(byteArrayOf(0xa0.toByte()), unusedBits = 5),
++        )
++        return sequence(*extensions.toTypedArray())
++    }
++
++    private fun extension(oid: String, critical: Boolean, value: ByteArray): ByteArray =
++        if (critical) sequence(objectIdentifier(oid), boolean(true), octetString(value))
++        else sequence(objectIdentifier(oid), octetString(value))
++
++    private fun parsePkcs1RsaPublicKey(pem: ByteArray): RSAPublicKey {
++        val text = pem.toString(StandardCharsets.US_ASCII).trim()
++        val begin = "-----BEGIN RSA PUBLIC KEY-----"
++        val end = "-----END RSA PUBLIC KEY-----"
++        require(text.startsWith(begin) && text.endsWith(end)) { "Expected a PKCS#1 RSA public key" }
++        val encoded = text.substring(begin.length, text.length - end.length).filterNot(Char::isWhitespace)
++        val der = Base64.getDecoder().decode(encoded)
++        val outer = DerReader(der)
++        val sequence = outer.readConstructed(0x30)
++        val modulus = sequence.readPositiveInteger()
++        val exponent = sequence.readPositiveInteger()
++        require(sequence.exhausted() && outer.exhausted()) { "Trailing data in RSA public key" }
++        return KeyFactory.getInstance("RSA").generatePublic(RSAPublicKeySpec(modulus, exponent)) as RSAPublicKey
++    }
++
++    private fun pkcs1PublicKey(publicKey: RSAPublicKey): ByteArray = sequence(
++        integer(publicKey.modulus),
++        integer(publicKey.publicExponent),
++    )
++
++    private fun distinguishedName(commonName: String?): ByteArray =
++        if (commonName == null) sequence() else sequence(set(sequence(objectIdentifier("2.5.4.3"), utf8String(commonName))))
++
++    private fun pem(label: String, der: ByteArray): ByteArray {
++        val encoded = Base64.getMimeEncoder(64, byteArrayOf('\n'.code.toByte())).encodeToString(der)
++        return "-----BEGIN $label-----\n$encoded\n-----END $label-----\n".toByteArray(StandardCharsets.US_ASCII)
++    }
++
++    private fun algorithmIdentifier(oid: String): ByteArray = sequence(objectIdentifier(oid), der(0x05, ByteArray(0)))
++    private fun sequence(vararg values: ByteArray): ByteArray = der(0x30, concatenate(*values))
++    private fun set(vararg values: ByteArray): ByteArray = der(0x31, concatenate(*values))
++    private fun explicit(number: Int, value: ByteArray): ByteArray = der(0xa0 + number, value)
++    private fun utf8String(value: String): ByteArray = der(0x0c, value.toByteArray(StandardCharsets.UTF_8))
++
++    private fun certificateTime(valueMillis: Long): ByteArray {
++        val utc = TimeZone.getTimeZone("UTC")
++        val year = SimpleDateFormat("yyyy", Locale.US).apply { timeZone = utc }
++            .format(Date(valueMillis)).toInt()
++        val utcTime = year <= UTC_TIME_LAST_YEAR
++        val formatter = SimpleDateFormat(
++            if (utcTime) "yyMMddHHmmss'Z'" else "yyyyMMddHHmmss'Z'",
++            Locale.US,
++        ).apply { timeZone = utc }
++        return der(if (utcTime) 0x17 else 0x18, formatter.format(Date(valueMillis)).toByteArray(StandardCharsets.US_ASCII))
++    }
++
++    private fun integer(value: BigInteger): ByteArray {
++        require(value.signum() >= 0) { "DER integer must be non-negative" }
++        return der(0x02, value.toByteArray())
++    }
++
++    private fun boolean(value: Boolean): ByteArray = der(0x01, byteArrayOf(if (value) 0xff.toByte() else 0))
++    private fun octetString(value: ByteArray): ByteArray = der(0x04, value)
++    private fun bitString(value: ByteArray, unusedBits: Int = 0): ByteArray {
++        require(unusedBits in 0..7) { "Invalid number of unused bits" }
++        return der(0x03, byteArrayOf(unusedBits.toByte()) + value)
++    }
++
++    private fun objectIdentifier(value: String): ByteArray {
++        val arcs = value.split('.').map(String::toLong)
++        require(arcs.size >= 2 && arcs[0] in 0..2 && arcs[1] >= 0 && (arcs[0] == 2L || arcs[1] < 40)) {
++            "Invalid object identifier"
++        }
++        val output = ByteArrayOutputStream()
++        writeBase128(output, arcs[0] * 40 + arcs[1])
++        arcs.drop(2).forEach { arc -> require(arc >= 0) { "Invalid object identifier" }; writeBase128(output, arc) }
++        return der(0x06, output.toByteArray())
++    }
++
++    private fun writeBase128(output: ByteArrayOutputStream, value: Long) {
++        var remaining = value
++        val bytes = ByteArray(10)
++        var offset = bytes.size
++        bytes[--offset] = (remaining and 0x7f).toByte()
++        remaining = remaining ushr 7
++        while (remaining != 0L) {
++            bytes[--offset] = ((remaining and 0x7f) or 0x80).toByte()
++            remaining = remaining ushr 7
++        }
++        output.write(bytes, offset, bytes.size - offset)
++    }
++
++    private fun der(tag: Int, content: ByteArray): ByteArray {
++        val output = ByteArrayOutputStream(1 + 5 + content.size)
++        output.write(tag)
++        if (content.size < 0x80) output.write(content.size) else {
++            var length = content.size
++            val bytes = ByteArray(4)
++            var offset = bytes.size
++            while (length != 0) { bytes[--offset] = length.toByte(); length = length ushr 8 }
++            output.write(0x80 or (bytes.size - offset))
++            output.write(bytes, offset, bytes.size - offset)
++        }
++        output.write(content)
++        return output.toByteArray()
++    }
++
++    private fun concatenate(vararg values: ByteArray): ByteArray {
++        val output = ByteArrayOutputStream(values.sumOf(ByteArray::size))
++        values.forEach(output::write)
++        return output.toByteArray()
++    }
++
++    private class DerReader(private val bytes: ByteArray) {
++        private var offset = 0
++
++        fun readConstructed(expectedTag: Int): DerReader = DerReader(readValue(expectedTag))
++
++        fun readPositiveInteger(): BigInteger {
++            val value = readValue(0x02)
++            require(value.isNotEmpty() && (value[0].toInt() and 0x80) == 0) { "Invalid positive DER integer" }
++            require(value.size == 1 || value[0].toInt() != 0 || (value[1].toInt() and 0x80) != 0) {
++                "Non-minimal positive DER integer"
++            }
++            return BigInteger(value)
++        }
++
++        fun exhausted(): Boolean = offset == bytes.size
++
++        private fun readValue(expectedTag: Int): ByteArray {
++            require(offset < bytes.size && bytes[offset++].toInt() and 0xff == expectedTag) { "Unexpected DER tag" }
++            require(offset < bytes.size) { "Missing DER length" }
++            val first = bytes[offset++].toInt() and 0xff
++            val length = if (first < 0x80) first else {
++                val count = first and 0x7f
++                require(count in 1..4 && offset + count <= bytes.size) { "Invalid DER length" }
++                require(bytes[offset].toInt() != 0) { "Non-minimal DER length" }
++                var result = 0
++                repeat(count) { result = (result shl 8) or (bytes[offset++].toInt() and 0xff) }
++                val minimumCount = (Integer.SIZE - Integer.numberOfLeadingZeros(result) + 7) / 8
++                require(result >= 0x80 && count == minimumCount) { "Non-minimal DER length" }
++                result
++            }
++            require(length >= 0 && offset + length <= bytes.size) { "DER value is truncated" }
++            return bytes.copyOfRange(offset, offset + length).also { offset += length }
++        }
++    }
++}
+--- /dev/null
++++ b/protocol/src/main/java/com/shilapi/xcertplay/transport/LockdownPlistChannel.kt
+@@ -0,0 +1,332 @@
++package com.shilapi.xcertplay.transport
++
++import org.kxml2.io.KXmlParser
++import java.io.Closeable
++import java.io.StringReader
++import java.nio.charset.StandardCharsets
++import java.util.Base64
++import org.xmlpull.v1.XmlPullParser
++
++/** The small plist value set needed by Lockdown messages. */
++sealed class LockdownPlistValue {
++    data class Dictionary(val entries: Map<String, LockdownPlistValue>) : LockdownPlistValue()
++    data class Text(val value: String) : LockdownPlistValue()
++    data class Integer(val value: Long) : LockdownPlistValue()
++    data class Boolean(val value: kotlin.Boolean) : LockdownPlistValue()
++
++    class Data(bytes: ByteArray) : LockdownPlistValue() {
++        private val value = bytes.copyOf()
++
++        val bytes: ByteArray
++            get() = value.copyOf()
++    }
++}
++
++/**
++ * Blocking Lockdown plist framing over one already-connected USBMUX TCP byte stream.
++ *
++ * A frame is a four-byte big-endian XML plist byte length followed by UTF-8 XML. This class does
++ * not pair, start a session or service, negotiate TLS, or establish any CarPlay/carkit session.
++ * Calls may block and must run away from Android's main thread.
++ */
++class LockdownPlistChannel(
++    private val connection: BlockingDuplexByteStream,
++    private val maximumMessageBytes: Int = DEFAULT_MAXIMUM_MESSAGE_BYTES,
++    private val defaultTimeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS,
++) : Closeable {
++    private val stateLock = Any()
++    private val ioLock = Any()
++    private var closed = false
++    private var detached = false
++
++    init {
++        require(maximumMessageBytes in 1..ABSOLUTE_MAXIMUM_MESSAGE_BYTES) {
++            "maximumMessageBytes must be between 1 and $ABSOLUTE_MAXIMUM_MESSAGE_BYTES"
++        }
++        require(defaultTimeoutMillis in 1..MAXIMUM_TIMEOUT_MILLIS) {
++            "defaultTimeoutMillis must be between 1 and $MAXIMUM_TIMEOUT_MILLIS"
++        }
++    }
++
++    /** Sends one root dictionary as a length-prefixed XML plist. */
++    fun send(message: LockdownPlistValue.Dictionary) = synchronized(ioLock) {
++        checkOpen()
++        sendLocked(message)
++    }
++
++    /** Receives one root dictionary, consuming exactly one framed XML plist. */
++    fun receive(timeoutMillis: Long = defaultTimeoutMillis): LockdownPlistValue.Dictionary = synchronized(ioLock) {
++        checkOpen()
++        receiveLocked(timeoutMillis)
++    }
++
++    /** Sends [message] and receives its corresponding response without interleaving another request. */
++    fun request(
++        message: LockdownPlistValue.Dictionary,
++        timeoutMillis: Long = defaultTimeoutMillis,
++    ): LockdownPlistValue.Dictionary = synchronized(ioLock) {
++        validateTimeout(timeoutMillis)
++        checkOpen()
++        sendLocked(message)
++        receiveLocked(timeoutMillis)
++    }
++
++    /**
++     * Permanently closes this channel without closing its stream and transfers stream ownership.
++     *
++     * Detach is serialized after any active request and may succeed exactly once. Later channel
++     * operations fail as closed; later [close] calls are no-ops for the detached stream.
++     */
++    fun detach(): BlockingDuplexByteStream = synchronized(ioLock) {
++        synchronized(stateLock) {
++            if (closed) {
++                val state = if (detached) "already detached" else "closed"
++                throw IphoneUsbException.DeviceUnavailable("Lockdown plist channel is $state")
++            }
++            detached = true
++            closed = true
++            connection
++        }
++    }
++
++    override fun close() {
++        val shouldClose = synchronized(stateLock) {
++            if (closed) false else {
++                closed = true
++                true
++            }
++        }
++        if (shouldClose && !detached) connection.close()
++    }
++
++    private fun sendLocked(message: LockdownPlistValue.Dictionary) {
++        val xml = encode(message).toByteArray(StandardCharsets.UTF_8)
++        if (xml.isEmpty() || xml.size > maximumMessageBytes) {
++            throw IphoneUsbException.Protocol("Lockdown plist message length ${xml.size} is outside 1..$maximumMessageBytes")
++        }
++        val frame = ByteArray(LENGTH_BYTES + xml.size)
++        putU32(frame, 0, xml.size.toLong())
++        xml.copyInto(frame, LENGTH_BYTES)
++        connection.send(frame)
++    }
++
++    private fun receiveLocked(timeoutMillis: Long): LockdownPlistValue.Dictionary {
++        validateTimeout(timeoutMillis)
++        val deadlineNanos = System.nanoTime() + timeoutMillis * NANOS_PER_MILLISECOND
++        val header = readFully(LENGTH_BYTES, deadlineNanos)
++        val length = readU32(header, 0)
++        if (length !in 1..maximumMessageBytes.toLong()) {
++            throw IphoneUsbException.Protocol("Invalid Lockdown plist message length $length (maximum $maximumMessageBytes)")
++        }
++        val xml = readFully(length.toInt(), deadlineNanos)
++        return parse(xml)
++    }
++
++    private fun readFully(byteCount: Int, deadlineNanos: Long): ByteArray {
++        val result = ByteArray(byteCount)
++        var offset = 0
++        while (offset < result.size) {
++            val remainingNanos = deadlineNanos - System.nanoTime()
++            if (remainingNanos <= 0) {
++                throw IphoneUsbException.TimedOut("Timed out while reading Lockdown plist frame")
++            }
++            val timeoutMillis = maxOf(1L, (remainingNanos + NANOS_PER_MILLISECOND - 1) / NANOS_PER_MILLISECOND)
++            val chunk = connection.recv(result.size - offset, timeoutMillis)
++                ?: throw IphoneUsbException.TimedOut("Timed out while reading Lockdown plist frame")
++            if (chunk.isEmpty()) {
++                throw IphoneUsbException.Protocol("USBMUX TCP stream ended inside a Lockdown plist frame")
++            }
++            chunk.copyInto(result, offset)
++            offset += chunk.size
++        }
++        return result
++    }
++
++    private fun parse(xml: ByteArray): LockdownPlistValue.Dictionary {
++        try {
++            val parser = KXmlParser().apply {
++                // KXmlParser never processes the DOCTYPE and rejects setting the feature at all.
++                runCatching { setFeature(XmlPullParser.FEATURE_PROCESS_DOCDECL, false) }
++                setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, false)
++                setInput(StringReader(xml.toString(StandardCharsets.UTF_8)))
++            }
++            if (parser.nextTag() != XmlPullParser.START_TAG || parser.name != "plist") {
++                throw IphoneUsbException.Protocol("Lockdown plist root must be <plist>")
++            }
++            if (parser.nextTag() != XmlPullParser.START_TAG) {
++                throw IphoneUsbException.Protocol("Lockdown plist must contain exactly one root value")
++            }
++            val value = parseValue(parser, 0)
++            if (parser.nextTag() != XmlPullParser.END_TAG || parser.name != "plist") {
++                throw IphoneUsbException.Protocol("Lockdown plist must contain exactly one root value")
++            }
++            while (true) {
++                when (parser.nextToken()) {
++                    XmlPullParser.END_DOCUMENT -> break
++                    XmlPullParser.TEXT, XmlPullParser.IGNORABLE_WHITESPACE -> {
++                        if (!parser.text.orEmpty().isBlank()) {
++                            throw IphoneUsbException.Protocol("Unexpected content after Lockdown plist")
++                        }
++                    }
++                    else -> throw IphoneUsbException.Protocol("Unexpected content after Lockdown plist")
++                }
++            }
++            return value as? LockdownPlistValue.Dictionary
++                ?: throw IphoneUsbException.Protocol("Lockdown plist root value must be <dict>")
++        } catch (error: IphoneUsbException) {
++            throw error
++        } catch (error: Exception) {
++            throw IphoneUsbException.Protocol("Invalid Lockdown plist XML: ${error.message ?: error.javaClass.simpleName}")
++        }
++    }
++
++    private fun parseValue(parser: XmlPullParser, depth: Int): LockdownPlistValue {
++        if (depth > MAXIMUM_NESTING) throw IphoneUsbException.Protocol("Lockdown plist nesting exceeds $MAXIMUM_NESTING")
++        return when (parser.name) {
++            "dict" -> {
++                val entries = LinkedHashMap<String, LockdownPlistValue>()
++                while (parser.nextTag() == XmlPullParser.START_TAG) {
++                    if (parser.name != "key" || entries.size == MAXIMUM_DICTIONARY_ENTRIES) {
++                        throw IphoneUsbException.Protocol("Invalid Lockdown plist dictionary")
++                    }
++                    val keyText = simpleText(parser, "key")
++                    if (entries.containsKey(keyText)) throw IphoneUsbException.Protocol("Duplicate Lockdown plist key '$keyText'")
++                    if (parser.nextTag() != XmlPullParser.START_TAG) {
++                        throw IphoneUsbException.Protocol("Lockdown plist dictionary value is missing")
++                    }
++                    entries[keyText] = parseValue(parser, depth + 1)
++                }
++                if (parser.name != "dict") throw IphoneUsbException.Protocol("Invalid Lockdown plist dictionary")
++                LockdownPlistValue.Dictionary(entries)
++            }
++            "string" -> LockdownPlistValue.Text(simpleText(parser, "string"))
++            "integer" -> LockdownPlistValue.Integer(
++                simpleText(parser, "integer").trim().toLongOrNull()
++                    ?: throw IphoneUsbException.Protocol("Invalid Lockdown plist integer"),
++            )
++            "true" -> {
++                requireEmpty(parser, "true")
++                LockdownPlistValue.Boolean(true)
++            }
++            "false" -> {
++                requireEmpty(parser, "false")
++                LockdownPlistValue.Boolean(false)
++            }
++            "data" -> {
++                val encoded = simpleText(parser, "data").filterNot(Char::isWhitespace)
++                try {
++                    LockdownPlistValue.Data(Base64.getDecoder().decode(encoded))
++                } catch (error: IllegalArgumentException) {
++                    throw IphoneUsbException.Protocol("Invalid base64 Lockdown plist data")
++                }
++            }
++            else -> throw IphoneUsbException.Protocol("Unsupported Lockdown plist value <${parser.name}>")
++        }
++    }
++
++    private fun encode(message: LockdownPlistValue.Dictionary): String = buildString {
++        append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
++        append("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">")
++        append("<plist version=\"1.0\">")
++        appendValue(message, 0)
++        append("</plist>")
++    }
++
++    private fun StringBuilder.appendValue(value: LockdownPlistValue, depth: Int) {
++        if (depth > MAXIMUM_NESTING) throw IphoneUsbException.Protocol("Lockdown plist nesting exceeds $MAXIMUM_NESTING")
++        when (value) {
++            is LockdownPlistValue.Dictionary -> {
++                if (value.entries.size > MAXIMUM_DICTIONARY_ENTRIES) {
++                    throw IphoneUsbException.Protocol("Lockdown plist dictionary exceeds $MAXIMUM_DICTIONARY_ENTRIES entries")
++                }
++                append("<dict>")
++                value.entries.forEach { (key, entryValue) ->
++                    append("<key>").appendEscaped(key).append("</key>")
++                    appendValue(entryValue, depth + 1)
++                }
++                append("</dict>")
++            }
++            is LockdownPlistValue.Text -> append("<string>").appendEscaped(value.value).append("</string>")
++            is LockdownPlistValue.Integer -> append("<integer>").append(value.value).append("</integer>")
++            is LockdownPlistValue.Boolean -> append(if (value.value) "<true/>" else "<false/>")
++            is LockdownPlistValue.Data -> append("<data>")
++                .append(Base64.getEncoder().encodeToString(value.bytes))
++                .append("</data>")
++        }
++    }
++
++    private fun StringBuilder.appendEscaped(value: String): StringBuilder = apply {
++        value.forEach { character ->
++            append(
++                when (character) {
++                    '&' -> "&amp;"
++                    '<' -> "&lt;"
++                    '>' -> "&gt;"
++                    '\"' -> "&quot;"
++                    '\'' -> "&apos;"
++                    else -> character.toString()
++                },
++            )
++        }
++    }
++
++    private fun simpleText(parser: XmlPullParser, name: String): String {
++        val text = StringBuilder()
++        while (true) {
++            when (parser.nextToken()) {
++                XmlPullParser.TEXT, XmlPullParser.CDSECT -> text.append(parser.text.orEmpty())
++                XmlPullParser.ENTITY_REF -> text.append(
++                    parser.text ?: throw IphoneUsbException.Protocol("Unknown entity in Lockdown plist <$name>"),
++                )
++                XmlPullParser.END_TAG -> {
++                    if (parser.name != name) throw IphoneUsbException.Protocol("Invalid Lockdown plist <$name>")
++                    return text.toString()
++                }
++                XmlPullParser.START_TAG -> throw IphoneUsbException.Protocol("Lockdown plist <$name> must not contain elements")
++                XmlPullParser.END_DOCUMENT -> throw IphoneUsbException.Protocol("Lockdown plist ended inside <$name>")
++            }
++        }
++    }
++
++    private fun requireEmpty(parser: XmlPullParser, name: String) {
++        if (parser.nextTag() != XmlPullParser.END_TAG || parser.name != name) {
++            throw IphoneUsbException.Protocol("Lockdown plist <$name> must be empty")
++        }
++    }
++
++    private fun checkOpen() {
++        synchronized(stateLock) {
++            if (closed) throw IphoneUsbException.DeviceUnavailable("Lockdown plist channel is closed")
++        }
++    }
++
++    private fun validateTimeout(timeoutMillis: Long) {
++        require(timeoutMillis in 1..MAXIMUM_TIMEOUT_MILLIS) {
++            "timeoutMillis must be between 1 and $MAXIMUM_TIMEOUT_MILLIS"
++        }
++    }
++
++    private companion object {
++        const val LENGTH_BYTES = 4
++        const val DEFAULT_MAXIMUM_MESSAGE_BYTES = 1 * 1024 * 1024
++        const val ABSOLUTE_MAXIMUM_MESSAGE_BYTES = 4 * 1024 * 1024
++        const val DEFAULT_TIMEOUT_MILLIS = 5_000L
++        const val MAXIMUM_TIMEOUT_MILLIS = 5 * 60_000L
++        const val MAXIMUM_NESTING = 64
++        const val MAXIMUM_DICTIONARY_ENTRIES = 1_024
++        const val NANOS_PER_MILLISECOND = 1_000_000L
++
++        fun putU32(target: ByteArray, offset: Int, value: Long) {
++            target[offset] = (value ushr 24).toByte()
++            target[offset + 1] = (value ushr 16).toByte()
++            target[offset + 2] = (value ushr 8).toByte()
++            target[offset + 3] = value.toByte()
++        }
++
++        fun readU32(source: ByteArray, offset: Int): Long =
++            ((source[offset].toLong() and 0xff) shl 24) or
++                ((source[offset + 1].toLong() and 0xff) shl 16) or
++                ((source[offset + 2].toLong() and 0xff) shl 8) or
++                (source[offset + 3].toLong() and 0xff)
++    }
++}
+--- /dev/null
++++ b/protocol/src/main/java/com/shilapi/xcertplay/transport/LockdownTlsEngineFactory.kt
+@@ -0,0 +1,102 @@
++package com.shilapi.xcertplay.transport
++
++import java.io.ByteArrayInputStream
++import java.nio.charset.StandardCharsets
++import java.security.GeneralSecurityException
++import java.security.KeyFactory
++import java.security.KeyStore
++import java.security.cert.CertificateFactory
++import java.security.cert.X509Certificate
++import java.security.spec.PKCS8EncodedKeySpec
++import java.util.Base64
++import javax.net.ssl.KeyManagerFactory
++import javax.net.ssl.SSLContext
++import javax.net.ssl.SSLEngine
++import javax.net.ssl.X509TrustManager
++
++/**
++ * Builds an unstarted client TLS engine for the dedicated USB Lockdown channel.
++ *
++ * Matching the locked transport behavior, the engine does not authenticate the peer certificate.
++ * It must not be reused for internet or general-purpose TLS connections.
++ */
++object LockdownTlsEngineFactory {
++    @Throws(GeneralSecurityException::class)
++    fun create(pairRecord: LockdownPairRecord): SSLEngine {
++        val password = charArrayOf('l', 'o', 'c', 'k', 'd', 'o', 'w', 'n')
++        // Lockdown presents the root identity from the pair record for both the session and
++        // service TLS channels. HostCertificate is part of pairing, not this TLS identity.
++        val privateKeyPem = pairRecord.rootPrivateKeyPem
++        val certificatePem = pairRecord.rootCertificatePem
++        var privateKeyDer: ByteArray? = null
++        try {
++            privateKeyDer = decodePkcs8Pem(privateKeyPem)
++            val privateKey = KeyFactory.getInstance("RSA")
++                .generatePrivate(PKCS8EncodedKeySpec(privateKeyDer))
++            val certificate = CertificateFactory.getInstance("X.509")
++                .generateCertificate(ByteArrayInputStream(certificatePem)) as X509Certificate
++            val keyStore = KeyStore.getInstance(KeyStore.getDefaultType()).apply {
++                load(null, password)
++                setKeyEntry(KEY_ALIAS, privateKey, password, arrayOf(certificate))
++            }
++            val keyManagers = KeyManagerFactory.getInstance("PKIX").apply {
++                init(keyStore, password)
++            }.keyManagers
++            val context = SSLContext.getInstance("TLS").apply {
++                init(keyManagers, arrayOf(UsbLockdownTrustManager), null)
++            }
++            return context.createSSLEngine(PEER_HOST, PEER_PORT).apply {
++                useClientMode = true
++                sslParameters = sslParameters.apply { endpointIdentificationAlgorithm = null }
++            }
++        } finally {
++            password.fill('\u0000')
++            privateKeyPem.fill(0)
++            certificatePem.fill(0)
++            privateKeyDer?.fill(0)
++        }
++    }
++
++    private fun decodePkcs8Pem(pem: ByteArray): ByteArray {
++        val begin = pem.indexOf(BEGIN_PRIVATE_KEY)
++        val end = pem.indexOf(END_PRIVATE_KEY, begin + BEGIN_PRIVATE_KEY.size)
++        if (begin < 0 || end < 0) throw GeneralSecurityException("Invalid PKCS#8 private key PEM")
++        val encoded = pem.copyOfRange(begin + BEGIN_PRIVATE_KEY.size, end)
++        return try {
++            Base64.getMimeDecoder().decode(encoded)
++        } catch (error: IllegalArgumentException) {
++            throw GeneralSecurityException("Invalid PKCS#8 private key PEM", error)
++        } finally {
++            encoded.fill(0)
++        }
++    }
++
++    private fun ByteArray.indexOf(needle: ByteArray, startIndex: Int = 0): Int {
++        if (needle.isEmpty()) return startIndex.coerceIn(0, size)
++        for (offset in startIndex.coerceAtLeast(0)..size - needle.size) {
++            var matches = true
++            for (index in needle.indices) {
++                if (this[offset + index] != needle[index]) {
++                    matches = false
++                    break
++                }
++            }
++            if (matches) return offset
++        }
++        return -1
++    }
++
++    private object UsbLockdownTrustManager : X509TrustManager {
++        override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
++
++        override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
++
++        override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
++    }
++
++    private const val KEY_ALIAS = "lockdown-host"
++    private const val PEER_HOST = "Device"
++    private const val PEER_PORT = 0
++    private val BEGIN_PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----".toByteArray(StandardCharsets.US_ASCII)
++    private val END_PRIVATE_KEY = "-----END PRIVATE KEY-----".toByteArray(StandardCharsets.US_ASCII)
++}
+--- /dev/null
++++ b/protocol/src/main/java/com/shilapi/xcertplay/transport/TlsDuplexChannel.kt
+@@ -0,0 +1,437 @@
++package com.shilapi.xcertplay.transport
++
++import java.nio.ByteBuffer
++import java.security.GeneralSecurityException
++import javax.net.ssl.SSLEngine
++import javax.net.ssl.SSLEngineResult
++
++/**
++ * Blocking plaintext stream carried by one client-mode TLS engine and one owned byte stream.
++ *
++ * [open] completes the TLS handshake before returning. Calls must run on worker threads. This
++ * class does not send Lockdown StartSession/StartService messages and does not persist records.
++ */
++class TlsDuplexChannel private constructor(
++    private val underlying: BlockingDuplexByteStream,
++    private val engine: SSLEngine,
++) : BlockingDuplexByteStream {
++    private val stateLock = Any()
++    private val engineLock = Any()
++    private val readLock = Any()
++    private val writeLock = Any()
++    private val encryptedInput = ByteQueue()
++    private val plaintextInput = ByteQueue()
++    private var closed = false
++    private var inboundEnded = false
++    private var failure: IphoneUsbException? = null
++
++    override fun send(data: ByteArray) = synchronized(writeLock) {
++        checkWritable()
++        if (data.isEmpty()) return@synchronized
++        try {
++            val source = ByteBuffer.wrap(data)
++            while (source.hasRemaining()) {
++                val outcome = wrap(source)
++                sendEncrypted(outcome.bytes)
++                if (outcome.result.status == SSLEngineResult.Status.CLOSED) {
++                    throw IphoneUsbException.Protocol("TLS outbound stream closed during send")
++                }
++                if (progressPostHandshake(outcome.result.handshakeStatus)) {
++                    throw IphoneUsbException.Protocol("TLS send requires inbound post-handshake processing")
++                }
++                if (outcome.result.bytesConsumed() == 0 && outcome.bytes.isEmpty()) {
++                    throw IphoneUsbException.Protocol("TLS send made no progress")
++                }
++            }
++        } catch (error: Exception) {
++            throw fail(error)
++        }
++    }
++
++    override fun recv(maxBytes: Int, timeoutMillis: Long): ByteArray? = synchronized(readLock) {
++        require(maxBytes > 0) { "maxBytes must be positive" }
++        require(timeoutMillis > 0) { "timeoutMillis must be positive" }
++        try {
++            receiveLocked(maxBytes, Deadline(timeoutMillis))
++        } catch (error: Exception) {
++            throw fail(error)
++        }
++    }
++
++    override fun close() {
++        val shouldClose = synchronized(stateLock) {
++            if (closed) false else {
++                closed = true
++                true
++            }
++        }
++        if (!shouldClose) return
++        try {
++            synchronized(writeLock) {
++                synchronized(engineLock) {
++                    if (!engine.isOutboundDone) engine.closeOutbound()
++                }
++                var steps = 0
++                while (steps++ < MAXIMUM_CLOSE_WRAP_STEPS &&
++                    !synchronized(engineLock) { engine.isOutboundDone }
++                ) {
++                    val outcome = wrap(ByteBuffer.allocate(0))
++                    sendEncrypted(outcome.bytes)
++                    var status = outcome.result.handshakeStatus
++                    if (status == SSLEngineResult.HandshakeStatus.NEED_TASK) {
++                        status = runDelegatedTasks()
++                    }
++                    if (outcome.result.status == SSLEngineResult.Status.CLOSED ||
++                        status != SSLEngineResult.HandshakeStatus.NEED_WRAP
++                    ) {
++                        break
++                    }
++                }
++            }
++        } catch (_: Exception) {
++            // close_notify is best effort; closing the owned transport is the final boundary.
++        } finally {
++            try {
++                underlying.close()
++            } catch (_: Exception) {
++                // The local state remains closed.
++            }
++        }
++    }
++
++    private fun performHandshake(timeoutMillis: Long) {
++        val deadline = Deadline(timeoutMillis)
++        var status = synchronized(engineLock) {
++            engine.beginHandshake()
++            engine.handshakeStatus
++        }
++        var noProgress = 0
++        while (!isHandshakeComplete(status)) {
++            deadline.requireRemainingMillis()
++            when {
++                status == SSLEngineResult.HandshakeStatus.NEED_TASK -> {
++                    status = runDelegatedTasks()
++                    noProgress = 0
++                }
++                status == SSLEngineResult.HandshakeStatus.NEED_WRAP -> {
++                    val outcome = synchronized(writeLock) {
++                        wrap(ByteBuffer.allocate(0)).also { sendEncrypted(it.bytes) }
++                    }
++                    if (outcome.result.status == SSLEngineResult.Status.CLOSED) {
++                        throw IphoneUsbException.Protocol("TLS handshake closed while wrapping")
++                    }
++                    status = outcome.result.handshakeStatus
++                    noProgress = checkProgress(outcome, noProgress)
++                }
++                isNeedUnwrap(status) -> {
++                    val outcome = unwrap()
++                    plaintextInput.append(outcome.bytes)
++                    when (outcome.result.status) {
++                        SSLEngineResult.Status.OK -> {
++                            status = outcome.result.handshakeStatus
++                            noProgress = checkProgress(outcome, noProgress)
++                        }
++                        SSLEngineResult.Status.BUFFER_UNDERFLOW -> {
++                            val incoming = underlying.recv(RECEIVE_CHUNK_BYTES, deadline.requireRemainingMillis())
++                                ?: throw IphoneUsbException.TimedOut("TLS handshake timed out")
++                            if (incoming.isEmpty()) {
++                                throw IphoneUsbException.Protocol("TLS transport ended during handshake")
++                            }
++                            encryptedInput.append(incoming)
++                            noProgress = 0
++                        }
++                        SSLEngineResult.Status.CLOSED -> {
++                            throw IphoneUsbException.Protocol("TLS peer closed during handshake")
++                        }
++                        SSLEngineResult.Status.BUFFER_OVERFLOW -> error("unwrap handles overflow internally")
++                    }
++                }
++                else -> throw IphoneUsbException.Protocol("Unsupported TLS handshake state ${status.name}")
++            }
++        }
++        deadline.requireRemainingMillis()
++    }
++
++    private fun receiveLocked(maxBytes: Int, deadline: Deadline): ByteArray? {
++        plaintextInput.take(maxBytes)?.let { return it }
++        synchronized(stateLock) {
++            failure?.let { throw it }
++            if (inboundEnded) return ByteArray(0)
++            if (closed) throw IphoneUsbException.DeviceUnavailable("TLS channel is closed")
++        }
++
++        var noProgress = 0
++        while (true) {
++            if (deadline.remainingMillis() == null) return null
++            val outcome = unwrap()
++            plaintextInput.append(outcome.bytes)
++            when (outcome.result.status) {
++                SSLEngineResult.Status.OK -> {
++                    noProgress = checkProgress(outcome, noProgress)
++                    progressPostHandshake(outcome.result.handshakeStatus)
++                }
++                SSLEngineResult.Status.BUFFER_UNDERFLOW -> {
++                    plaintextInput.take(maxBytes)?.let { return it }
++                    val remaining = deadline.remainingMillis() ?: return null
++                    val incoming = underlying.recv(RECEIVE_CHUNK_BYTES, remaining) ?: return null
++                    if (incoming.isEmpty()) {
++                        if (encryptedInput.size != 0) {
++                            throw IphoneUsbException.Protocol("TLS transport ended inside a record")
++                        }
++                        throw IphoneUsbException.Protocol("TLS transport ended without close_notify")
++                    }
++                    encryptedInput.append(incoming)
++                    noProgress = 0
++                    continue
++                }
++                SSLEngineResult.Status.CLOSED -> {
++                    plaintextInput.take(maxBytes)?.let {
++                        finishInbound()
++                        return it
++                    }
++                    finishInbound()
++                    return ByteArray(0)
++                }
++                SSLEngineResult.Status.BUFFER_OVERFLOW -> error("unwrap handles overflow internally")
++            }
++            plaintextInput.take(maxBytes)?.let { return it }
++        }
++    }
++
++    /** Returns true only when further inbound TLS processing is required. */
++    private fun progressPostHandshake(initialStatus: SSLEngineResult.HandshakeStatus): Boolean {
++        var status = initialStatus
++        var steps = 0
++        while (true) {
++            if (++steps > MAXIMUM_CONTROL_STEPS) {
++                throw IphoneUsbException.Protocol("TLS post-handshake processing did not converge")
++            }
++            when {
++                status == SSLEngineResult.HandshakeStatus.NEED_TASK -> status = runDelegatedTasks()
++                status == SSLEngineResult.HandshakeStatus.NEED_WRAP -> {
++                    val outcome = synchronized(writeLock) {
++                        wrap(ByteBuffer.allocate(0)).also { sendEncrypted(it.bytes) }
++                    }
++                    if (outcome.result.status == SSLEngineResult.Status.CLOSED) {
++                        throw IphoneUsbException.Protocol("TLS outbound stream closed during post-handshake processing")
++                    }
++                    if (outcome.result.bytesConsumed() == 0 && outcome.bytes.isEmpty() &&
++                        outcome.result.handshakeStatus == SSLEngineResult.HandshakeStatus.NEED_WRAP
++                    ) {
++                        throw IphoneUsbException.Protocol("TLS post-handshake wrap made no progress")
++                    }
++                    status = outcome.result.handshakeStatus
++                }
++                isNeedUnwrap(status) -> return true
++                isHandshakeComplete(status) -> return false
++                else -> throw IphoneUsbException.Protocol("Unsupported TLS post-handshake state ${status.name}")
++            }
++        }
++    }
++
++    private fun runDelegatedTasks(): SSLEngineResult.HandshakeStatus = synchronized(engineLock) {
++        while (true) {
++            val task = engine.delegatedTask ?: break
++            task.run()
++        }
++        engine.handshakeStatus
++    }
++
++    private fun wrap(source: ByteBuffer): EngineOutcome {
++        var capacity = synchronized(engineLock) { engine.session.packetBufferSize }.coerceAtLeast(1)
++        while (true) {
++            if (capacity > MAXIMUM_TLS_BUFFER_BYTES) {
++                throw IphoneUsbException.Protocol("TLS packet buffer exceeds the defensive limit")
++            }
++            val output = ByteBuffer.allocate(capacity)
++            val result = synchronized(engineLock) { engine.wrap(source, output) }
++            if (result.status == SSLEngineResult.Status.BUFFER_OVERFLOW) {
++                if (result.bytesConsumed() != 0 || result.bytesProduced() != 0) {
++                    throw IphoneUsbException.Protocol("TLS wrap overflow consumed data")
++                }
++                capacity = grow(capacity)
++                continue
++            }
++            if (result.status == SSLEngineResult.Status.BUFFER_UNDERFLOW) {
++                throw IphoneUsbException.Protocol("TLS wrap reported buffer underflow")
++            }
++            output.flip()
++            return EngineOutcome(result, ByteArray(output.remaining()).also(output::get))
++        }
++    }
++
++    private fun unwrap(): EngineOutcome {
++        var capacity = synchronized(engineLock) { engine.session.applicationBufferSize }.coerceAtLeast(1)
++        while (true) {
++            if (capacity > MAXIMUM_TLS_BUFFER_BYTES) {
++                throw IphoneUsbException.Protocol("TLS application buffer exceeds the defensive limit")
++            }
++            val input = encryptedInput.asByteBuffer()
++            val output = ByteBuffer.allocate(capacity)
++            val result = synchronized(engineLock) { engine.unwrap(input, output) }
++            if (result.status == SSLEngineResult.Status.BUFFER_OVERFLOW) {
++                if (result.bytesConsumed() != 0 || result.bytesProduced() != 0) {
++                    throw IphoneUsbException.Protocol("TLS unwrap overflow consumed data")
++                }
++                capacity = grow(capacity)
++                continue
++            }
++            encryptedInput.discard(result.bytesConsumed())
++            output.flip()
++            return EngineOutcome(result, ByteArray(output.remaining()).also(output::get))
++        }
++    }
++
++    private fun sendEncrypted(bytes: ByteArray) {
++        if (bytes.isNotEmpty()) underlying.send(bytes)
++    }
++
++    private fun finishInbound() {
++        synchronized(stateLock) { inboundEnded = true }
++        close()
++    }
++
++    private fun checkWritable() = synchronized(stateLock) {
++        failure?.let { throw it }
++        if (closed) throw IphoneUsbException.DeviceUnavailable("TLS channel is closed")
++    }
++
++    private fun checkProgress(outcome: EngineOutcome, previous: Int): Int {
++        if (outcome.result.bytesConsumed() != 0 || outcome.bytes.isNotEmpty()) return 0
++        if (previous + 1 >= MAXIMUM_NO_PROGRESS_STEPS) {
++            throw IphoneUsbException.Protocol("TLS engine made no progress")
++        }
++        return previous + 1
++    }
++
++    private fun fail(error: Exception): IphoneUsbException {
++        val mapped = when (error) {
++            is IphoneUsbException -> error
++            else -> IphoneUsbException.Protocol("TLS channel failed (${error.javaClass.simpleName})")
++        }
++        val shouldClose = synchronized(stateLock) {
++            if (failure == null) failure = mapped
++            if (closed) false else {
++                closed = true
++                true
++            }
++        }
++        if (shouldClose) {
++            try {
++                underlying.close()
++            } catch (_: Exception) {
++                // Preserve the original failure.
++            }
++        }
++        return synchronized(stateLock) { failure ?: mapped }
++    }
++
++    private fun grow(capacity: Int): Int {
++        if (capacity >= MAXIMUM_TLS_BUFFER_BYTES) return MAXIMUM_TLS_BUFFER_BYTES + 1
++        return minOf(MAXIMUM_TLS_BUFFER_BYTES, capacity * 2)
++    }
++
++    private data class EngineOutcome(
++        val result: SSLEngineResult,
++        val bytes: ByteArray,
++    )
++
++    private class Deadline(timeoutMillis: Long) {
++        private val startNanos = System.nanoTime()
++        private val timeoutNanos = minOf(timeoutMillis, Long.MAX_VALUE / NANOS_PER_MILLISECOND) *
++            NANOS_PER_MILLISECOND
++
++        fun remainingMillis(): Long? {
++            val remaining = timeoutNanos - (System.nanoTime() - startNanos)
++            if (remaining <= 0) return null
++            return (remaining - 1) / NANOS_PER_MILLISECOND + 1
++        }
++
++        fun requireRemainingMillis(): Long = remainingMillis()
++            ?: throw IphoneUsbException.TimedOut("TLS handshake timed out")
++    }
++
++    private class ByteQueue {
++        private var bytes = ByteArray(0)
++        private var offset = 0
++
++        val size: Int
++            get() = bytes.size - offset
++
++        fun append(value: ByteArray) {
++            if (value.isEmpty()) return
++            if (size > MAXIMUM_TLS_BUFFER_BYTES - value.size) {
++                throw IphoneUsbException.Protocol("TLS buffered data exceeds the defensive limit")
++            }
++            val combined = ByteArray(size + value.size)
++            bytes.copyInto(combined, 0, offset)
++            value.copyInto(combined, size)
++            bytes = combined
++            offset = 0
++        }
++
++        fun asByteBuffer(): ByteBuffer = ByteBuffer.wrap(bytes, offset, size).slice()
++
++        fun discard(count: Int) {
++            require(count in 0..size) { "Invalid TLS queue discard" }
++            offset += count
++            if (offset == bytes.size) {
++                bytes = ByteArray(0)
++                offset = 0
++            }
++        }
++
++        fun take(maxBytes: Int): ByteArray? {
++            if (size == 0) return null
++            val count = minOf(maxBytes, size)
++            return bytes.copyOfRange(offset, offset + count).also { discard(count) }
++        }
++    }
++
++    companion object {
++        private val ALLOWED_PROTOCOLS = arrayOf("TLSv1.3", "TLSv1.2")
++        private const val RECEIVE_CHUNK_BYTES = 16 * 1024
++        private const val MAXIMUM_TLS_BUFFER_BYTES = 1024 * 1024
++        private const val MAXIMUM_CONTROL_STEPS = 32
++        private const val MAXIMUM_NO_PROGRESS_STEPS = 8
++        private const val MAXIMUM_CLOSE_WRAP_STEPS = 4
++        private const val NANOS_PER_MILLISECOND = 1_000_000L
++
++        /** Creates and fully handshakes a TLS client stream, taking ownership of [underlying]. */
++        @JvmStatic
++        @Throws(IphoneUsbException::class, GeneralSecurityException::class)
++        fun open(
++            underlying: BlockingDuplexByteStream,
++            pairRecord: LockdownPairRecord,
++            handshakeTimeoutMillis: Long = 5_000,
++        ): TlsDuplexChannel {
++            require(handshakeTimeoutMillis > 0) { "handshakeTimeoutMillis must be positive" }
++            try {
++                val engine = LockdownTlsEngineFactory.create(pairRecord)
++                val supported = engine.supportedProtocols.toSet()
++                val enabled = ALLOWED_PROTOCOLS.filter(supported::contains).toTypedArray()
++                if (enabled.isEmpty()) {
++                    throw IphoneUsbException.Protocol("TLS engine supports neither TLSv1.2 nor TLSv1.3")
++                }
++                engine.enabledProtocols = enabled
++                return TlsDuplexChannel(underlying, engine).also {
++                    it.performHandshake(handshakeTimeoutMillis)
++                }
++            } catch (error: Exception) {
++                try {
++                    underlying.close()
++                } catch (_: Exception) {
++                    // Preserve the handshake failure.
++                }
++                throw error
++            }
++        }
++
++        private fun isHandshakeComplete(status: SSLEngineResult.HandshakeStatus): Boolean =
++            status == SSLEngineResult.HandshakeStatus.FINISHED ||
++                status == SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING
++
++        private fun isNeedUnwrap(status: SSLEngineResult.HandshakeStatus): Boolean =
++            status == SSLEngineResult.HandshakeStatus.NEED_UNWRAP || status.name == "NEED_UNWRAP_AGAIN"
++    }
++}
+--- /dev/null
++++ b/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2WiredControlClient.kt
+@@ -0,0 +1,267 @@
++package com.shilapi.xcertplay.transport
++
++import com.shilapi.xcertplay.iap2.message.Iap2CarPlayMessages
++import com.shilapi.xcertplay.iap2.message.Iap2ControlMessages
++import com.shilapi.xcertplay.iap2.session.Iap2Session
++import com.shilapi.xcertplay.iap2.wire.Iap2Frame
++import com.shilapi.xcertplay.mfi.Iap2MfiAuthenticationClient
++import java.net.Inet6Address
++import java.net.InetAddress
++import kotlin.math.min
++
++/**
++ * The wired LIVI control sequence after a CSM channel is ready:
++ * Identification, MFi, power announcement, five update subscriptions, then CarPlay availability.
++ *
++ * The caller retains ownership of [session]. While [run] is active it is the only receiver and
++ * forwards each non-availability CSM frame to [onIncoming]; it neither opens NCM nor implements
++ * an AirPlay receiver.
++ */
++class Iap2WiredControlClient(
++    private val session: Iap2Session,
++    private val mfi: Iap2MfiAuthenticationClient,
++) {
++    fun run(
++        identification: Iap2IdentificationConfig,
++        endpoint: Iap2WiredCarPlayEndpoint,
++        availableCurrentMilliAmps: Int,
++        timeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS,
++        locationProvider: Iap2LocationProvider? = null,
++        onIncoming: (Iap2Frame) -> Unit = {},
++        onReady: () -> Unit = {},
++        onProgress: (String) -> Unit = {},
++    ): Iap2WiredControlResult {
++        require(availableCurrentMilliAmps in 0..0xffff) {
++            "availableCurrentMilliAmps must be in 0..65535"
++        }
++        require(timeoutMillis == NO_TIMEOUT_MILLIS || timeoutMillis in 1..MAX_TIMEOUT_MILLIS) {
++            "timeoutMillis must be in 1..$MAX_TIMEOUT_MILLIS or NO_TIMEOUT_MILLIS"
++        }
++
++        val deadlineNanos = Iap2ControlDeadline(timeoutMillis)
++        Iap2IdentificationClient(session).identify(identification, requireRemaining(deadlineNanos))
++        onProgress("iap2 identification accepted")
++        var stage = Iap2WiredControlStage.IDENTIFIED
++        mfi.run(session, requireRemaining(deadlineNanos), onProgress)
++        stage = Iap2WiredControlStage.AUTHENTICATED
++        onProgress("iap2 authentication accepted")
++        deadlineNanos.authenticated()
++
++        send(powerSourceUpdate(availableCurrentMilliAmps), deadlineNanos)
++        for (subscription in subscriptions()) send(subscription, deadlineNanos)
++        stage = Iap2WiredControlStage.SUBSCRIBED
++        onProgress("iap2 power/subscriptions sent")
++        onReady()
++
++        var forwardedFrames = 0
++        var carPlayStartSessions = 0
++        var locationActive = false
++        var locationSentLogged = false
++        try {
++            while (true) {
++                val remaining = remainingMillis(deadlineNanos)
++                if (remaining == 0L) {
++                    return Iap2WiredControlResult(Iap2WiredControlTerminal.TIMED_OUT, stage, forwardedFrames, carPlayStartSessions)
++                }
++                if (locationActive && sendLatestLocation(locationProvider, deadlineNanos) && !locationSentLogged) {
++                    locationSentLogged = true
++                    onProgress("iap2 tx=0xfffb location-information")
++                }
++                val pollTimeout = if (locationActive) {
++                    min(remaining, LOCATION_POLL_INTERVAL_MILLIS)
++                } else {
++                    remaining
++                }
++                val incoming = session.recv(pollTimeout)
++                if (incoming == null) {
++                    if (session.isClosed) {
++                        return Iap2WiredControlResult(
++                            Iap2WiredControlTerminal.CHANNEL_CLOSED,
++                            stage,
++                            forwardedFrames,
++                            carPlayStartSessions,
++                        )
++                    }
++                    if (remainingMillis(deadlineNanos) == 0L) {
++                        return Iap2WiredControlResult(
++                            Iap2WiredControlTerminal.TIMED_OUT,
++                            stage,
++                            forwardedFrames,
++                            carPlayStartSessions,
++                        )
++                    }
++                    continue
++                }
++
++                when (incoming.messageId) {
++                    CARPLAY_AVAILABILITY -> {
++                        onProgress("iap2 rx=0x4300 carplay-availability")
++                        onProgress(carPlayAvailabilitySummary(incoming.payload))
++                        // LIVI sends its wired answer on every availability notification; do not gate it on
++                        // the phone's advertised availability boolean.
++                        send(carPlayStartSession(endpoint), deadlineNanos)
++                        stage = Iap2WiredControlStage.CARPLAY_START_SENT
++                        carPlayStartSessions++
++                        onProgress("iap2 tx=0x4301 carplay-start-session")
++                    }
++
++                    Iap2LocationMessages.START_LOCATION_INFORMATION -> {
++                        onProgress("iap2 rx=0xfffa start-location-information")
++                        locationActive = startLocationUpdates(locationProvider, onProgress)
++                        locationSentLogged = false
++                        if (locationActive && sendLatestLocation(locationProvider, deadlineNanos)) {
++                            locationSentLogged = true
++                            onProgress("iap2 tx=0xfffb location-information")
++                        }
++                    }
++
++                    Iap2LocationMessages.STOP_LOCATION_INFORMATION -> {
++                        onProgress("iap2 rx=0xfffc stop-location-information")
++                        locationActive = false
++                        locationSentLogged = false
++                        locationProvider?.stop()
++                    }
++
++                    else -> {
++                        onProgress("iap2 rx=0x${incoming.messageId.toString(16).padStart(4, '0')}")
++                        onIncoming(incoming)
++                        forwardedFrames++
++                    }
++                }
++            }
++        } finally {
++            locationProvider?.stop()
++        }
++    }
++
++    private fun send(frame: Iap2Frame, deadlineNanos: Iap2ControlDeadline) {
++        session.send(frame, requireRemaining(deadlineNanos))
++    }
++
++    private fun sendLatestLocation(
++        provider: Iap2LocationProvider?,
++        deadlineNanos: Iap2ControlDeadline,
++    ): Boolean {
++        val sentence = provider?.latestNmea() ?: return false
++        session.send(
++            Iap2LocationMessages.locationInformation(sentence),
++            requireRemaining(deadlineNanos),
++        )
++        return true
++    }
++
++    private fun startLocationUpdates(
++        provider: Iap2LocationProvider?,
++        onProgress: (String) -> Unit,
++    ): Boolean {
++        if (provider == null) return false
++        return try {
++            provider.start().also { started ->
++                if (!started) onProgress("iap2 location provider did not start")
++            }
++        } catch (error: Exception) {
++            onProgress("iap2 location provider start failed: ${error.message}")
++            false
++        }
++    }
++
++    companion object {
++        const val NO_TIMEOUT_MILLIS = Long.MAX_VALUE
++        private const val CARPLAY_AVAILABILITY = 0x4300
++        private const val CARPLAY_START_SESSION = 0x4301
++        private const val LOCATION_POLL_INTERVAL_MILLIS = 1_000L
++        private const val DEFAULT_TIMEOUT_MILLIS = 60_000L
++        private const val MAX_TIMEOUT_MILLIS = 24 * 60 * 60 * 1_000L
++        private const val MAX_RECV_TIMEOUT_MILLIS = 5 * 60 * 1_000L
++        private const val NANOS_PER_MILLISECOND = 1_000_000L
++
++        /** Exact LIVI wired PowerSourceUpdate encoding: current and the charge-if-powered flag. */
++        fun powerSourceUpdate(availableCurrentMilliAmps: Int): Iap2Frame =
++            Iap2ControlMessages.powerSourceUpdate(availableCurrentMilliAmps, charging = true)
++
++        /** Exact five subscription requests emitted by LIVI's wired bring-up. */
++        fun subscriptions(): List<Iap2Frame> = Iap2ControlMessages.subscriptions()
++
++        /** Builds the wired-only CarPlayStartSession message; no NCM or AirPlay socket is opened. */
++        fun carPlayStartSession(endpoint: Iap2WiredCarPlayEndpoint): Iap2Frame =
++            Iap2CarPlayMessages.startSession(
++                wiredIpv6Addresses = endpoint.ipv6Addresses,
++                airPlayPort = endpoint.airPlayPort,
++                deviceIdentifier = endpoint.deviceIdentifier,
++                publicKey = endpoint.publicKey,
++                sourceVersion = endpoint.sourceVersion,
++            )
++
++        fun carPlayAvailabilitySummary(payload: ByteArray): String {
++            return try {
++                val availability = Iap2CarPlayMessages.availability(payload).wired
++                val available = availability?.available
++                val transport = availability?.identifier
++                "iap2 4300 wiredAvailable=$available usbTransport=${transport ?: "none"}"
++            } catch (error: RuntimeException) {
++                "iap2 4300 decode failed: ${error.message}"
++            }
++        }
++
++        private fun requireRemaining(deadlineNanos: Iap2ControlDeadline): Long = remainingMillis(deadlineNanos).also {
++            if (it == 0L) throw IphoneUsbException.TimedOut("Timed out during wired iAP2 control bring-up")
++        }
++
++        private fun remainingMillis(deadlineNanos: Iap2ControlDeadline): Long = deadlineNanos.remainingMillis()
++
++    }
++}
++
++/** A configured wired AirPlay endpoint; configuration does not claim that either service is live. */
++class Iap2WiredCarPlayEndpoint(
++    ipv6Addresses: List<String>,
++    val airPlayPort: Int,
++    val publicKey: String,
++    val sourceVersion: String,
++    val deviceIdentifier: String? = null,
++) {
++    /** A stable copy so a caller cannot mutate a validated endpoint before it is encoded. */
++    val ipv6Addresses: List<String> = ipv6Addresses.toList()
++
++    init {
++        require(ipv6Addresses.isNotEmpty()) { "At least one wired IPv6 address is required" }
++        require(ipv6Addresses.all(::isIpv6Literal)) { "Every wired address must be an IPv6 text literal" }
++        require(airPlayPort in 1..65535) { "airPlayPort must be in 1..65535" }
++        require(publicKey.isNotEmpty()) { "publicKey is required and must not be empty" }
++        require(sourceVersion.isNotEmpty()) { "sourceVersion is required and must not be empty" }
++        require('\u0000' !in publicKey) { "publicKey must not contain U+0000" }
++        require('\u0000' !in sourceVersion) { "sourceVersion must not contain U+0000" }
++        deviceIdentifier?.let {
++            require(it.isNotEmpty()) { "deviceIdentifier is optional, but must not be empty when provided" }
++            require('\u0000' !in it) { "deviceIdentifier must not contain U+0000" }
++        }
++    }
++
++    private companion object {
++        fun isIpv6Literal(value: String): Boolean {
++            if (value.contains('%') || '\u0000' in value || !value.contains(':')) return false
++            return try {
++                InetAddress.getByName(value) is Inet6Address
++            } catch (_: Exception) {
++                false
++            }
++        }
++    }
++}
++
++enum class Iap2WiredControlStage {
++    IDENTIFIED,
++    AUTHENTICATED,
++    SUBSCRIBED,
++    CARPLAY_START_SENT,
++}
++
++enum class Iap2WiredControlTerminal { CHANNEL_CLOSED, TIMED_OUT }
++
++/** End state of the control loop only; it is not evidence of NCM or AirPlay availability. */
++data class Iap2WiredControlResult(
++    val terminal: Iap2WiredControlTerminal,
++    val stage: Iap2WiredControlStage,
++    val forwardedFrames: Int,
++    val carPlayStartSessionsSent: Int,
++)
+--- /dev/null
++++ b/protocol/src/main/java/com/shilapi/xcertplay/transport/Iap2ControlDeadline.kt
+@@ -0,0 +1,24 @@
++package com.shilapi.xcertplay.transport
++
++/** An unlimited drive still has a bounded authentication handshake and bounded I/O polls. */
++internal class Iap2ControlDeadline(
++    private val timeoutMillis: Long,
++    private val clockNanos: () -> Long = System::nanoTime,
++) {
++    private val unlimited = timeoutMillis == Long.MAX_VALUE
++    private val startedNanos = clockNanos()
++    private var authenticated = false
++    fun authenticated() { authenticated = true }
++    fun remainingMillis(): Long {
++        if (unlimited && authenticated) return MAX_POLL_MILLIS
++        val budget = if (unlimited) HANDSHAKE_MILLIS else timeoutMillis
++        val elapsedNanos = (clockNanos() - startedNanos).coerceAtLeast(0)
++        val remainingNanos = budget * 1_000_000 - elapsedNanos
++        if (remainingNanos <= 0) return 0
++        return ((remainingNanos + 999_999) / 1_000_000).coerceAtMost(MAX_POLL_MILLIS)
++    }
++    companion object {
++        const val HANDSHAKE_MILLIS = 60_000L
++        const val MAX_POLL_MILLIS = 30_000L
++    }
++}
+--- /dev/null
++++ b/protocol/src/main/java/com/shilapi/xcertplay/transport/UsbMuxPipe.kt
+@@ -0,0 +1,24 @@
++package com.shilapi.xcertplay.transport
++
++import java.io.Closeable
++import org.slf4j.LoggerFactory
++
++/**
++ * The iPhone's USBMUX bulk pipe in the CarPlay USB configuration (wired CarPlay with the accessory as
++ * USB host). On Android this was a UsbDeviceConnection; on Linux a helper process owns the device
++ * (see UsbBridgePipe in the server). One write is one bulk transfer.
++ */
++interface Iap2UsbSession : Closeable {
++    fun write(data: ByteArray, timeoutMillis: Int)
++
++    /** Returns null only when nothing arrived within [timeoutMillis]. */
++    fun read(timeoutMillis: Long): ByteArray?
++}
++
++/** android.util.Log for the code taken over from the Android app; forwards to SLF4J. */
++internal object Log {
++    fun i(tag: String, message: String) = LoggerFactory.getLogger(tag).info(message)
++    fun w(tag: String, message: String) = LoggerFactory.getLogger(tag).warn(message)
++    fun d(tag: String, message: String) = LoggerFactory.getLogger(tag).debug(message)
++    fun e(tag: String, message: String, error: Throwable? = null) = LoggerFactory.getLogger(tag).error(message, error)
++}
+--- /dev/null
++++ b/server/src/main/kotlin/com/playport/server/WiredBootstrap.kt
+@@ -0,0 +1,395 @@
++package com.playport.server
++
++import com.shilapi.xcertplay.iap2.session.Iap2Session
++import com.shilapi.xcertplay.mfi.Iap2MfiAuthenticationClient
++import com.shilapi.xcertplay.transport.Iap2IdentificationConfig
++import com.shilapi.xcertplay.transport.Iap2UsbMuxHost
++import com.shilapi.xcertplay.transport.Iap2UsbSession
++import com.shilapi.xcertplay.transport.Iap2WiredCarPlayEndpoint
++import com.shilapi.xcertplay.transport.Iap2WiredControlClient
++import com.shilapi.xcertplay.transport.LockdownCarKitClient
++import com.shilapi.xcertplay.transport.LockdownPairRecord
++import com.shilapi.xcertplay.transport.LockdownPairingClient
++import java.io.Closeable
++import java.io.DataInputStream
++import java.io.DataOutputStream
++import java.io.EOFException
++import java.net.Inet6Address
++import java.net.NetworkInterface
++import java.nio.file.Files
++import java.nio.file.Path
++import java.util.Properties
++import java.util.UUID
++import java.util.concurrent.ArrayBlockingQueue
++import java.util.concurrent.TimeUnit
++import org.slf4j.LoggerFactory
++
++/**
++ * Wired CarPlay with the box as USB host (the Android WheelPlay/LIVI sequence): a helper process
++ * (iphone-usb-bridge.py) switches the plugged iPhone to its CarPlay USB configuration and relays the
++ * USBMUX bulk pipe; over it run Lockdown pairing (the iPhone asks "Trust this computer?" once), the
++ * com.apple.carkit.service TLS stream and iAP2 with the USB host transport. The iPhone then opens
++ * AirPlay over the configuration's NCM link, on which [CarPlayServer.listenWired] listens.
++ * The box's Wi-Fi only joins the car hotspot, for the head unit's browser.
++ */
++class WiredBootstrap(private val server: CarPlayServer, private val helper: Path) : Closeable {
++    private val log = LoggerFactory.getLogger("wired")
++    @Volatile private var stopped = false
++    @Volatile private var pipe: UsbBridgePipe? = null
++    @Volatile private var mux: Iap2UsbMuxHost? = null
++    @Volatile private var session: Iap2Session? = null
++    @Volatile private var serial: String? = null   // USB serial (UDID) of the iPhone on the cable
++    private val statusFile = System.getenv("CARPLAY_WIRED_STATUS")?.takeIf { it.isNotBlank() }?.let { Path.of(it) }
++
++    fun start() {
++        Thread({
++            while (!stopped) {
++                try {
++                    runOnce()
++                } catch (error: Exception) {
++                    if (!stopped) log.warn("wired CarPlay ended: {}", error.message ?: error.javaClass.simpleName)
++                } finally {
++                    closeLink()
++                    pipe = null
++                    mux = null
++                    session = null
++                }
++                if (!stopped) Thread.sleep(RETRY_MILLIS)
++            }
++        }, "wired-bootstrap").apply { isDaemon = true; start() }
++    }
++
++    private fun runOnce() {
++        val bridge = UsbBridgePipe.start(helper) { state ->
++            // The helper says "usb waiting" (no iPhone) or "usb iphone <serial>" (one plugged in) first.
++            val parts = state.split(" ")
++            when (parts[0]) {
++                "waiting" -> { server.setCablePhone(false); status("cable") }
++                "iphone" -> { serial = parts.getOrNull(1); server.setCablePhone(true); status("starting") }
++            }
++        }.also { pipe = it }
++        // The helper exits when the iPhone is unplugged, but the iAP2 session blocked in recv never
++        // noticed (2026-10-12: replugging then did nothing). End this run as soon as the helper is gone.
++        bridge.onExit {
++            if (!stopped && pipe === bridge) {
++                log.info("wired: USB helper exited; ending this wired run")
++                closeLink()
++            }
++        }
++        val ncm = bridge.awaitNcm(Long.MAX_VALUE) ?: throw EOFException("USB helper exited before an iPhone appeared")
++        log.info("wired: iPhone in its CarPlay configuration, NCM interface {}", ncm)
++        val mux = Iap2UsbMuxHost.open(bridge).also { this.mux = it }
++        log.info("wired: USBMUX open")
++        // One record per iPhone (its USB serial): a second iPhone must not replace the first one's
++        // "Trust" (2026-10-12). The single file of the first version is still tried.
++        val legacy = PairRecordStore(server.config.stateDir.resolve("lockdown-pair-record.properties"))
++        val pairing = serial?.takeIf { it.matches(Regex("[0-9A-Za-z-]{8,64}")) }
++            ?.let { PairRecordStore(server.config.stateDir.resolve("lockdown-pair-record-$it.properties")) } ?: legacy
++        var record = pairing.load() ?: legacy.load() ?: pairNew(mux, pairing)
++        val carkit = try {
++            LockdownCarKitClient(mux).open(record, LABEL)
++        } catch (error: Exception) {
++            // InvalidHostID: an iPhone that never trusted this box (another phone's record was tried).
++            if (error.message?.contains(Regex("InvalidPairRecord|InvalidHostID", RegexOption.IGNORE_CASE)) != true) throw error
++            log.info("wired: the iPhone does not know this box ({}); pairing", error.message)
++            record = pairNew(mux, pairing)
++            LockdownCarKitClient(mux).open(record, LABEL)
++        }
++        log.info("wired: com.apple.carkit.service open")
++        // Diagnostics only: filtering the iPhone's log took a whole CPU core and shared the cable with
++        // the video, adding ~0.3 s to every touch (2026-10-12).
++        if (System.getenv("CARPLAY_WIRED_PHONE_LOG") == "1") phoneLog(mux, record)
++        val session = Iap2Session.open(carkit, traceContext = "wired", onTrace = { log.debug(it) })
++            .also { this.session = it }
++        val linkLocal = waitLinkLocal(ncm)
++        server.listenWired(linkLocal)
++        val identification = Iap2IdentificationConfig(
++            name = server.config.deviceName,
++            modelIdentifier = server.config.model,
++            manufacturer = server.config.manufacturer,
++            serialNumber = "CARPLAYWEB-" + server.deviceId.replace(":", ""),
++            firmwareVersion = "1.0.0",
++            hardwareVersion = "1.0",
++            carPlayUsbInterfaceNumber = bridge.ncmInterfaceNumber,
++        )
++        val endpoint = Iap2WiredCarPlayEndpoint(
++            ipv6Addresses = listOf(linkLocal.hostAddress.substringBefore('%')),
++            airPlayPort = server.config.airPlayPort,
++            publicKey = server.identity.publicKeyHex,
++            sourceVersion = server.config.sourceVersion,
++            // As the Android app: the NCM MAC the iPhone assigned to this side.
++            deviceIdentifier = bridge.ncmMac ?: server.deviceId,
++        )
++        log.info("wired: iAP2 control starting, AirPlay on [{}]:{}", linkLocal.hostAddress, server.config.airPlayPort)
++        val result = Iap2WiredControlClient(session, Iap2MfiAuthenticationClient(server.mfi)).run(
++            identification = identification,
++            endpoint = endpoint,
++            availableCurrentMilliAmps = 1000,
++            timeoutMillis = Iap2WiredControlClient.NO_TIMEOUT_MILLIS,
++            onReady = { log.info("wired: iAP2 identified and authenticated; CarPlay available"); awaitSession(bridge) },
++            // Song, artist, album and artwork for the browser's media session, as over the wireless tunnel.
++            onIncoming = server.nowPlayingFeed(session, "wired") { !stopped && this.session === session },
++            // NowPlaying updates arrive every ~0.45 s while music plays: debug only.
++            onProgress = { if (it.startsWith("iap2 rx=0x5001")) log.debug("wired {}", it) else log.info("wired {}", it) },
++        )
++        log.info("wired: iAP2 control ended {} at {}", result.terminal, result.stage)
++    }
++
++    /**
++     * Two minutes of the iPhone's own log about accessories and CarPlay (com.apple.syslog_relay over
++     * the same Lockdown pairing), as the Android app captured while bringing wired CarPlay up.
++     */
++    private fun phoneLog(mux: Iap2UsbMuxHost, record: LockdownPairRecord) {
++        val relay = runCatching { LockdownCarKitClient(mux).openService(record, LABEL, "com.apple.syslog_relay") }
++            .onFailure { log.info("wired: iPhone log unavailable: {}", it.message) }.getOrNull() ?: return
++        val relevant = Regex(" (accessoryd|ACCCarPlay|iap2d|CarPlay|carkitd|AirPlay|airplayd|mDNSResponder|NCM|usbmux)", RegexOption.IGNORE_CASE)
++        Thread({
++            val phone = LoggerFactory.getLogger("iphone")
++            try {
++                relay.use {
++                    val deadline = System.nanoTime() + TimeUnit.MINUTES.toNanos(2)
++                    val pending = StringBuilder()
++                    while (!stopped && System.nanoTime() < deadline) {
++                        val bytes = relay.recv(8192, 1000) ?: continue
++                        if (bytes.isEmpty()) break
++                        pending.append(bytes.toString(Charsets.UTF_8).replace('\u0000', '\n'))
++                        while (true) {
++                            val end = pending.indexOf("\n")
++                            if (end < 0) break
++                            val line = pending.substring(0, end)
++                            pending.delete(0, end + 1)
++                            if (relevant.containsMatchIn(line)) phone.info(line.take(600))
++                        }
++                        if (pending.length > 65536) pending.clear()
++                    }
++                }
++            } catch (error: Exception) {
++                log.info("wired: iPhone log ended: {}", error.message)
++            }
++        }, "wired-iphone-log").apply { isDaemon = true; start() }
++    }
++
++    private fun pairNew(mux: Iap2UsbMuxHost, store: PairRecordStore): LockdownPairRecord {
++        log.info("wired: pairing with the iPhone; tap Trust on its screen")
++        status("trust")
++        val paired = LockdownPairingClient(mux).pair(
++            label = LABEL,
++            hostId = UUID.randomUUID().toString().uppercase(),
++            systemBuid = UUID.randomUUID().toString().uppercase(),
++            totalTimeoutMillis = PAIR_TIMEOUT_MILLIS,
++            isCancelled = { stopped },
++        )
++        store.save(paired.pairRecord)
++        log.info("wired: paired; record saved")
++        status("starting")
++        return paired.pairRecord
++    }
++
++    /** The NCM interface's link-local address once the kernel assigned it (interface brought up by the helper). */
++    private fun waitLinkLocal(name: String): Inet6Address {
++        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15)
++        while (System.nanoTime() < deadline) {
++            // The helper puts fe80::2 on its TAP interface (the Android app's fixed address); the
++            // kernel adds its own link-local next to it.
++            val addresses = NetworkInterface.getByName(name)?.inetAddresses?.toList()
++                ?.filterIsInstance<Inet6Address>()?.filter { it.isLinkLocalAddress }.orEmpty()
++            val address = addresses.firstOrNull { it.hostAddress.startsWith("fe80:0:0:0:0:0:0:2%") } ?: addresses.firstOrNull()
++            if (address != null) return address
++            Thread.sleep(200)
++        }
++        throw EOFException("NCM interface $name has no IPv6 link-local address")
++    }
++
++    /**
++     * "live" once the iPhone has opened CarPlay on the cable. An iPhone plugged in right after a wireless
++     * session accepted the start but never connected (2026-10-12); starting the run over fixes that.
++     */
++    private fun awaitSession(bridge: UsbBridgePipe) {
++        Thread({
++            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(SESSION_WAIT_SECONDS)
++            while (!stopped && pipe === bridge && System.nanoTime() < deadline) {
++                if (server.wiredSessionActive()) {
++                    status("live")
++                    return@Thread
++                }
++                Thread.sleep(250)
++            }
++            if (!stopped && pipe === bridge) {
++                log.info("wired: the iPhone did not open CarPlay within {} s; starting over", SESSION_WAIT_SECONDS)
++                closeLink()
++            }
++        }, "wired-session-wait").apply { isDaemon = true; start() }
++    }
++
++    /**
++     * Phase for the box's settings page (CARPLAY_WIRED_STATUS): cable (no iPhone), starting, trust
++     * (waiting for "Trust this computer?"), live (CarPlay available on the cable).
++     */
++    private fun status(phase: String) {
++        val file = statusFile ?: return
++        runCatching {
++            val temporary = file.resolveSibling(file.fileName.toString() + ".tmp")
++            Files.writeString(temporary, "{\"phase\": \"$phase\"}\n")
++            Files.move(temporary, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
++        }.onFailure { log.debug("wired status not written: {}", it.message) }
++    }
++
++    /** Ends the current wired run; the loop starts a new one (new iAP2 identification and start session). */
++    fun restart() {
++        log.info("wired: restarting for the new display")
++        closeLink()
++    }
++
++    /** The iAP2 session blocks in recv without noticing a closed pipe (2026-10-12), so close it too. */
++    private fun closeLink() {
++        runCatching { session?.close() }
++        runCatching { mux?.close() }
++        runCatching { pipe?.close() }
++    }
++
++    override fun close() {
++        stopped = true
++        closeLink()
++    }
++
++    private companion object {
++        const val LABEL = "DashPlay"
++        const val RETRY_MILLIS = 2_000L
++        const val PAIR_TIMEOUT_MILLIS = 120_000L
++        const val SESSION_WAIT_SECONDS = 8L   // the iPhone normally connects ~2 s after the start
++    }
++}
++
++/** Lockdown pair record in the state directory (owner-only), hex PEM fields as in the Android app. */
++internal class PairRecordStore(private val file: Path) {
++    fun load(): LockdownPairRecord? = runCatching {
++        if (!Files.exists(file)) return null
++        val p = Properties().apply { Files.newInputStream(file).use(::load) }
++        fun hex(key: String) = p.getProperty(key).chunked(2).map { it.toInt(16).toByte() }.toByteArray()
++        LockdownPairRecord.restore(
++            hostId = p.getProperty("hostId"),
++            systemBuid = p.getProperty("systemBuid"),
++            wifiMacAddress = p.getProperty("wifiMacAddress"),
++            devicePublicKeyPem = hex("devicePublicKey"),
++            deviceCertificatePem = hex("deviceCertificate"),
++            hostPrivateKeyPem = hex("hostPrivateKey"),
++            hostCertificatePem = hex("hostCertificate"),
++            rootPrivateKeyPem = hex("rootPrivateKey"),
++            rootCertificatePem = hex("rootCertificate"),
++        )
++    }.getOrNull()
++
++    fun save(record: LockdownPairRecord) {
++        fun hex(bytes: ByteArray) = bytes.joinToString("") { "%02x".format(it) }
++        val p = Properties().apply {
++            setProperty("hostId", record.hostId)
++            setProperty("systemBuid", record.systemBuid)
++            setProperty("wifiMacAddress", record.wifiMacAddress)
++            setProperty("devicePublicKey", hex(record.devicePublicKeyPem))
++            setProperty("deviceCertificate", hex(record.deviceCertificatePem))
++            setProperty("hostPrivateKey", hex(record.hostPrivateKeyPem))
++            setProperty("hostCertificate", hex(record.hostCertificatePem))
++            setProperty("rootPrivateKey", hex(record.rootPrivateKeyPem))
++            setProperty("rootCertificate", hex(record.rootCertificatePem))
++        }
++        val temporary = file.resolveSibling(file.fileName.toString() + ".tmp")
++        Files.newOutputStream(temporary).use { p.store(it, "Lockdown pair record for wired CarPlay") }
++        runCatching { Files.setPosixFilePermissions(temporary, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------")) }
++        Files.move(temporary, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
++    }
++}
++
++/**
++ * The USBMUX pipe through iphone-usb-bridge.py: stdin/stdout carry length-prefixed bulk transfers
++ * (u32 big-endian length, then the bytes); stderr carries its log, "usb waiting" / "usb iphone" and
++ * "ncm <interface> <number> <mac>".
++ */
++internal class UsbBridgePipe private constructor(
++    private val process: Process,
++    private val onState: (String) -> Unit,
++) : Iap2UsbSession {
++    private val log = LoggerFactory.getLogger("usb-bridge")
++    private val output = DataOutputStream(process.outputStream.buffered())
++    private val input = DataInputStream(process.inputStream.buffered())
++    private val received = ArrayBlockingQueue<ByteArray>(256)
++    private val ncm = ArrayBlockingQueue<Triple<String, Int, String?>>(1)
++    @Volatile private var ended = false
++    var ncmInterfaceNumber: Int = 0
++        private set
++
++    /** The MAC the iPhone's NCM descriptor assigns to this side; reported as the CarPlay device id. */
++    var ncmMac: String? = null
++        private set
++
++    init {
++        Thread({
++            process.errorStream.bufferedReader().forEachLine { line ->
++                if (line.startsWith("usb ")) {
++                    log.info(line)
++                    runCatching { onState(line.removePrefix("usb ").trim()) }
++                } else if (line.startsWith("ncm ")) {
++                    val parts = line.split(" ")
++                    ncm.offer(Triple(parts[1], parts.getOrNull(2)?.toIntOrNull() ?: 0, parts.getOrNull(3)))
++                } else {
++                    log.info(line)
++                }
++            }
++        }, "usb-bridge-stderr").apply { isDaemon = true; start() }
++        Thread({
++            try {
++                while (true) {
++                    val length = input.readInt()
++                    val bytes = ByteArray(length)
++                    input.readFully(bytes)
++                    received.put(bytes)
++                }
++            } catch (_: Exception) {
++            } finally {
++                ended = true
++            }
++        }, "usb-bridge-reader").apply { isDaemon = true; start() }
++    }
++
++    fun awaitNcm(timeoutMillis: Long): String? {
++        val deadline = if (timeoutMillis == Long.MAX_VALUE) Long.MAX_VALUE else System.currentTimeMillis() + timeoutMillis
++        while (System.currentTimeMillis() < deadline) {
++            val found = ncm.poll(500, TimeUnit.MILLISECONDS)
++            if (found != null) {
++                ncmInterfaceNumber = found.second
++                ncmMac = found.third?.uppercase()
++                return found.first
++            }
++            if (!process.isAlive) return null
++        }
++        return null
++    }
++
++    @Synchronized
++    override fun write(data: ByteArray, timeoutMillis: Int) {
++        if (ended || !process.isAlive) throw EOFException("USB helper exited")
++        output.writeInt(data.size)
++        output.write(data)
++        output.flush()
++    }
++
++    override fun read(timeoutMillis: Long): ByteArray? {
++        val bytes = received.poll(timeoutMillis, TimeUnit.MILLISECONDS)
++        if (bytes == null && ended) throw EOFException("USB helper exited")
++        return bytes
++    }
++
++    fun onExit(action: () -> Unit) {
++        process.onExit().thenRun { runCatching(action) }
++    }
++
++    override fun close() {
++        ended = true
++        process.destroy()
++        if (!process.waitFor(2, TimeUnit.SECONDS)) process.destroyForcibly()
++    }
++
++    companion object {
++        fun start(helper: Path, onState: (String) -> Unit = {}): UsbBridgePipe =
++            UsbBridgePipe(ProcessBuilder("python3", helper.toString()).start(), onState)
++    }
++}
+--- a/server/src/main/kotlin/com/playport/server/WirelessBootstrap.kt
++++ b/server/src/main/kotlin/com/playport/server/WirelessBootstrap.kt
+@@ -67,6 +67,9 @@
+                 return
+             }
+             val hostBluetoothMac = server.hostBluetoothMac
++            // Closed meanwhile, e.g. an iPhone was plugged into the USB port: no invitation, and no log
++            // line that reads like one (run-receiver.py marks "invitation sent" on it).
++            if (stopped) return
+             log.info("wireless bootstrap: iPhone={} hostBt={} wifi={} ch={}", deviceAddress, hostBluetoothMac, wifi.ssid, wifi.channel)
+ 
+             val stream = synchronized(this) {
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AudioStream.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AudioStream.kt
+@@ -142,7 +142,8 @@
+                             "payloadHead=${payload.copyOf(minOf(payload.size, 16)).toHexString()}",
+                     )
+                 } else if (decryptedNumber % PACKET_LOG_INTERVAL == 0) {
+-                    com.shilapi.xcertplay.platform.Log.i(
++                    // Every 0.74 s on LPCM: debug only; the 5 s "Receive: audio" summary stays.
++                    com.shilapi.xcertplay.platform.Log.d(
+                         TAG,
+                         "audio stream type=$streamType decrypted=$decryptedNumber " +
+                             "authFailures=${authenticationFailures.get()}",
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/AirPlaySession.kt
+@@ -420,7 +420,8 @@
+     }
+ 
+     private fun debugLog(message: String, uiVisible: Boolean = true) {
+-        Log.i(TAG, message)
++        // Feedback every 2 s and /command traffic: debug only (they filled most of a drive's log).
++        if (uiVisible) Log.i(TAG, message) else Log.d(TAG, message)
+         if (!uiVisible) return
+         try {
+             listener.onDebugLog(message)
+--- a/server/src/main/kotlin/com/playport/server/PersistentConfig.kt
++++ b/server/src/main/kotlin/com/playport/server/PersistentConfig.kt
+@@ -11,7 +11,8 @@
+ data class DisplayPrefs(
+     val width: Int = 1280,
+     val height: Int = 720,
+-    val fps: Int = 60,
++    // 30 by default: at 60 the iPhone encodes twice the frames on the cable and ran hot (2026-10-12 drive).
++    val fps: Int = 30,
+     val uiScale: Int = 100,
+     val hevc: Boolean = false,
+ )
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -57,7 +57,8 @@
+ data class DisplayRequest(
+     val width: Int,
+     val height: Int,
+-    val fps: Int = 60,
++    // 30 by default: at 60 the iPhone encodes twice the frames on the cable and ran hot (2026-10-12 drive).
++    val fps: Int = 30,
+     val uiScale: Int = 100,
+     val hevc: Boolean = false,
+ )

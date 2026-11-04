@@ -67,10 +67,11 @@
          override fun onSessionActive(session: AirPlaySession) {
              log.info("CarPlay session active peer={}", session.host)
              activeSession = session
-@@ -308,7 +320,7 @@
+@@ -308,8 +320,8 @@
              log.info("CarPlay session ended peer={}", session.host)
              if (activeSession !== session) return
              activeSession = null
+             if (connectedSession === session) connectedSession = null
 -            if (presenceHelper != null) presence("idle")
 +            if (hasPresence) presence("idle")
              // A session the receiver closed itself to apply a new display is already being re-invited;

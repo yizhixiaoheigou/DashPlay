@@ -1,0 +1,670 @@
+Display changes without the black screen (2026-10-21).
+
+CarPlay fixes the stream's size, codec and frame rate when a session starts; only the view areas declared then can be
+switched in place (playport-view-areas.patch). Every other change renegotiates, 5-6 s on Wi-Fi and ~10 s on the
+cable, and the page showed the black "waiting for iPhone" screen meanwhile. A Tesla page asked for eight in 30
+minutes (2026-10-16 diagnosis): four only made the picture sharper or switched H.264/H.265 for a shape the phone
+already had, as the browser proved its decoder fast or slow, and two put back another page's frame rate.
+
+- A change that can wait (auto quality for a shape the phone already has) is kept by the box and taken up when the
+  session ends by itself; a new shape, the other orientation, a failed H.265 decode and any change by hand still
+  renegotiate at once and replace it. The settings show "next connection" while one waits.
+- A renegotiation for a display keeps the last picture with a notice (up to 20 s awake) instead of the black screen,
+  for the page that asked and for any other page (the box marks that session end as "restarting").
+- Auto reads the box's display before it decides, so it no longer sends back the fps or size another page set.
+- The box logs why each change came (manual, shape, quality, codec) and the areas declared.
+- Up to 8 view areas instead of 4 (4 was chosen on 2026-10-14, not a protocol limit; the F50 in the XPeng had four
+  landscape shapes and no room for the split screen's portrait one). The shapes are kept most recently used last and
+  the most recent are declared, ordered by size, so the same shapes make the same areas from either of them.
+- A change that waits for the next session still switches to the window's area now, when one is declared.
+- Both orientations are declared together when that grows the stream by at most 10%: a split screen turns the car's
+  window portrait and back (XPeng with fnOS beside CarPlay, 2026-10-19: 1372x1260 with 1162x1280, 2560x2160 with
+  1534x1684), and every open and close of the panel renegotiated. A phone turning (1920x1080 with 1080x1920) still
+  declares one orientation, as xcertplay 1836c27 has it.
+- A request for the stream already declared while the phone is between sessions only notes the area: restarting the
+  invitation then cut the reconnection in progress (the same display twice within 5 s, F50 2026-10-19).
+
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+index 8dde7e6..7994b37 100644
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -162,9 +162,16 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+             // A session the receiver closed itself to apply a new display is already being re-invited;
+             // flagging it as ended made the supervisor start a second invitation that cut off the first
+             // (fullscreen switch took 19 s instead of ~12 s, 2026-10-11).
+-            sessionEnded = !closingForDisplay.getAndSet(false)
++            val forDisplay = closingForDisplay.getAndSet(false)
++            sessionEnded = !forDisplay
++            // Ended by itself (the phone left, the car slept): the next session can take up a change that waited.
++            if (!forDisplay && display.applyPending()) {
++                configStore?.save(PersistentConfig.of(config, display))
++                log.info("display changed to {}x{} @{}fps codec={} for the next session (it waited for this one to end)",
++                    display.width, display.height, display.fps, if (display.hevc) "h265" else "h264")
++            }
+             bridge.endMicrophone()
+-            hub.setSessionState(false, null)
++            hub.setSessionState(false, null, restarting = forDisplay)
+         }
+ 
+         override fun onDeviceInfo(session: AirPlaySession, info: AirPlayDeviceInfo) {
+@@ -636,27 +643,44 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+      * Applies a new display configuration and restarts CarPlay so the phone re-negotiates the
+      * display. Returns null on success or a human-readable error.
+      */
+-    fun applyDisplay(request: DisplayRequest): String? {
++    fun applyDisplay(request: DisplayRequest): DisplayOutcome {
+         val (width, height, fps, uiScale, hevc) = request
+-        DisplayState.validate(width, height, fps)?.let { return it }
++        DisplayState.validate(width, height, fps)?.let { return DisplayOutcome(it) }
+         val areas = request.areas.takeIf { it.size > 1 } ?: emptyList()
+-        DisplayState.validateAreas(width, height, areas, request.area)?.let { return it }
++        DisplayState.validateAreas(width, height, areas, request.area)?.let { return DisplayOutcome(it) }
++        val reason = request.reason.take(16).filter { it.isLetterOrDigit() || it == '-' }.ifEmpty { "-" }
+         // Only another of the declared areas (the page's window changed shape): move CarPlay there, no reconnect.
+         val session = activeSession
+         if (areas.isNotEmpty() && session != null && display.sameStream(width, height, fps, uiScale, hevc, areas)) {
+-            if (request.area == display.area) return null
++            if (request.area == display.area) return DisplayOutcome()
+             display.useArea(request.area)
+             configStore?.save(PersistentConfig.of(config, display))
+             val sent = session.showViewArea(request.area)
+-            log.info("view area {} ({}x{}) of {}x{} sent={}", request.area, areas[request.area].width,
+-                areas[request.area].height, width, height, sent)
+-            return if (sent) null else "view area not sent"
++            log.info("view area {} ({}x{}) of {}x{} sent={} ({})", request.area, areas[request.area].width,
++                areas[request.area].height, width, height, sent, reason)
++            return if (sent) DisplayOutcome() else DisplayOutcome("view area not sent")
++        }
++        if (session == null && display.pending == null && display.sameStream(width, height, fps, uiScale, hevc, areas)) {
++            // Between sessions (CarPlay is coming back, perhaps for this very display): the phone reads the area at its
++            // next connection; restarting the invitation cut the reconnection in progress (two restarts within 5 s for
++            // the same display, F50 2026-10-19).
++            if (request.area != display.area) display.useArea(request.area)
++            configStore?.save(PersistentConfig.of(config, display))
++            log.info("display {}x{} area {} kept for the next session ({})", width, height, request.area, reason)
++            return DisplayOutcome()
++        }
++        if (request.defer && session != null) {
++            display.defer(request.copy(areas = areas))
++            log.info("display {}x{} @{}fps codec={} waits for the session to end ({})", width, height, fps,
++                if (hevc) "h265" else "h264", reason)
++            return DisplayOutcome(deferred = true)
+         }
+         display.update(width, height, fps, uiScale, hevc, areas, request.area)
+         configStore?.save(PersistentConfig.of(config, display))
+         log.info(
+-            "display changed to {}x{} @{}fps uiScale={} codec={} ({}); restarting CarPlay",
++            "display changed to {}x{} @{}fps uiScale={} codec={} ({}) areas={} ({}); restarting CarPlay",
+             width, height, fps, display.uiScale, if (display.hevc) "h265" else "h264", display.orientation,
++            areas.joinToString(",") { "${it.width}x${it.height}" }.ifEmpty { "-" }, reason,
+         )
+         val wasActive = activeSession != null
+         closingForDisplay.set(wasActive)
+@@ -675,14 +699,14 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+                     restartWireless(confirmedPresent = true)
+                 }
+             }, "display-keep-link").apply { isDaemon = true; start() }
+-            return null
++            return DisplayOutcome()
+         }
+         activeSession?.close()
+         // Wired: start the USB side over (identification, then CarPlayStartSession with the new display).
+         wired?.restart()
+         // The phone was just using CarPlay, so skip the ~2.4 s presence re-check before re-inviting it.
+         restartWireless(confirmedPresent = wasActive)
+-        return null
++        return DisplayOutcome()
+     }
+ 
+     private fun displayKeepLinkMs(): Long =
+diff --git a/server/src/main/kotlin/com/playport/server/DisplayState.kt b/server/src/main/kotlin/com/playport/server/DisplayState.kt
+index 44ac777..f16de1f 100644
+--- a/server/src/main/kotlin/com/playport/server/DisplayState.kt
++++ b/server/src/main/kotlin/com/playport/server/DisplayState.kt
+@@ -31,6 +31,7 @@ class DisplayState(width: Int, height: Int, fps: Int, uiScale: Int, hevc: Boolea
+         private set
+ 
+     fun update(width: Int, height: Int, fps: Int, uiScale: Int, hevc: Boolean, areas: List<ViewArea> = emptyList(), area: Int = 0) {
++        pending = null
+         this.width = width
+         this.height = height
+         this.fps = fps
+@@ -47,6 +48,27 @@ class DisplayState(width: Int, height: Int, fps: Int, uiScale: Int, hevc: Boolea
+ 
+     fun useArea(index: Int) { area = index.coerceIn(0, maxOf(0, areas.lastIndex)) }
+ 
++    /**
++     * A change that can wait ([DisplayRequest.defer]: a sharper picture or another codec for the same window shapes),
++     * kept while a session runs: renegotiating cut the picture for 5-10 s, so it is taken up when the session ends by
++     * itself (2026-10-21; a Tesla's page asked for four such restarts within ten minutes, 2026-10-16). A change that
++     * cannot wait replaces it.
++     */
++    @Volatile var pending: DisplayRequest? = null
++        private set
++
++    fun defer(request: DisplayRequest) { pending = request }
++
++    /** Takes up the pending change, if any; true when the display changed. */
++    fun applyPending(): Boolean {
++        val next = pending ?: return false
++        pending = null
++        val areas = next.areas.takeIf { it.size > 1 } ?: emptyList()
++        if (validate(next.width, next.height, next.fps) != null || validateAreas(next.width, next.height, areas, next.area) != null) return false
++        update(next.width, next.height, next.fps, next.uiScale, next.hevc, areas, next.area)
++        return true
++    }
++
+     /**
+      * CarPlay sizes its icons by pixels per millimetre. With areas the stream is wider than the window shape it mostly
+      * shows, and at the plain 200 mm the windowed area looked crowded (Tesla, 2026-10-14): the narrowest area keeps the
+@@ -64,7 +86,8 @@ class DisplayState(width: Int, height: Int, fps: Int, uiScale: Int, hevc: Boolea
+         const val MIN_EDGE = 480
+         const val MAX_EDGE = 3840
+ 
+-        const val MAX_AREAS = 4
++        /** As many as the page declares (display-fit.ts MAX_AREAS; 4 until 2026-10-21). */
++        const val MAX_AREAS = 8
+ 
+         fun validateAreas(width: Int, height: Int, areas: List<ViewArea>, area: Int): String? = when {
+             areas.size > MAX_AREAS -> "at most $MAX_AREAS view areas"
+diff --git a/server/src/main/kotlin/com/playport/server/WebHub.kt b/server/src/main/kotlin/com/playport/server/WebHub.kt
+index 2691951..fc9ea68 100644
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -74,4 +74,11 @@ data class DisplayRequest(
+     val area: Int = 0,
++    /** A change that can wait for the next session (a sharper picture, another codec): never cut the one running. */
++    val defer: Boolean = false,
++    /** Who asked, for the log: "manual", "shape", "quality", "codec" ... */
++    val reason: String = "",
+ )
+ 
++/** What became of a display request: an error, or applied now, or kept until the session ends ([DisplayRequest.defer]). */
++data class DisplayOutcome(val error: String? = null, val deferred: Boolean = false)
++
+ @Serializable
+@@ -95,2 +102,4 @@ data class ServerMessage(
+     val micBitrate: Int? = null,
++    /** "session" ended because the receiver applies a new display: the phone comes back at once (keep the picture). */
++    val restarting: Boolean? = null,
+ )
+@@ -152,3 +161,3 @@ class WebHub(
+     /** Applies a display change; returns null on success or an error message. */
+-    @Volatile var onApplyDisplay: ((DisplayRequest) -> String?)? = null
++    @Volatile var onApplyDisplay: ((DisplayRequest) -> DisplayOutcome)? = null
+ 
+@@ -207,3 +216,3 @@ class WebHub(
+ 
+-    fun setSessionState(active: Boolean, name: String?) {
++    fun setSessionState(active: Boolean, name: String?, restarting: Boolean = false) {
+         if (!active) { nowPlaying = NowPlaying(); artwork = null }
+@@ -218,2 +227,3 @@ class WebHub(
+                 message = name,
++                restarting = restarting.takeIf { it },
+             ),
+@@ -355,3 +365,4 @@ class WebHub(
+                 }
+-                val error = applier(request)
++                val outcome = applier(request)
++                val error = outcome.error
+                 if (error != null) {
+@@ -364,3 +375,4 @@ class WebHub(
+                 }
+-                call.respondText("""{"ok":true}""", io.ktor.http.ContentType.Application.Json)
++                call.respondText(if (outcome.deferred) """{"ok":true,"deferred":true}""" else """{"ok":true}""",
++                    io.ktor.http.ContentType.Application.Json)
+             }
+@@ -558,2 +570,4 @@ class WebHub(
+         put("area", kotlinx.serialization.json.JsonPrimitive(display.area))
++        // A change waiting for the session to end (DisplayState.pending): shown as "next connection" in the settings.
++        put("pending", kotlinx.serialization.json.JsonPrimitive(display.pending != null))
+         put("orientation", kotlinx.serialization.json.JsonPrimitive(display.orientation))
+diff --git a/server/src/test/kotlin/com/playport/server/ViewAreaTest.kt b/server/src/test/kotlin/com/playport/server/ViewAreaTest.kt
+index e9a4b3e..654542d 100644
+--- a/server/src/test/kotlin/com/playport/server/ViewAreaTest.kt
++++ b/server/src/test/kotlin/com/playport/server/ViewAreaTest.kt
+@@ -19,7 +19,8 @@ class ViewAreaTest {
+         assertNotNull(DisplayState.validateAreas(1280, 996, listOf(full, windowed), 0))
+         assertNotNull(DisplayState.validateAreas(1920, 1080, listOf(full, ViewArea(1281, 996)), 0))
+         assertNotNull(DisplayState.validateAreas(1920, 1080, listOf(full, windowed), 2))
+-        assertNotNull(DisplayState.validateAreas(1920, 1080, List(5) { windowed }, 0))
++        assertNull(DisplayState.validateAreas(1920, 1080, List(DisplayState.MAX_AREAS) { windowed }, 0))
++        assertNotNull(DisplayState.validateAreas(1920, 1080, List(DisplayState.MAX_AREAS + 1) { windowed }, 0))
+     }
+ 
+     @Test
+@@ -55,4 +56,29 @@ class ViewAreaTest {
+         assertTrue("an older config.json has no areas",
+             json.decodeFromString(DisplayPrefs.serializer(), """{"width":1280,"height":720}""").areas.isEmpty())
+     }
++
++    @Test
++    fun aChangeThatCanWaitIsTakenUpWhenTheSessionEnds() {
++        val display = DisplayState(1280, 996, 60, 100, false)
++        val sharper = Json.decodeFromString(DisplayRequest.serializer(),
++            """{"width":1920,"height":1140,"fps":60,"hevc":true,"defer":true,"reason":"quality"}""")
++        assertTrue(sharper.defer)
++        display.defer(sharper)
++        assertEquals("the running session keeps what the phone was told", 1280, display.width)
++        assertTrue(display.applyPending())
++        assertEquals(listOf(1920, 1140, 60), listOf(display.width, display.height, display.fps))
++        assertTrue(display.hevc)
++        assertNull(display.pending)
++        assertFalse("nothing left to take up", display.applyPending())
++
++        display.defer(sharper.copy(width = 1280, height = 996))
++        display.update(1920, 1080, 30, 100, false)
++        assertNull("a change that could not wait replaces the waiting one", display.pending)
++        assertFalse(display.applyPending())
++        assertEquals(1920, display.width)
++
++        display.defer(sharper.copy(width = 7))
++        assertFalse("a bad waiting change is dropped", display.applyPending())
++        assertEquals(1920, display.width)
++    }
+ }
+diff --git a/web/check-car.mjs b/web/check-car.mjs
+index d8b078f..9d2f59c 100644
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -6,7 +6,7 @@ async function load(name, transform = s => s) {
+   const {outputText}=ts.transpileModule(source,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ESNext}});
+   return import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
+ }
+-const {suggestedResolution,aspectChanged,shownSize,areaPlan,areaSize}=await load('display-fit');
++const {suggestedResolution,aspectChanged,shownSize,areaPlan,areaSize,areaFor,sameStream,showsShape,MAX_AREAS}=await load('display-fit');
+ { // XPeng fullscreen is 876x579 or 876x641 CSS px (dock shown or not): 1280x846 or 1280x936 (F50 drive 2026-10-13).
+   // With view areas the page (1280x756) and both fullscreen heights are areas: learned once, then switched.
+   const s846=suggestedResolution(876,579),s936=suggestedResolution(876,641),page=suggestedResolution(876,518);
+@@ -26,6 +26,20 @@ assert.deepEqual(suggestedResolution(2560,1440,2560),{width:2560,height:1440},'a
+ assert.deepEqual(suggestedResolution(3840,2160,2560),{width:2560,height:1440},'never beyond 2560');
+ assert.deepEqual(suggestedResolution(1254*1.53,784*1.53,2560),{width:1918,height:1200},'Tesla: same as before');
+ assert.deepEqual(suggestedResolution(2560,1440),{width:1920,height:1080},'1920 unless asked for more');
++{ // A Tesla page (2026-10-16 diagnosis): 1280x996 H.264 first, then the browser proves a fast decoder. Real pixels and
++  // H.265 for the same window are sharper only: that waits for the session to end. A new shape cannot wait.
++  const live={width:1280,height:996,fps:60,uiScale:100,hevc:false};
++  const sharp=suggestedResolution(1254*1.53,976*1.53,2560);
++  const plan=areaPlan(live,sharp,true,[{width:1280,height:996}]);
++  assert.ok(plan&&!sameStream(live,plan.display),'sharper and H.265 is a new stream');
++  assert.ok(showsShape(live,sharp),'but the phone already has this shape: it waits');
++  const full=suggestedResolution(1254,744);
++  assert.ok(!showsShape(live,full),'fullscreen the first time is a new shape: now');
++  const both=areaPlan(live,full,false,[{width:1280,height:996}]).display;
++  assert.ok(showsShape(both,{width:1280,height:996})&&showsShape(both,full),'each declared area counts');
++  assert.ok(sameStream(both,{...both,area:0}),'switching area keeps the stream');
++  assert.ok(!sameStream(both,{...both,fps:30}),'another fps does not');
++  assert.ok(!showsShape(live,{width:720,height:1280}),'the other orientation renegotiates now'); }
+ assert.deepEqual(shownSize(1280,846,1280,756),{width:1280,height:756},'fullscreen picture fills the normal page without bars');
+ assert.deepEqual(shownSize(1280,756,1280,846),{width:1280,height:846},'and the other way round');
+ assert.deepEqual(shownSize(1280,846,1082,1280),{width:1082,height:1280},'no black bars even before a portrait renegotiation');
+@@ -204,8 +218,11 @@ console.log('Car checks passed: aspect fit, media keys, disconnect state, single
+   const s=areaSize(1920,1080,windowed,773,601);
+   assert.ok(Math.abs(s.width-773*1920/1280)<1e-6 && Math.abs(s.height-601*1080/996)<1e-6,'the area fills the view');
+   assert.deepEqual(areaSize(1280,996,undefined,773,601),{width:773,height:601},'without areas as before');
+-  const four=areaPlan(start,{width:1280,height:400},true,[{width:1280,height:720},{width:1280,height:996},{width:1920,height:1080},{width:1280,height:640}]);
+-  assert.equal(four.display.areas.length,4,'at most four areas');
++  const many=Array.from({length:MAX_AREAS},(_,i)=>({width:1280,height:400+60*i}));
++  const capped=areaPlan(start,{width:1280,height:300},true,many);
++  assert.equal(capped.display.areas.length,MAX_AREAS,'at most MAX_AREAS areas');
++  assert.ok(!capped.display.areas.some(a=>a.height===400),'the least recently used shape gives way');
++  assert.equal(capped.shapes.length,MAX_AREAS,'and is no longer kept');
+   // Turning the window (xcertplay 1836c27): only the window's orientation is declared, so the stream is never the
+   // near-square envelope of a landscape and a portrait shape; the other orientation's shapes stay remembered.
+   const portrait={width:1082,height:1280};
+@@ -216,7 +233,31 @@ console.log('Car checks passed: aspect fit, media keys, disconnect state, single
+   assert.deepEqual([again.display.width,again.display.height],[1920,1080],'turning back is landscape only');
+   assert.deepEqual(again.display.areas,[windowed,full],'with the shapes learned before');
+   assert.equal(again.display.area,1);
+-  assert.deepEqual(again.shapes,[portrait,windowed,full],'and the portrait one is kept in turn');
++  assert.deepEqual(again.shapes,[windowed,portrait,full],'and the portrait one is kept, the most recent last');
++  // A split screen (XPeng with fnOS beside CarPlay, 2026-10-19): the window turns portrait and back as the panel opens
++  // and closes. The two orientations together hardly grow the stream: declared once, then only switched.
++  const page={width:1280,height:756},tall={width:1280,height:1260},side={width:1162,height:1280};
++  const xp={width:1372,height:1260,fps:30,uiScale:100,hevc:true,areas:[page,tall],area:0};
++  const split=areaPlan(xp,side,true,[page,tall]);
++  assert.deepEqual([split.display.width,split.display.height,split.display.areas.length],[1280,1280,3],'portrait joins: 1280x1280');
++  let d=split.display,k=split.shapes;
++  for (const shape of [page,side,tall,side,page]) {
++    const p=areaPlan(d,shape,true,k);
++    if (p) { assert.deepEqual({...p.display,area:0},{...d,area:0},'opening and closing the panel only switches area'); d=p.display; k=p.shapes; }
++    const index=d.areas.findIndex(a=>!aspectChanged(a,shape));
++    assert.equal(d.area,index,'the area in use is the window\'s'); }
++  // The F50 in the XPeng (2026-10-21) had four landscape shapes declared; the split screen's portrait joins them.
++  const narrow={width:1372,height:686},fullDock={width:1280,height:846};
++  const xp4={width:1372,height:1260,fps:30,uiScale:100,hevc:true,areas:[page,fullDock,narrow,tall],area:1};
++  const mixed=areaPlan(xp4,side,true,[narrow,fullDock,tall,page]);
++  assert.deepEqual(mixed.display.areas,[side,page,fullDock,tall,narrow],'all five, by size');
++  assert.deepEqual([mixed.display.width,mixed.display.height],[1372,1280]);
++  for (const shape of [page,side,narrow,side,fullDock]) {
++    const p=areaPlan(mixed.display,shape,true,mixed.shapes);
++    assert.ok(!p||sameStream(mixed.display,p.display),'opening and closing the panel only switches area'); }
++  assert.equal(areaFor(xp4,fullDock),1,'a declared shape is found');
++  assert.equal(areaFor(xp4,side),-1,'a new one is not');
++  assert.equal(areaFor({width:1280,height:720,hevc:false},page),-1,'nor without areas');
+ }
+ console.log('View areas: shapes learned once, switched without reconnecting.');
+ { // Tesla fullscreen leaves the page only when its video sites answer (offline Tesla, simulated 2026-10-14).
+diff --git a/web/src/display-fit.ts b/web/src/display-fit.ts
+index 8e41a67..5f9497f 100644
+--- a/web/src/display-fit.ts
++++ b/web/src/display-fit.ts
+@@ -22,37 +22,68 @@ export function shownSize(width: number, height: number, viewWidth: number, view
+ 
+ export interface Area { width: number; height: number }
+ export interface AreaDisplay { width: number; height: number; hevc: boolean; areas?: Area[]; area?: number }
+-/** Window shapes kept per browser and orientation as CarPlay view areas (protocol: at most 4). */
+-export const MAX_AREAS = 4;
+-/** View areas (2026-10-14): each window shape of this orientation the browser has shown (normal, fullscreen, the car's dock shown or not)
++/** Window shapes declared as CarPlay view areas, and kept per browser and orientation. 4 at first (2026-10-14, chosen,
++ *  not a protocol limit: DiPlay sets none); 8 since a car with a split screen shows more (user 2026-10-21). The
++ *  receiver's DisplayState.MAX_AREAS must allow as many. */
++export const MAX_AREAS = 8;
++/** Both orientations are declared together only while the stream grows by at most this much over one orientation's. */
++export const MIXED_GROWTH = 1.1;
++/** View areas (2026-10-14): each window shape the browser has shown (normal, fullscreen, the car's dock shown or not)
+  *  becomes an area at the stream's top left, the stream as large as all of them. A shape seen before is reached by
+  *  switching area, without reconnecting CarPlay; a new shape, or one that wants a clearly sharper size, declares the
+- *  areas again (one reconnect). Returns what to send and the shapes to keep, or null when nothing changes. */
++ *  areas again (one reconnect). Returns what to send and the shapes to keep, or null when nothing changes.
++ *  The shapes are kept most recently used last; the areas declared are the most recent ones, ordered by size, so the
++ *  same shapes always make the same areas whichever of them the window has now (2026-10-21). */
+ export function areaPlan<T extends AreaDisplay>(display: T, target: Area, hevc: boolean, known: Area[]): { display: T; shapes: Area[] } | null {
+-  // Only shapes of the target's orientation are declared: a landscape and a portrait shape together make the stream
+-  // as large as both, a near-square frame the iPhone has to encode (xcertplay 1836c27). Shapes of the other
+-  // orientation stay remembered for when the window turns back; turning is one reconnect.
+   const landscape = (s: Area) => s.width >= s.height, wide = landscape(target);
+-  const valid = known.filter(s => s.width > 0 && s.height > 0).map(s => ({ width: s.width, height: s.height }));
+-  const other = valid.filter(s => landscape(s) !== wide).slice(-MAX_AREAS);
+-  const shapes = valid.filter(s => landscape(s) === wide).slice(-MAX_AREAS);
+-  let at = shapes.findIndex(s => !aspectChanged(s, target));
+-  if (at < 0) {
+-    shapes.push({ ...target });
+-    if (shapes.length > MAX_AREAS) shapes.shift();
+-    at = shapes.length - 1;
+-  } else if (target.width * target.height > shapes[at].width * shapes[at].height * 1.2) {
+-    shapes[at] = { ...target };   // sharper (a fast decoder's real pixels): worth one reconnect
+-  }
+-  const width = Math.max(...shapes.map(s => s.width)), height = Math.max(...shapes.map(s => s.height));
+-  const areas = shapes.length > 1 ? shapes : [];
++  const all = known.filter(s => s.width > 0 && s.height > 0).map(s => ({ width: s.width, height: s.height }));
++  let found = all.findIndex(s => landscape(s) === wide && !aspectChanged(s, target));
++  let entry = found >= 0 ? all.splice(found, 1)[0] : { ...target };
++  if (target.width * target.height > entry.width * entry.height * 1.2) entry = { ...target };   // sharper (a fast decoder's real pixels): worth one reconnect
++  all.push(entry);
++  // At most MAX_AREAS of each orientation are remembered.
++  const kept = all.filter((s, i) => all.slice(i + 1).filter(n => landscape(n) === landscape(s)).length < MAX_AREAS);
++  // Shapes of the window's orientation are declared: a landscape and a portrait shape together make the stream as
++  // large as both, a near-square frame the iPhone has to encode (xcertplay 1836c27; 1920x1080 with 1082x1280 would be
++  // 1920x1280). The most recent shapes of both join when the stream hardly grows: a split screen turns the car's window
++  // portrait and back (XPeng with fnOS beside CarPlay, 2026-10-19: 1372x1260 with 1162x1280 is 1372x1280, yet every
++  // open and close of the panel renegotiated). Otherwise turning is one reconnect.
++  let chosen = kept.filter(s => landscape(s) === wide).slice(-MAX_AREAS);
++  const recent = kept.slice(-MAX_AREAS);
++  const ofOrientation = (o: boolean) => recent.filter(s => landscape(s) === o);
++  if (recent.some(s => landscape(s) !== wide) &&
++      pixels(recent) <= MIXED_GROWTH * Math.max(pixels(ofOrientation(true)), pixels(ofOrientation(false)))) chosen = recent;
++  chosen = [...chosen].sort((a, b) => a.width - b.width || a.height - b.height);
++  const at = chosen.indexOf(entry);
++  const width = Math.max(...chosen.map(s => s.width)), height = Math.max(...chosen.map(s => s.height));
++  const areas = chosen.length > 1 ? chosen : [];
+   const declared = display.areas ?? [];
+   const same = display.width === width && display.height === height && display.hevc === hevc &&
+     declared.length === areas.length && declared.every((a, i) => a.width === areas[i].width && a.height === areas[i].height);
+-  const kept = [...other, ...shapes];
+   if (same) return areas.length && (display.area ?? 0) !== at ? { display: { ...display, area: at }, shapes: kept } : null;
+   return { display: { ...display, width, height, hevc, areas, area: areas.length ? at : 0 }, shapes: kept };
+ }
++/** The declared area with `target`'s shape, or -1 (none, or no areas declared). */
++export function areaFor(display: AreaDisplay, target: Area) {
++  return display.areas && display.areas.length > 1 ? display.areas.findIndex(s => !aspectChanged(s, target)) : -1;
++}
++function pixels(shapes: Area[]) {
++  return shapes.length ? Math.max(...shapes.map(s => s.width)) * Math.max(...shapes.map(s => s.height)) : 0;
++}
++/** Whether `next` keeps the stream the phone was told, only the area in use differing: no reconnect. */
++export function sameStream(display: AreaDisplay & { fps?: number; uiScale?: number }, next: AreaDisplay & { fps?: number; uiScale?: number }) {
++  const a = display.areas ?? [], b = next.areas ?? [];
++  return display.width === next.width && display.height === next.height && display.hevc === next.hevc &&
++    display.fps === next.fps && display.uiScale === next.uiScale &&
++    a.length === b.length && a.every((s, i) => s.width === b[i].width && s.height === b[i].height);
++}
++/** Whether the display the phone was told already has `target`'s shape (one of its areas, or the whole stream). Then a
++ *  plan for it only makes the picture sharper or changes codec, and waits for the session to end (2026-10-21: each
++ *  renegotiation cut the picture 5-10 s; a Tesla's page asked for four such within ten minutes, 2026-10-16). */
++export function showsShape(display: AreaDisplay, target: Area) {
++  const declared = display.areas && display.areas.length > 1 ? display.areas : [{ width: display.width, height: display.height }];
++  return declared.some(s => s.width > 0 && s.height > 0 && !aspectChanged(s, target));
++}
+ /** The picture element's size so that the area in use fills the view (the rest of the stream lies outside it, to the
+  *  right and below; touches, normalized over the element, stay in stream coordinates). Without areas: shownSize. */
+ export function areaSize(streamWidth: number, streamHeight: number, area: Area | undefined, viewWidth: number, viewHeight: number) {
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+index 83311f3..992d176 100644
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -21,6 +21,9 @@ const messages = {
+   compatDisplay: ['兼容显示', 'Compatible display'], compatDisplayHint: ['有声音但画面黑屏时打开（老车机浏览器默认打开）；切换后页面会刷新', 'Turn on if there is sound but no picture (on by default in older car browsers); the page reloads'],
+   ui: ['界面大小', 'UI size'], fps: ['帧率', 'Frame rate'], codec: ['视频编码', 'Video codec'], codecAuto: ['自动', 'Automatic'], standard: ['标准', 'Standard'], large: ['大', 'Large'], small: ['小', 'Small'],
+   loading: ['正在读取…', 'Loading…'], applying: ['正在应用…', 'Applying…'], applied: ['已保存，正在重新连接 CarPlay。', 'Saved. Reconnecting CarPlay.'],
++  deferred: ['已记下，下次连接 iPhone 时生效，不打断当前画面。', 'Saved for the next connection; the picture is not interrupted now.'],
++  nextSession: ['新画质下次连接生效', 'new quality on next connection'],
++  adjusting: ['正在按新画面重新连接 iPhone…', 'Reconnecting the iPhone for the new picture size…'],
+   loadFail: ['读取失败，请检查盒子连接后重试。', 'Could not load settings. Check the receiver connection and retry.'],
+   applyFail: ['应用失败，请检查连接和分辨率范围。', 'Could not apply. Check connection and resolution range.'],
+   range: ['宽高需为 480–3840 之间的偶数。', 'Width and height must be even numbers between 480 and 3840.'],
+diff --git a/web/src/main.ts b/web/src/main.ts
+index 4025b27..8430f55 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -6,7 +6,7 @@ import { VideoPlayer } from './video';
+ import { Connection } from './ws';
+ import { SystemMedia } from './media-session';
+ import { LagProbe } from './lag';
+-import { suggestedResolution, areaPlan, areaSize, type Area } from './display-fit';
++import { suggestedResolution, areaPlan, areaSize, areaFor, sameStream, showsShape, type Area } from './display-fit';
+ import { t, language, setLanguage, type Key } from './i18n';
+ import { isNight, parseNightMode } from './night';
+ import { reachable, TESLA_HOPS } from './tesla-fullscreen';
+@@ -37,7 +37,11 @@ let hudFrames = 0, hudBytes = 0, hudMusicBytes = 0, hudStart = performance.now()
+ let state: Key = token ? 'connecting' : 'access';
+ let hint: Key = token ? 'waitingHint' : 'accessHint';
+ let lastAutoTarget = '', autoTimer = 0, displayBusy = false;
+-interface Display { width: number; height: number; fps: number; uiScale: number; hevc: boolean; areas?: Area[]; area?: number; }
++/** A change that cannot wait for the next session (codec failed, a setting changed by hand): why, for the box's log. */
++let urgentChange = '';
++/** This page asked for a renegotiation: keep the layout of the picture on screen until the new one comes. */
++let expectRestart = false, expectTimer = 0;
++interface Display { width: number; height: number; fps: number; uiScale: number; hevc: boolean; areas?: Area[]; area?: number; pending?: boolean; }
+ let display: Display | null = null;
+ const autoFit = el<HTMLInputElement>('auto-fit');
+ autoFit.checked = localStorage.getItem('f50-auto-fit') !== 'false';
+@@ -75,6 +79,8 @@ function render() {
+   el('night-status').title = t(darkQuery.matches ? 'browserDark' : 'browserLight');
+ }
+ function fit() {
++  // While CarPlay renegotiates, the last picture stays laid out as it was (the new areas belong to the next stream).
++  if (expectRestart || (holding && holdForDisplay)) return;
+   // With view areas the stream is larger than the area in use: the area fills the view from the top left and the
+   // rest of the picture lies outside it (areaSize, display-fit.ts).
+   const areas = display?.areas ?? [], area = areas.length > 1 ? areas[display?.area ?? 0] : undefined;
+@@ -84,7 +90,7 @@ function fit() {
+ }
+ function error(message: string) {
+   // This browser said it decodes H.265 but cannot: auto goes back to H.264 for good (on this browser).
+-  if (message.includes('H.265/HEVC')) { saveFlag('f50-hevc-failed', '1'); lastAutoTarget = ''; scheduleAuto(); }
++  if (message.includes('H.265/HEVC')) { saveFlag('f50-hevc-failed', '1'); lastAutoTarget = ''; urgentChange = 'codec'; scheduleAuto(); }
+   el('error-text').textContent = message; el('error-banner').hidden = !message;
+ }
+ /** Auto quality (2026-10-14; a Tesla decodes a frame in ~1 ms, the XPeng in 60-100 ms): once this browser has
+@@ -118,7 +124,7 @@ const video = new VideoPlayer(canvas, error, () => {
+   if (!active) return;
+   if (!shownOnce) { startup.mark('firstFrameMs'); connection.send({type:'stats', stats:{ev:16,...startupStats()}}); }
+   frames++; reportFrames++; hudFrames++; painted = true; shownOnce = true; el('overlay').hidden = true; el('app').dataset.live = 'true';
+-  if (holding) { holding = false; el('toast').hidden = true; }
++  if (holding) { holding = false; el('toast').hidden = true; fit(); }
+   if (wokeAt) { lifeEvent(14, { pictureMs: Math.round(performance.now() - wokeAt) }); wokeAt = 0; }
+   const now = performance.now();
+   if (input.lastDownAt > handledDownAt) {
+@@ -193,13 +199,16 @@ function syncNight() {
+  *  awake counts towards HOLD_MS (the one-second tick adds it): a wall-clock timer ran on while a Tesla had the page
+  *  frozen and cleared the picture the moment it came back, just before the new one arrived. */
+ const HOLD_MS = 8000;
+-let holding = false, holdAwakeMs = 0, shownOnce = false;
+-function reset(hold = false) {
++/** A renegotiation for a new display (2026-10-21): the iPhone comes back in 5-6 s on Wi-Fi, ~10 s on the cable; the
++ *  last picture stays up with a notice instead of the black "waiting for iPhone" screen. */
++const DISPLAY_HOLD_MS = 20000;
++let holding = false, holdAwakeMs = 0, holdForDisplay = false, shownOnce = false;
++function reset(hold = false, forDisplay = false) {
+   sentNight = null; lag.reset();
+   active = painted = false; input.reset(); canvas.inert = true;
+   video.close(); audio.stopAll(); media.setActive(false); void microphone.stop();
+-  holding = hold; holdAwakeMs = 0;
+-  if (hold) toast(t('reconnecting'));
++  holding = hold; holdAwakeMs = 0; holdForDisplay = forDisplay;
++  if (hold) toast(t(forDisplay ? 'adjusting' : 'reconnecting'));
+   else clearPicture();
+ }
+ function clearPicture() { canvas.getContext('2d')?.clearRect(0,0,canvas.width,canvas.height); }
+@@ -217,8 +226,12 @@ function server(message: ServerMessage) {
+     else void microphone.stop();
+   }
+   if (message.type !== 'session' && message.type !== 'hello') return;
+-  if (!message.sessionActive) { reset(); state = 'waiting'; }
+-  else { active = true; canvas.inert = false; state = 'starting'; media.setActive(true); syncNight(); if(message.nowPlaying) media.setMetadata(message.nowPlaying); if(message.artwork) media.setArtwork(message.revision ?? 0,message.artwork); }
++  if (!message.sessionActive) {
++    // Ended to apply a new display (by this page or another): the phone comes straight back, keep the picture.
++    const forDisplay = message.restarting === true || expectRestart;
++    endExpectRestart(); reset(forDisplay && (painted || holding), forDisplay); state = 'waiting';
++  }
++  else { endExpectRestart(); void loadDisplay(); active = true; canvas.inert = false; state = 'starting'; media.setActive(true); syncNight(); if(message.nowPlaying) media.setMetadata(message.nowPlaying); if(message.artwork) media.setArtwork(message.revision ?? 0,message.artwork); }
+   render();
+ }
+ async function unlock() {
+@@ -340,28 +353,41 @@ document.querySelectorAll<HTMLButtonElement>('[data-command]').forEach(button =>
+   else if (cmd === 'refresh') send({ type:'keyframe' });
+   else send({ type:'media', media:cmd==='previous'?5:cmd==='next'?4:3 });
+ });
++/** The box's display as it is now: another page may have changed it (it sent back that page's fps, 2026-10-16). */
++async function fetchDisplay(): Promise<Display | null> {
++  try { const r = await fetch('/api/display', { cache: 'no-store' }); return r.ok ? await r.json() as Display : null; }
++  catch { return null; }
++}
+ async function loadDisplay() {
+   if (displayBusy || !token) return;
+   el('display-status').textContent = t('loading');
+-  try {
+-    const r = await fetch('/api/display'); if (!r.ok) throw new Error();
+-    display = await r.json() as Display;
+-    el<HTMLInputElement>('width').value = String(display.width); el<HTMLInputElement>('height').value = String(display.height);
+-    el<HTMLSelectElement>('fps').value = String(display.fps); el<HTMLSelectElement>('ui-scale').value = String(display.uiScale);
+-    el('display-status').dataset.codec = display.hevc ? 'H.265' : 'H.264';
+-    el('display-status').textContent = `${display.width} × ${display.height} / ${display.fps} fps / ${display.hevc ? 'H.265' : 'H.264'}`;
+-    scheduleAuto();
+-  } catch { el('display-status').textContent = t('loadFail'); }
+-}
+-async function saveDisplay(target: Display): Promise<boolean> {
++  const loaded = await fetchDisplay();
++  if (!loaded) { el('display-status').textContent = t('loadFail'); return; }
++  display = loaded; showDisplay(); fit(); scheduleAuto();
++}
++function showDisplay() {
++  if (!display) return;
++  el<HTMLInputElement>('width').value = String(display.width); el<HTMLInputElement>('height').value = String(display.height);
++  el<HTMLSelectElement>('fps').value = String(display.fps); el<HTMLSelectElement>('ui-scale').value = String(display.uiScale);
++  el('display-status').dataset.codec = display.hevc ? 'H.265' : 'H.264';
++  el('display-status').textContent = `${display.width} × ${display.height} / ${display.fps} fps / ${display.hevc ? 'H.265' : 'H.264'}${display.pending ? ` · ${t('nextSession')}` : ''}`;
++}
++function endExpectRestart() { expectRestart = false; window.clearTimeout(expectTimer); }
++/** defer: a sharper picture or another codec for shapes the phone already has; the box keeps it for the next session. */
++async function saveDisplay(target: Display, how: { defer?: boolean; reason: string }): Promise<boolean> {
+   if (displayBusy || !token) return false;
+   displayBusy = true; el<HTMLButtonElement>('apply').disabled = true; el<HTMLFieldSetElement>('display-fields').disabled = true;
+   el('display-status').textContent = t('applying');
++  // A renegotiation is coming: hold the layout from now, the session's end may arrive before this answer.
++  const restart = active && !how.defer && (!display || !sameStream(display, target));
++  if (restart) { expectRestart = true; window.clearTimeout(expectTimer); expectTimer = window.setTimeout(() => { endExpectRestart(); fit(); }, DISPLAY_HOLD_MS); }
+   try {
+-    const r = await fetch(`/api/display?token=${encodeURIComponent(token)}`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(target) });
+-    const body = await r.json() as {ok?:boolean}; if (!r.ok || !body.ok) throw new Error();
+-    display = target; el('display-status').textContent = t('applied'); return true;
+-  } catch { el('display-status').textContent = t('applyFail'); return false; }
++    const r = await fetch(`/api/display?token=${encodeURIComponent(token)}`, { method:'POST', headers:{'Content-Type':'application/json'},
++      body:JSON.stringify({ ...target, defer: how.defer === true, reason: how.reason }) });
++    const body = await r.json() as {ok?:boolean; deferred?:boolean}; if (!r.ok || !body.ok) throw new Error();
++    if (body.deferred) { if (display) display.pending = true; el('display-status').textContent = t('deferred'); return true; }
++    display = { ...target, pending: false }; el('display-status').textContent = t('applied'); return true;
++  } catch { if (restart) { endExpectRestart(); fit(); } el('display-status').textContent = t('applyFail'); return false; }
+   finally { displayBusy=false; el<HTMLButtonElement>('apply').disabled=false; el<HTMLFieldSetElement>('display-fields').disabled=false; render(); }
+ }
+ function scheduleAuto() {
+@@ -372,14 +398,27 @@ function scheduleAuto() {
+ async function adapt() {
+   // Not for a hidden page (a covered page reports a small window) nor while fullscreen waits for its tap; a timer
+   // set just before the car covered the page fired anyway and renegotiated to 800x400 (Chrome, 2026-10-12).
+-  if (!display || !autoFit.checked || displayBusy || document.hidden || (wantFullscreen && !document.fullscreenElement)) return;
+-  const plan=areaPlan(display,autoTarget(),wantHevc(),storedShapes());
++  const busy = () => !display || !autoFit.checked || displayBusy || document.hidden || (wantFullscreen && !document.fullscreenElement);
++  if (busy()) return;
++  // From the box's own, not what this page last saw: fps and size set by another page are kept, not sent back.
++  const current = await fetchDisplay();
++  if (current && !expectRestart && !holding) { display = current; showDisplay(); }
++  if (busy() || !display) return;
++  const urgent = urgentChange; urgentChange = '';
++  const target=autoTarget(), plan=areaPlan(display,target,wantHevc(),storedShapes());
+   if (!plan) return;
+   const next=plan.display,key=`${next.width}x${next.height}${next.hevc?'-h265':''}/${(next.areas??[]).map(a=>`${a.width}x${a.height}`).join(',')}/${next.area??0}`;
+   if (key===lastAutoTarget) return;
+   // Avoid a reconnect loop even when another viewer has a different screen shape.
+   lastAutoTarget=key;
+-  if (!(await saveDisplay(next))) { error(t('autoFail')); return; }
++  // A shape the phone has (only sharper, or another codec as this browser proved fast or slow) waits for the session to
++  // end; a new shape, the other orientation, a codec that failed or a change by hand renegotiates now.
++  const waits = !urgent && showsShape(display, target);
++  const reason = urgent || (waits ? 'quality' : 'shape');
++  // What waits is for the next session; the window's shape is shown now, by switching to its declared area.
++  const now = waits ? areaFor(display, target) : -1;
++  if (now >= 0 && now !== (display.area ?? 0) && !(await saveDisplay({ ...display, area: now }, { reason: 'area' }))) { error(t('autoFail')); return; }
++  if (!(await saveDisplay(next, { defer: waits, reason }))) { error(t('autoFail')); return; }
+   saveFlag('f50-view-areas', JSON.stringify(plan.shapes));
+   fit();
+ }
+@@ -396,13 +435,13 @@ function autoTarget() {
+   return suggestedResolution(screen.clientWidth*pixels,screen.clientHeight*pixels,fastDecoder()?2560:1920);
+ }
+ el<HTMLSelectElement>('codec').value = readFlag('f50-codec') || 'auto';
+-el<HTMLSelectElement>('codec').onchange=() => { saveFlag('f50-codec', el<HTMLSelectElement>('codec').value); lastAutoTarget=''; scheduleAuto(); };
+-autoFit.onchange=() => { localStorage.setItem('f50-auto-fit',String(autoFit.checked)); lastAutoTarget=''; render(); scheduleAuto(); };
++el<HTMLSelectElement>('codec').onchange=() => { saveFlag('f50-codec', el<HTMLSelectElement>('codec').value); lastAutoTarget=''; urgentChange='manual'; scheduleAuto(); };
++autoFit.onchange=() => { localStorage.setItem('f50-auto-fit',String(autoFit.checked)); lastAutoTarget=''; urgentChange='manual'; render(); scheduleAuto(); };
+ el<HTMLFormElement>('display-form').onsubmit=event => {
+   event.preventDefault();
+   const size=autoFit.checked?autoTarget():{width:Number(el<HTMLInputElement>('width').value),height:Number(el<HTMLInputElement>('height').value)};
+   if (![size.width,size.height].every(v=>Number.isInteger(v)&&v>=480&&v<=3840&&v%2===0)) { error(t('range')); return; }
+-  void saveDisplay({...size,fps:Number(el<HTMLSelectElement>('fps').value),uiScale:Number(el<HTMLSelectElement>('ui-scale').value),hevc:wantHevc()});
++  void saveDisplay({...size,fps:Number(el<HTMLSelectElement>('fps').value),uiScale:Number(el<HTMLSelectElement>('ui-scale').value),hevc:wantHevc()},{reason:'manual'});
+ };
+ new ResizeObserver(()=>{ fit(); scheduleAuto(); }).observe(screen);
+ document.addEventListener('visibilitychange',()=>{
+@@ -497,7 +536,7 @@ window.setInterval(() => {
+   const now = performance.now(), gap = now - lastTick, late = gap > 2500 && !hiddenMeanwhile;
+   lastTick = now; hiddenMeanwhile = document.hidden;
+   if (!token) return;
+-  if (holding && !late) { holdAwakeMs += Math.min(gap, 1000); if (holdAwakeMs > HOLD_MS) { holding = false; clearPicture(); render(); } }
++  if (holding && !late) { holdAwakeMs += Math.min(gap, 1000); if (holdAwakeMs > (holdForDisplay ? DISPLAY_HOLD_MS : HOLD_MS)) { holding = false; el('toast').hidden = true; clearPicture(); fit(); render(); } }
+   if (late) { lifeEvent(8, { gapMs: Math.round(gap) }); wake(1); }
+   else if (active && !document.hidden && now - lastHeard > 8000) revive();   // the link died while in view
+   else if (!document.hidden && closedAt && now - closedAt > RELOAD_AFTER_MS) reloadWhenBoxAnswers();
+diff --git a/web/src/protocol.ts b/web/src/protocol.ts
+index 8496179..c03eddb 100644
+--- a/web/src/protocol.ts
++++ b/web/src/protocol.ts
+@@ -103,6 +103,8 @@ export interface ServerMessage {
+   type: string;
+   deviceName?: string;
+   sessionActive?: boolean;
++  /** With sessionActive false: ended to apply a new display, the iPhone comes straight back. */
++  restarting?: boolean;
+   width?: number;
+   height?: number;
+   viewers?: number;

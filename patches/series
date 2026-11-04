@@ -80,3 +80,13 @@ playport-screen-read-deadline.patch
 playport-simple-settings.patch
 playport-audio-contiguous-queue.patch
 playport-wired-handoff-order.patch
+playport-touch-final-position.patch
+playport-codec-startup.patch
+playport-connection-recovery.patch
+playport-viewer-live-mode-sync.patch
+playport-wireless-session-recovery.patch
+playport-navigation-continuous-pcm.patch
+playport-browser-mode-sparse-flags.patch
+playport-active-phone-presence.patch
+playport-viewer-phone-disconnect.patch
+playport-phone-connection-confirmation.patch

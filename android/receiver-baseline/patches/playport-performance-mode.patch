@@ -1,0 +1,108 @@
+Viewer: a performance mode switch for the automatic size (2026-10-23).
+
+On (the default) each window is upsized to the sharpest size (long side 1280 to 1920/2560) and shrunk into
+the window: clear, heavier to decode. Off is the normal mode: the window's own size (CSS size times the
+pixels used) with a 720 minimum width, so the 2/3 window is 876 wide and the 1/3 720 instead of 490 (its
+UI is cramped below that); clarity may drop. Every window size change reconnects; the canvas is never
+shared. The Display hint says what each mode does.
+
+--- a/web/src/display-fit.ts
++++ b/web/src/display-fit.ts
+@@ -9,6 +9,15 @@
+   w *= grow; h *= grow;
+   return { width: Math.round(w / 2) * 2, height: Math.round(h / 2) * 2 };
+ }
++/** The window's own size for the normal mode (no upsize to 1280): the CSS size times the pixels used, a minimum
++ *  width of 720 (CarPlay's UI is cramped below that in the 1/3 split) and the same maximum (1920; 2560 with a fast
++ *  decoder). A larger window keeps its true size; clarity may drop. */
++export function windowResolution(width: number, height: number, max = 1920, minWidth = 720) {
++  const long = Math.max(width, height);
++  let factor = Math.max(1, minWidth / Math.max(1, width));
++  if (long * factor > max) factor = max / Math.max(1, long);
++  return { width: Math.round(width * factor / 2) * 2, height: Math.round(height * factor / 2) * 2 };
++}
+ export function aspectChanged(a: {width: number; height: number}, b: {width: number; height: number}) {
+   return Math.abs((a.width / a.height) / (b.width / b.height) - 1) > 0.025;
+ }
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -6,7 +6,7 @@
+ import { Connection } from './ws';
+ import { SystemMedia } from './media-session';
+ import { LagProbe } from './lag';
+-import { suggestedResolution, areaSize, sameStream, frameRateCheck, type Area } from './display-fit';
++import { suggestedResolution, windowResolution, areaSize, sameStream, frameRateCheck, type Area } from './display-fit';
+ import { t, language, setLanguage, type Key } from './i18n';
+ import { isNight, parseNightMode } from './night';
+ import { reachable, TESLA_HOPS } from './tesla-fullscreen';
+@@ -48,6 +48,11 @@
+ // Off (the default) follows the window; on keeps the typed width and height.
+ customSize.checked = localStorage.getItem('f50-auto-fit') === 'false';
+ const autoFitOn = () => !customSize.checked;
++/** Performance mode (the default): upsize each window to the sharpest size (long side at least 1280), then shrink it
++ *  into the window. Off: the window's own size (minimum width 720), lighter but softer. 2026-10-23, in Display. */
++const performanceMode = el<HTMLInputElement>('performance-mode');
++performanceMode.checked = readFlag('f50-performance-mode') !== '0';
++const performanceOn = () => performanceMode.checked;
+ const nightSelect = el<HTMLSelectElement>('night-mode');
+ nightSelect.value = parseNightMode(localStorage.getItem('f50-night-mode'));
+ const darkQuery = matchMedia('(prefers-color-scheme: dark)');
+@@ -437,11 +442,13 @@
+  *  session (2026-10-23: one stream shared by several window shapes made small windows soft and cramped). */
+ function autoTarget() {
+   const pixels=fastDecoder()?Math.min(2,Math.max(1,window.devicePixelRatio||1)):1;
+-  return suggestedResolution(screen.clientWidth*pixels,screen.clientHeight*pixels,fastDecoder()?2560:1920);
++  const max=fastDecoder()?2560:1920, width=screen.clientWidth*pixels, height=screen.clientHeight*pixels;
++  return performanceOn() ? suggestedResolution(width,height,max) : windowResolution(width,height,max);
+ }
+ el<HTMLSelectElement>('codec').value = readFlag('f50-codec') || 'auto';
+ el<HTMLSelectElement>('codec').onchange=() => { saveFlag('f50-codec', el<HTMLSelectElement>('codec').value); lastAutoTarget=''; urgentChange='manual'; scheduleAuto(); };
+ customSize.onchange=() => { localStorage.setItem('f50-auto-fit',String(!customSize.checked)); lastAutoTarget=''; urgentChange='manual'; render(); scheduleAuto(); };
++performanceMode.onchange=() => { saveFlag('f50-performance-mode',performanceMode.checked?'1':'0'); lastAutoTarget=''; urgentChange='manual'; scheduleAuto(); };
+ el<HTMLFormElement>('display-form').onsubmit=event => {
+   event.preventDefault();
+   // Automatic display keeps the box's current stream and changes only frame rate, size or codec; the areas are empty
+--- a/web/index.html
++++ b/web/index.html
+@@ -31,6 +31,7 @@
+   <div class="group">
+     <label class="cell"><span class="main"><b data-i18n="nightMode"></b><span id="night-status"></span></span><select id="night-mode"><option value="schedule" data-i18n="nightSchedule"></option><option value="system" data-i18n="nightSystem"></option><option value="day" data-i18n="nightDay"></option><option value="night" data-i18n="nightNight"></option></select></label>
+     <label class="cell"><span class="main"><b data-i18n="fullscreenButton"></b><span data-i18n="fullscreenButtonHint"></span></span><select id="fullscreen-button"><option value="top" data-i18n="cornerTop"></option><option value="bottom" data-i18n="cornerBottom"></option><option value="off" data-i18n="cornerOff"></option></select></label>
++    <label class="cell"><span class="main"><b data-i18n="performanceMode"></b><span data-i18n="performanceModeHint"></span></span><input id="performance-mode" class="switch" type="checkbox"/></label>
+     <label class="cell"><span class="main"><b data-i18n="customSize"></b><span data-i18n="customSizeHint"></span></span><input id="custom-size" class="switch" type="checkbox"/></label>
+     <label class="cell"><span class="main"><b data-i18n="debugHud"></b><span data-i18n="debugHudHint"></span></span><input id="debug-hud-on" class="switch" type="checkbox"/></label>
+     <label class="cell"><span class="main"><b data-i18n="compatDisplay"></b><span data-i18n="compatDisplayHint"></span></span><input id="compat-display-on" class="switch" type="checkbox"/></label>
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -2,7 +2,7 @@
+   settings: ['盒子设置', 'Box settings'], close: ['关闭', 'Close'], done: ['完成', 'Done'],
+   boxLink: ['添加 iPhone · 网络设置', 'Add iPhone · Network'], boxLinkHint: ['配对新手机、选择热点', 'Pair a phone, choose the hotspot'],
+   boxLinkHintLive: ['离开画面，配对手机、更换热点', 'Leaves the picture to pair phones or change the hotspot'],
+-  playerSettings: ['画面与声音', 'Display and sound'], displaySettings: ['画面参数', 'Display settings'], customSize: ['自定义分辨率', 'Custom resolution'], customSizeHint: ['关闭时跟随窗口', 'Off: follow the window'], language: ['语言', 'Language'],
++  playerSettings: ['画面与声音', 'Display and sound'], displaySettings: ['画面参数', 'Display settings'], performanceMode: ['性能模式', 'Performance mode'], performanceModeHint: ['开：先按最高分辨率放大再缩回窗口，更清楚但更吃解码；关：按窗口实际尺寸（最小宽度 720），清晰度可能下降', 'On: upsize then shrink into the window, sharper but heavier; off: the window own size (min width 720), clarity may drop'], customSize: ['自定义分辨率', 'Custom resolution'], customSizeHint: ['关闭时跟随窗口', 'Off: follow the window'], language: ['语言', 'Language'],
+   waiting: ['正在等待 iPhone', 'Waiting for iPhone'], waitingHint: ['已添加的 iPhone 打开蓝牙和 Wi-Fi 后会自动连接。第一次使用，请先添加 iPhone。', 'An added iPhone connects by itself with Bluetooth and Wi-Fi on. First time here? Add your iPhone.'],
+   connecting: ['正在连接盒子…', 'Connecting to receiver…'], reconnecting: ['连接中断，正在自动重连…', 'Disconnected. Reconnecting automatically…'],
+   starting: ['已连接，正在等待画面…', 'Connected. Waiting for video…'], live: ['已连接', 'Connected'],
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -6,7 +6,7 @@
+   const {outputText}=ts.transpileModule(source,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ESNext}});
+   return import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
+ }
+-const {suggestedResolution,windowShape,aspectChanged,shownSize,areaPlan,areaSize,areaFor,sameStream,showsShape,MAX_AREAS,frameRateCheck}=await load('display-fit');
++const {suggestedResolution,windowResolution,windowShape,aspectChanged,shownSize,areaPlan,areaSize,areaFor,sameStream,showsShape,MAX_AREAS,frameRateCheck}=await load('display-fit');
+ { // 60 fps the decoder cannot keep up with (Zeekr 7X): two 10 s reports in a row with two catch-ups each go to 30 fps.
+   let c=frameRateCheck(0,3,60);assert.deepEqual(c,{run:1,lower:false},'one report is not enough');
+   assert.deepEqual(frameRateCheck(c.run,2,60),{run:0,lower:true},'two in a row lower it');
+@@ -31,6 +31,11 @@
+ assert.deepEqual(suggestedResolution(3840,2160,2560),{width:2560,height:1440},'never beyond 2560');
+ assert.deepEqual(suggestedResolution(1254*1.53,784*1.53,2560),{width:1918,height:1200},'Tesla: same as before');
+ assert.deepEqual(suggestedResolution(2560,1440),{width:1920,height:1080},'1920 unless asked for more');
++// Normal mode: the window's own size, a 720 minimum width, the same maximum (2026-10-23).
++assert.deepEqual(windowResolution(876,518),{width:876,height:518},'a 2/3 window keeps its size');
++assert.deepEqual(windowResolution(490,580),{width:720,height:852},'the 1/3 window gets the minimum width');
++assert.deepEqual(windowResolution(1372,686),{width:1372,height:686},'the full window stays');
++assert.deepEqual(windowResolution(3840,2160),{width:1920,height:1080},'and the maximum still applies');
+ { // A Tesla page (2026-10-16 diagnosis): 1280x996 H.264 first, then the browser proves a fast decoder. Real pixels and
+   // H.265 for the same window are sharper only: that waits for the session to end. A new shape cannot wait.
+   const live={width:1280,height:996,fps:60,uiScale:100,hevc:false};

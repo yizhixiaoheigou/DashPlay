@@ -1,0 +1,199 @@
+diff --git a/web/index.html b/web/index.html
+index ca07724..2902f09 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -15,6 +15,7 @@
+   <label class="volume"><span data-i18n="volume"></span><output id="volume-value">100%</output><input id="volume" type="range" min="0" max="100" value="100"/></label>
+   <p id="audio-status" class="hint"></p>
+   <section><div class="section-title"><h3 data-i18n="display"></h3></div>
++  <label class="row"><span data-i18n="nightMode"></span><select id="night-mode"><option value="schedule" data-i18n="nightSchedule"></option><option value="system" data-i18n="nightSystem"></option><option value="day" data-i18n="nightDay"></option><option value="night" data-i18n="nightNight"></option></select></label><p id="night-status" class="hint" role="status"></p>
+   <label class="check"><input id="auto-fit" type="checkbox"/><span data-i18n="auto"></span></label><p class="hint" data-i18n="autoHint"></p>
+   <form id="display-form"><fieldset id="display-fields"><div class="pair"><label><span data-i18n="width"></span><input id="width" type="number" min="480" max="3840" step="2" required/></label><label><span data-i18n="height"></span><input id="height" type="number" min="480" max="3840" step="2" required/></label></div><div class="pair"><label><span data-i18n="ui"></span><select id="ui-scale"><option value="85" data-i18n="small"></option><option value="100" data-i18n="standard"></option><option value="115" data-i18n="large"></option></select></label><label><span data-i18n="fps"></span><select id="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label></div></fieldset><button id="apply" class="primary" data-i18n="apply"></button><p id="display-status" class="hint" role="status"></p></form></section>
+   <details><summary data-i18n="diagnostics"></summary><button id="browser-check-show" type="button">浏览器兼容性检测 / Browser check</button><p id="capabilities"></p><p id="media-support"></p><p id="stats"></p><p data-i18n="micHint"></p><p id="mic-status"></p><p class="hint" data-i18n="privacy"></p></details>
+diff --git a/web/check-car.mjs b/web/check-car.mjs
+index 993c162..0978b98 100644
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -54,4 +54,11 @@ function boxes(data){const result=[];for(let offset=0;offset<data.length;){const
+ assert.deepEqual(boxes(init),['ftyp','moov']);
+ assert.deepEqual(boxes(aacFragment(1,0,[new Uint8Array([1,2,3])])),['moof','mdat']);
+ assert.throws(()=>aacInit(48000,2,new Uint8Array()));
+-console.log('Car checks passed: aspect fit, media keys, disconnect state, single music route, MP4 framing.');
++const {isNight,parseNightMode}=await load('night');
++const at=(h,m)=>new Date(2026,9,10,h,m);
++assert.equal(parseNightMode(null),'schedule');assert.equal(parseNightMode('bogus'),'schedule');assert.equal(parseNightMode('system'),'system');
++assert.equal(isNight('schedule',at(18,29),true),false);assert.equal(isNight('schedule',at(18,30),false),true);
++assert.equal(isNight('schedule',at(0,0),false),true);assert.equal(isNight('schedule',at(6,29),false),true);assert.equal(isNight('schedule',at(6,30),true),false);
++assert.equal(isNight('system',at(12,0),true),true);assert.equal(isNight('system',at(23,0),false),false);
++assert.equal(isNight('day',at(23,0),true),false);assert.equal(isNight('night',at(12,0),false),true);
++console.log('Car checks passed: aspect fit, media keys, disconnect state, single music route, MP4 framing, night schedule.');
+diff --git a/web/src/main.ts b/web/src/main.ts
+index 44d4ded..1f218ee 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -6,6 +6,7 @@ import { Connection } from './ws';
+ import { SystemMedia } from './media-session';
+ import { fittedSize, suggestedResolution, aspectChanged } from './display-fit';
+ import { t, language, setLanguage, type Key } from './i18n';
++import { isNight, parseNightMode } from './night';
+ import type { ServerMessage, ClientMessage } from './protocol';
+ 
+ function el<T extends HTMLElement = HTMLElement>(id: string): T { return document.getElementById(id) as T; }
+@@ -25,6 +26,10 @@ interface Display { width: number; height: number; fps: number; uiScale: number;
+ let display: Display | null = null;
+ const autoFit = el<HTMLInputElement>('auto-fit');
+ autoFit.checked = localStorage.getItem('f50-auto-fit') !== 'false';
++const nightSelect = el<HTMLSelectElement>('night-mode');
++nightSelect.value = parseNightMode(localStorage.getItem('f50-night-mode'));
++const darkQuery = matchMedia('(prefers-color-scheme: dark)');
++let sentNight: boolean | null = null;
+ const volume = el<HTMLInputElement>('volume');
+ volume.value = String(Math.min(100, Math.max(0, Number(localStorage.getItem('playport-master') ?? 100) || 0)));
+ 
+@@ -43,6 +48,8 @@ function render() {
+   el<HTMLInputElement>('width').disabled = autoFit.checked;
+   el<HTMLInputElement>('height').disabled = autoFit.checked;
+   document.querySelectorAll<HTMLButtonElement>('[data-command]').forEach(b => { b.disabled = !active; });
++  const night = isNight(parseNightMode(nightSelect.value), new Date(), darkQuery.matches);
++  el('night-status').textContent = `${t('nightNow')}${t(night ? 'nightOn' : 'nightOff')}；${t(darkQuery.matches ? 'browserDark' : 'browserLight')}`;
+ }
+ function fit() {
+   const size = fittedSize(canvas.width, canvas.height, screen.clientWidth, screen.clientHeight);
+@@ -78,7 +85,15 @@ const connection = new Connection(token, {
+   },
+ });
+ const input = new InputController(canvas, send); input.attach();
++/** Sends CarPlay day/night only on change; a new session (sentNight reset) always gets the current value. */
++function syncNight() {
++  if (!active) return;
++  const night = isNight(parseNightMode(nightSelect.value), new Date(), darkQuery.matches);
++  if (night === sentNight) return;
++  sentNight = night; send({ type:'night', night });
++}
+ function reset() {
++  sentNight = null;
+   active = painted = false; input.reset(); canvas.inert = true;
+   video.close(); audio.stopAll(); media.setActive(false); void microphone.stop();
+   canvas.getContext('2d')?.clearRect(0,0,canvas.width,canvas.height);
+@@ -95,7 +110,7 @@ function server(message: ServerMessage) {
+   }
+   if (message.type !== 'session' && message.type !== 'hello') return;
+   if (!message.sessionActive) { reset(); state = 'waiting'; }
+-  else { active = true; canvas.inert = false; state = 'starting'; media.setActive(true); if(message.nowPlaying) media.setMetadata(message.nowPlaying); if(message.artwork) media.setArtwork(message.revision ?? 0,message.artwork); }
++  else { active = true; canvas.inert = false; state = 'starting'; media.setActive(true); syncNight(); if(message.nowPlaying) media.setMetadata(message.nowPlaying); if(message.artwork) media.setArtwork(message.revision ?? 0,message.artwork); }
+   render();
+ }
+ async function unlock() {
+@@ -189,10 +204,14 @@ new ResizeObserver(()=>{ fit(); scheduleAuto(); }).observe(screen);
+ document.addEventListener('visibilitychange',()=>{if(!document.hidden){fit();scheduleAuto();void unlock();}});
+ window.setInterval(()=>{
+   const now=performance.now(),fps=frames*1000/Math.max(1,now-lastStats);frames=0;lastStats=now;
+-  el('stats').textContent=painted?`${canvas.width} × ${canvas.height} / ${fps.toFixed(0)} fps`:t('noStream');
++  el('stats').textContent=painted?`${canvas.width} × ${canvas.height} / ${fps.toFixed(0)} fps / ${t('latency')} ${video.decodeLatencyMs.toFixed(0)} ms`:t('noStream');
+   el('audio-unlock').hidden=!active||audio.isUnlocked;
+   el('audio-status').textContent=t(audio.isPlaying?'playing':'paused');media.setPlaying(audio.isPlaying);
+ },750);
+ render();fit();if(token) connection.connect();
+ 
++nightSelect.onchange = () => { localStorage.setItem('f50-night-mode', nightSelect.value); syncNight(); render(); };
++darkQuery.addEventListener('change', () => { syncNight(); render(); });
++window.setInterval(() => { syncNight(); if (panel.open) render(); }, 30000);
++
+ el('browser-check-show').onclick = () => (window as unknown as { F50BrowserCheck: { show(): void } }).F50BrowserCheck.show();
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+index 544bcf7..b6d14b2 100644
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -8,6 +8,9 @@ const messages = {
+   display: ['画面', 'Display'], fullscreen: ['全屏', 'Fullscreen'], exitFullscreen: ['退出全屏', 'Exit fullscreen'], fullscreenFail: ['此浏览器不允许全屏，画面仍会自动适配窗口。', 'Fullscreen unavailable. The picture still fits this window.'],
+   auto: ['自动匹配屏幕比例', 'Match screen aspect ratio automatically'], autoHint: ['仅此显示端启用。比例变化时重新协商画面，最多 1920 像素长边；可能短暂重连。', 'Enable on one display only. Aspect changes renegotiate video, up to 1920 pixels on the long edge, and may briefly reconnect.'],
+   width: ['宽度', 'Width'], height: ['高度', 'Height'], apply: ['应用并重连', 'Apply and reconnect'],
++  nightMode: ['夜间模式', 'Night mode'], nightSchedule: ['自动（18:30–06:30 为夜间）', 'Auto (night 18:30–06:30)'], nightSystem: ['跟随车机浏览器深色模式', 'Follow car browser dark mode'], nightDay: ['始终白天', 'Always day'], nightNight: ['始终夜间', 'Always night'],
++  nightNow: ['当前请求：', 'Requested now: '], nightOn: ['夜间', 'night'], nightOff: ['白天', 'day'], browserDark: ['车机浏览器报告深色模式', 'Car browser reports dark mode'], browserLight: ['车机浏览器报告浅色模式', 'Car browser reports light mode'],
++  latency: ['解码延迟', 'Decode delay'],
+   ui: ['界面大小', 'UI size'], fps: ['帧率', 'Frame rate'], standard: ['标准', 'Standard'], large: ['大', 'Large'], small: ['小', 'Small'],
+   loading: ['正在读取…', 'Loading…'], applying: ['正在应用…', 'Applying…'], applied: ['已保存，正在重新连接 CarPlay。', 'Saved. Reconnecting CarPlay.'],
+   loadFail: ['读取失败，请检查盒子连接后重试。', 'Could not load settings. Check the receiver connection and retry.'],
+diff --git a/web/src/video.ts b/web/src/video.ts
+index 9df3edb..3d6b990 100644
+--- a/web/src/video.ts
++++ b/web/src/video.ts
+@@ -45,6 +45,9 @@ export class VideoPlayer {
+ 
+   /** Timestamp of the most recent frame arrival; used for the latency readout. */
+   lastArrivalAt = 0;
++  /** Smoothed time from frame arrival to canvas paint (decoder delay), in ms. */
++  decodeLatencyMs = 0;
++  private readonly arrivals = new Map<number, number>();
+ 
+   configure(message: VideoConfigMessage): void {
+     void this.configureAsync(message);
+@@ -81,6 +84,7 @@ export class VideoPlayer {
+       codedWidth: message.width,
+       codedHeight: message.height,
+       hardwareAcceleration: this.preferHardware ? 'prefer-hardware' : 'no-preference',
++      optimizeForLatency: true,
+       ...(descriptionPresent ? { description: message.codecData } : {}),
+     };
+     const decoder = this.createDecoder();
+@@ -101,6 +105,7 @@ export class VideoPlayer {
+         codedWidth: message.width,
+         codedHeight: message.height,
+         hardwareAcceleration: candidate.software ? 'no-preference' : 'prefer-hardware',
++        optimizeForLatency: true,
+         ...(candidate.description ? { description: candidate.description } : {}),
+       };
+       const support = await VideoDecoder.isConfigSupported(config).catch(() => null);
+@@ -146,6 +151,8 @@ export class VideoPlayer {
+     const data = state.usesDescription ? annexBToAvcc(message.data) : message.data;
+     if (data.length === 0) return;
+     state.timestampUs += state.frameIntervalUs;
++    this.arrivals.set(state.timestampUs, this.lastArrivalAt);
++    if (this.arrivals.size > 120) this.arrivals.delete(this.arrivals.keys().next().value!);
+     try {
+       state.decoder.decode(
+         new EncodedVideoChunk({
+@@ -162,6 +169,7 @@ export class VideoPlayer {
+   close(): void {
+     const state = this.state;
+     this.state = null;
++    this.arrivals.clear();
+     this.clearWatchdog();
+     if (state) {
+       try {
+@@ -231,6 +239,12 @@ export class VideoPlayer {
+       this.onResolutionChange(frame.displayWidth, frame.displayHeight);
+     }
+     context.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
++    const arrived = this.arrivals.get(frame.timestamp);
++    if (arrived !== undefined) {
++      this.arrivals.delete(frame.timestamp);
++      const latency = performance.now() - arrived;
++      this.decodeLatencyMs = this.decodeLatencyMs ? this.decodeLatencyMs * 0.9 + latency * 0.1 : latency;
++    }
+     this.onFrame();
+   }
+ 
+diff --git a/web/src/night.ts b/web/src/night.ts
+new file mode 100644
+index 0000000..e776219
+--- /dev/null
++++ b/web/src/night.ts
+@@ -0,0 +1,17 @@
++/** CarPlay day/night appearance requested by this display. CarPlay itself switches maps and UI. */
++export type NightMode = 'schedule' | 'system' | 'day' | 'night';
++export const NIGHT_START = 18 * 60 + 30;
++export const NIGHT_END = 6 * 60 + 30;
++
++export function parseNightMode(value: string | null): NightMode {
++  return value === 'system' || value === 'day' || value === 'night' ? value : 'schedule';
++}
++
++/** schedule: 18:30–06:30 local time; system: the car browser's dark/light preference. */
++export function isNight(mode: NightMode, now: Date, prefersDark: boolean): boolean {
++  if (mode === 'day') return false;
++  if (mode === 'night') return true;
++  if (mode === 'system') return prefersDark;
++  const minutes = now.getHours() * 60 + now.getMinutes();
++  return minutes >= NIGHT_START || minutes < NIGHT_END;
++}

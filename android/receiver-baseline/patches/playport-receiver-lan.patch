@@ -1,0 +1,39 @@
+diff --git a/server/src/main/kotlin/com/playport/server/Main.kt b/server/src/main/kotlin/com/playport/server/Main.kt
+index 049f098..bf94371 100644
+--- a/server/src/main/kotlin/com/playport/server/Main.kt
++++ b/server/src/main/kotlin/com/playport/server/Main.kt
+@@ -40,7 +40,7 @@ fun main(args: Array<String>) {
+     val webRoot = Path.of("web/dist").toAbsolutePath().normalize()
+     val tls = TlsCertificate.loadOrCreate(config.stateDir, listOf(server.bindAddress))
+     val http = if (config.insecureHttp) {
+-        embeddedServer(Netty, port = config.httpPort, host = "0.0.0.0") {
++        embeddedServer(Netty, port = config.httpPort, host = server.bindAddress.hostAddress) {
+             server.hub.install(this, webRoot)
+         }
+     } else {
+@@ -49,7 +49,7 @@ fun main(args: Array<String>) {
+             environment = applicationEnvironment { },
+             configure = {
+                 sslConnector(tls.keyStore, tls.alias, { tls.password }, { tls.password }) {
+-                    host = "0.0.0.0"
++                    host = server.bindAddress.hostAddress
+                     port = config.httpPort
+                 }
+             },
+diff --git a/web/package-lock.json b/web/package-lock.json
+index a4646c2..6cf5d56 100644
+--- a/web/package-lock.json
++++ b/web/package-lock.json
+@@ -721,9 +721,9 @@
+       }
+     },
+     "node_modules/source-map-js": {
+-      "version": "1.2.1",
+-      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.1.tgz",
+-      "integrity": "sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==",
++      "version": "1.2.2",
++      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.2.tgz",
++      "integrity": "sha512-KGj/8Y43x35aZVDtt+J4mK1hoLGHULMYfSkODJNQjNDC3oW1PqPoxMwo0pLUsWM/UEGzON/NxeHywEfNXNP3Vw==",
+       "dev": true,
+       "license": "BSD-3-Clause",
+       "engines": {

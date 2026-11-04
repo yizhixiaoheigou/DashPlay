@@ -6,8 +6,8 @@ import android.net.wifi.WifiManager
 /**
  * The SSID this device is actually joined to, or null when it cannot be read.
  *
- * Reading the SSID needs a location permission on Android 8–12 and NEARBY_WIFI_DEVICES on 13+; both are declared for
- * the phone scan, so on a phone we normally get a value. A box that is not on Wi-Fi, or a ROM that hides it, returns
+ * SSID is location-sensitive on modern Android too. Nearby-device consent alone may still return UNKNOWN_SSID;
+ * setup can request foreground location permission or let the user enter the network explicitly. A box that is not on Wi-Fi, or a ROM that hides it, returns
  * null and the setup screen falls back to asking the user (never invent a name).
  */
 object CurrentWifi {
@@ -23,6 +23,6 @@ object CurrentWifi {
     /** True when the stored name matches what the device is on; null when we cannot tell. */
     fun matches(context: Context, stored: String): Boolean? {
         val current = ssid(context) ?: return null
-        return current.equals(stored.trim(), ignoreCase = true)
+        return current == stored.trim()
     }
 }

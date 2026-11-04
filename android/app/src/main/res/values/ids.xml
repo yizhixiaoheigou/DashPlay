@@ -29,6 +29,9 @@
     <item name="tls_disable" type="id" />
     <item name="row_tesla_access" type="id" />
     <item name="tesla_root_enable" type="id" />
+    <item name="compat_http" type="id" />
+    <item name="compat_http_port" type="id" />
+    <item name="compat_http_save" type="id" />
     <item name="tesla_root_disable" type="id" />
     <item name="row_phones" type="id" />
     <item name="row_usb" type="id" />
@@ -54,4 +57,7 @@
     <item name="row_device" type="id" />
     <item name="row_licenses" type="id" />
     <item name="add_iphone" type="id" />
+    <item name="usb_setup_done" type="id" />
+    <item name="probe_start" type="id" />
+    <item name="probe_stop" type="id" />
 </resources>

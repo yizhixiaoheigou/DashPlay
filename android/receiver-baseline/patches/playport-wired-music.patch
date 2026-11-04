@@ -1,0 +1,245 @@
+Wired music without crackle and with media controls (2026-10-12).
+
+The wired iPhone sends music as 48 kHz LPCM on stream 100; Web Audio stitched 7 ms buffers (crackles
+every few seconds in the car) and the head unit saw no media session. The LPCM is now framed
+losslessly as FLAC (VERBATIM subframes) in fragmented MP4 and played by the same media element as
+stream 102 AAC; browsers without FLAC in MSE keep the Web Audio path. check-flac.mjs proves the
+framing bit-exact with ffmpeg.
+
+--- a/web/package.json
++++ b/web/package.json
+@@ -5,7 +5,7 @@
+   "type": "module",
+   "scripts": {
+     "dev": "vite",
+-    "test": "node check.mjs && node check-audio.mjs && node check-car.mjs && node check-browser.mjs",
++    "test": "node check.mjs && node check-audio.mjs && node check-car.mjs && node check-browser.mjs && node check-flac.mjs",
+     "build": "tsc && vite build",
+     "preview": "vite preview"
+   },
+--- a/web/src/audio.ts
++++ b/web/src/audio.ts
+@@ -80,9 +80,14 @@
+       nextPlayTime: 0,
+       gain: streamGain,
+     };
+-    if (message.codec === AudioCodec.AacLc && message.name === 'media' && MusicOutput.supported()) {
++    // Music through a media element: AAC (stream 102, wireless) as sent; the wired iPhone's LPCM
++    // (stream 100) losslessly as FLAC, since 7 ms Web Audio buffers crackled and gave the head unit no
++    // media session (2026-10-12). Other LPCM (calls, Siri, alerts) stays on Web Audio for low latency.
++    const kind = message.name !== 'media' ? null : message.codec === AudioCodec.AacLc ? 'aac'
++      : message.codec === AudioCodec.Lpcm && message.channels <= 2 && [44100, 48000].includes(message.sampleRate) ? 'flac' : null;
++    if (kind && MusicOutput.supported(kind)) {
+       try {
+-        state.music = (this.retainedMusic && this.retainedConfig === JSON.stringify([message.sampleRate,message.channels,Array.from(message.description)]) ? this.retainedMusic : new MusicOutput(message, this.onError));
++        state.music = (this.retainedMusic && this.retainedConfig === MusicOutput.key(message, kind) ? this.retainedMusic : new MusicOutput(message, this.onError, kind));
+         if (this.retainedMusic && this.retainedMusic !== state.music) this.retainedMusic.close();
+         this.retainedMusic = null;
+         state.music.volume(this.masterVolume * (this.streamGains.get(state.name) ?? 1));
+--- a/web/src/music-output.ts
++++ b/web/src/music-output.ts
+@@ -1,9 +1,13 @@
+ import { aacInit, aacFragment } from './aac-mp4';
++import { FLAC_BLOCK, FLAC_MIME, flacFragment, flacFrame, flacInit } from './flac-mp4';
+ import type { AudioConfigMessage } from './protocol';
+-const mime='audio/mp4; codecs="mp4a.40.2"';
++/** aac: stream 102's AAC as sent. flac: the wired iPhone's LPCM, losslessly framed (flac-mp4.ts). */
++export type MusicKind = 'aac' | 'flac';
++const MIMES: Record<MusicKind,string> = { aac: 'audio/mp4; codecs="mp4a.40.2"', flac: FLAC_MIME };
+ /** A real HTML media timeline makes received music eligible for OS media controls. */
+ export class MusicOutput {
+-  static supported() { return typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(mime); }
++  static supported(kind: MusicKind = 'aac') { return typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(MIMES[kind]); }
++  static key(config: AudioConfigMessage, kind: MusicKind) { return JSON.stringify([kind,config.sampleRate,config.channels,Array.from(config.description)]); }
+   readonly element=document.createElement('audio');
+   private readonly source=new MediaSource();
+   private readonly url=URL.createObjectURL(this.source);
+@@ -15,25 +19,30 @@
+   private closed=false;
+   private lastPacket=-Infinity;
+   private running=false;
++  private pcm:Uint8Array[]=[];
++  private pcmBytes=0;
++  private block=0;
++  private readonly rate:number;
++  private readonly channels:number;
+   readonly configKey: string;
+-  constructor(config:AudioConfigMessage,private readonly onError:(message:string)=>void) {
+-    this.configKey=JSON.stringify([config.sampleRate,config.channels,Array.from(config.description)]);
++  constructor(config:AudioConfigMessage,private readonly onError:(message:string)=>void,private readonly kind:MusicKind='aac') {
++    this.configKey=MusicOutput.key(config,kind);this.rate=config.sampleRate;this.channels=config.channels;
+     this.element.id='carplay-music';this.element.hidden=true;this.element.setAttribute('playsinline','');this.element.src=this.url;
+     document.body.append(this.element);
+     this.element.addEventListener('playing',()=>{this.running=true;});
+     this.element.addEventListener('waiting',()=>{this.running=false;});
+     this.element.addEventListener('pause',()=>{this.running=false;});
+     this.element.addEventListener('error',()=>{if(!this.closed)this.onError('Music playback: '+(this.element.error?.message||'media error'));});
+-    this.pending.push(aacInit(config.sampleRate,config.channels,config.description));
++    this.pending.push(kind==='flac'?flacInit(config.sampleRate,config.channels):aacInit(config.sampleRate,config.channels,config.description));
+     this.source.addEventListener('sourceopen',()=>{
+       if(this.closed)return;
+-      try { this.buffer=this.source.addSourceBuffer(mime);this.buffer.addEventListener('updateend',()=>this.pump());this.buffer.addEventListener('error',()=>this.onError('Music buffer decode error'));this.pump(); }
++      try { this.buffer=this.source.addSourceBuffer(MIMES[this.kind]);this.buffer.addEventListener('updateend',()=>this.pump());this.buffer.addEventListener('error',()=>this.onError('Music buffer decode error'));this.pump(); }
+       catch(error){this.onError(String(error));}
+     },{once:true});
+   }
+   get unlocked(){return !this.element.paused;}
+   get playing(){return this.running&&!this.element.paused&&performance.now()-this.lastPacket<1800;}
+-  pause(){this.element.pause();this.running=false;this.frames=[];}
++  pause(){this.element.pause();this.running=false;this.frames=[];this.pcm=[];this.pcmBytes=0;}
+   unlock(){
+     if(this.element.paused && this.buffer?.buffered.length) this.element.currentTime=this.buffer.buffered.end(this.buffer.buffered.length-1);
+     return this.element.play();
+@@ -41,12 +50,30 @@
+   volume(value:number){this.element.volume=Math.max(0,Math.min(1,value));}
+   packet(data:Uint8Array){
+     if(this.closed)return;
++    if(this.kind==='flac'){this.pcmPacket(data);return;}
+     this.lastPacket=performance.now();this.frames.push(data.slice());
+     if(this.frames.length<20)return;
+     this.pending.push(aacFragment(this.sequence++,this.samples,this.frames));this.samples+=1024*this.frames.length;this.frames=[];
+     if(this.pending.length>12){this.onError('Music buffer is not advancing');this.close();return;}
+     this.pump();
+   }
++  /** LPCM packets (352 samples each) are cut into fixed FLAC_BLOCK blocks, one MP4 fragment each. */
++  private pcmPacket(data:Uint8Array){
++    this.lastPacket=performance.now();this.pcm.push(data.slice());this.pcmBytes+=data.length;
++    const step=FLAC_BLOCK*this.channels*2;
++    while(this.pcmBytes>=step){
++      const block=new Uint8Array(step);let filled=0;
++      while(filled<step){
++        const head=this.pcm[0],take=Math.min(head.length,step-filled);
++        block.set(head.subarray(0,take),filled);filled+=take;
++        if(take===head.length)this.pcm.shift();else this.pcm[0]=head.subarray(take);
++      }
++      this.pcmBytes-=step;
++      this.pending.push(flacFragment(this.sequence++,this.samples,flacFrame(this.block++,this.rate,this.channels,block),FLAC_BLOCK));this.samples+=FLAC_BLOCK;
++    }
++    if(this.pending.length>12){this.onError('Music buffer is not advancing');this.close();return;}
++    this.pump();
++  }
+   private pump(){
+     const b=this.buffer;if(this.closed||!b||b.updating||this.source.readyState!=='open')return;
+     try {
+@@ -59,6 +86,6 @@
+     }catch(error){this.onError(String(error));}
+   }
+   close(){
+-    if(this.closed)return;this.closed=true;this.element.pause();this.element.removeAttribute('src');this.element.load();this.element.remove();URL.revokeObjectURL(this.url);this.pending=[];this.frames=[];
++    if(this.closed)return;this.closed=true;this.element.pause();this.element.removeAttribute('src');this.element.load();this.element.remove();URL.revokeObjectURL(this.url);this.pending=[];this.frames=[];this.pcm=[];this.pcmBytes=0;
+   }
+ }
+--- /dev/null
++++ b/web/src/flac-mp4.ts
+@@ -0,0 +1,75 @@
++/**
++ * Lossless ISO-BMFF framing for the wired iPhone's 16-bit LPCM music: each block becomes a FLAC frame
++ * with VERBATIM subframes (the samples as they are, no compression), so the browser's media element
++ * (MSE, "fLaC" in MP4) plays it like stream 102's AAC: buffered, no Web Audio stitching, and eligible
++ * for the head unit's media controls.
++ */
++const join = (...parts: Uint8Array[]) => { const b=new Uint8Array(parts.reduce((n,p)=>n+p.length,0));let i=0;for(const p of parts){b.set(p,i);i+=p.length;}return b; };
++const text = (s:string) => new TextEncoder().encode(s);
++const u32 = (...values:number[]) => { const b=new Uint8Array(values.length*4);const v=new DataView(b.buffer);values.forEach((x,i)=>v.setUint32(i*4,x));return b; };
++const u16 = (...values:number[]) => { const b=new Uint8Array(values.length*2);const v=new DataView(b.buffer);values.forEach((x,i)=>v.setUint16(i*2,x));return b; };
++const zeros = (n:number) => new Uint8Array(n);
++const box = (type:string,...parts:Uint8Array[]) => { const data=join(...parts);return join(u32(data.length+8),text(type),data); };
++const full = (type:string,flags:number,...parts:Uint8Array[]) => box(type,u32(flags),...parts);
++const matrix = u32(0x10000,0,0,0,0x10000,0,0,0,0x40000000);
++
++export const FLAC_MIME = 'audio/mp4; codecs="flac"';
++/** Samples per FLAC frame / MP4 fragment: ~85 ms at 48 kHz, 11-12 of the iPhone's 352-sample packets. */
++export const FLAC_BLOCK = 4096;
++
++const RATE_CODES: Record<number,number> = { 88200:1, 176400:2, 192000:3, 8000:4, 16000:5, 22050:6, 24000:7, 32000:8, 44100:9, 48000:10, 96000:11 };
++
++function crc8(data:Uint8Array):number { let c=0;for(const byte of data){c^=byte;for(let i=0;i<8;i++)c=c&0x80?((c<<1)^0x07)&0xff:(c<<1)&0xff;}return c; }
++function crc16(data:Uint8Array):number { let c=0;for(const byte of data){c^=byte<<8;for(let i=0;i<8;i++)c=c&0x8000?((c<<1)^0x8005)&0xffff:(c<<1)&0xffff;}return c; }
++
++/** FLAC's UTF-8-like coding of the frame number (fixed block size stream). */
++function codedNumber(n:number):number[] {
++  if(n<0x80)return [n];
++  const tail:number[]=[];let k=0;
++  do { tail.unshift(0x80|(n&0x3f));n=Math.floor(n/64);k++; } while(n>=(1<<(6-k)));
++  return [((0xff<<(7-k))&0xff)|n,...tail];
++}
++
++function streamInfo(rate:number,channels:number,block:number):Uint8Array {
++  const b=new Uint8Array(34);const v=new DataView(b.buffer);
++  v.setUint16(0,block);v.setUint16(2,block);   // min/max block size; frame sizes 0 = unknown
++  // 20-bit sample rate, 3-bit channels-1, 5-bit bits-per-sample-1, 36-bit total samples (0 = unknown)
++  b[10]=(rate>>>12)&0xff;b[11]=(rate>>>4)&0xff;b[12]=((rate&0x0f)<<4)|((channels-1)<<1)|((16-1)>>>4);b[13]=((16-1)&0x0f)<<4;
++  return b;   // MD5 left zero: unknown
++}
++
++export function flacInit(rate:number,channels:number):Uint8Array {
++  if(!(rate in RATE_CODES)||rate>65535||channels<1||channels>2) throw new Error('Unsupported LPCM configuration');
++  const dfLa=full('dfLa',0,new Uint8Array([0x80,0,0,34]),streamInfo(rate,channels,FLAC_BLOCK));   // last block: STREAMINFO
++  const fLaC=box('fLaC',zeros(6),u16(1),zeros(8),u16(channels,16,0,0),u32(rate*65536),dfLa);
++  const stbl=box('stbl',full('stsd',0,u32(1),fLaC),full('stts',0,u32(0)),full('stsc',0,u32(0)),full('stsz',0,u32(0,0)),full('stco',0,u32(0)));
++  const dinf=box('dinf',full('dref',0,u32(1),full('url ',1)));
++  const mdia=box('mdia',full('mdhd',0,u32(0,0,rate,0),u16(0x55c4,0)),full('hdlr',0,u32(0),text('soun'),zeros(12),text('DashPlay Audio\0')),box('minf',full('smhd',0,u16(0,0)),dinf,stbl));
++  const trak=box('trak',full('tkhd',7,u32(0,0,1,0,0),zeros(8),u16(0,0,0x100,0),matrix,u32(0,0)),mdia);
++  const mvhd=full('mvhd',0,u32(0,0,rate,0,0x10000),u16(0x100,0),zeros(8),matrix,zeros(24),u32(2));
++  return join(box('ftyp',text('isom'),u32(0x200),text('isomiso6mp41')),box('moov',mvhd,trak,box('mvex',full('trex',0,u32(1,1,FLAC_BLOCK,0,0)))));
++}
++
++/** One FLAC frame (always FLAC_BLOCK samples: a fixed-block-size stream) from interleaved little-endian
++ *  16-bit samples, as the receiver sends LPCM. */
++export function flacFrame(number:number,rate:number,channels:number,pcm:Uint8Array):Uint8Array {
++  const frames=Math.floor(pcm.length/(2*channels));
++  if(frames<1||frames>65536)throw new Error('FLAC block size out of range');
++  const header=new Uint8Array([0xff,0xf8,(0b0111<<4)|RATE_CODES[rate],((channels-1)<<4)|(0b100<<1),...codedNumber(number),((frames-1)>>8)&0xff,(frames-1)&0xff]);
++  const out=new Uint8Array(header.length+1+channels*(1+2*frames)+2);
++  out.set(header);out[header.length]=crc8(header);
++  const src=new DataView(pcm.buffer,pcm.byteOffset,pcm.byteLength),dst=new DataView(out.buffer);
++  let at=header.length+1;
++  for(let channel=0;channel<channels;channel++){
++    out[at++]=0x02;   // subframe: VERBATIM, no wasted bits
++    for(let i=0;i<frames;i++,at+=2)dst.setInt16(at,src.getInt16((i*channels+channel)*2,true));
++  }
++  dst.setUint16(at,crc16(out.subarray(0,at)));
++  return out;
++}
++
++export function flacFragment(sequence:number,sampleTime:number,frame:Uint8Array,samples:number):Uint8Array {
++  const make=(offset:number)=>box('moof',full('mfhd',0,u32(sequence)),box('traf',full('tfhd',0x020000,u32(1)),full('tfdt',0x01000000,u32(Math.floor(sampleTime/4294967296),sampleTime>>>0)),full('trun',0x301,u32(1,offset),u32(samples,frame.length))));
++  const preliminary=make(0),moof=make(preliminary.length+8);
++  return join(moof,box('mdat',frame));
++}
+--- /dev/null
++++ b/web/check-flac.mjs
+@@ -0,0 +1,33 @@
++// FLAC-in-MP4 framing of the wired iPhone's LPCM must be lossless and decodable: wrap 300 blocks of
++// random stereo PCM (frame numbers beyond one byte), decode with ffmpeg, compare byte for byte.
++import assert from 'node:assert/strict';
++import { execFileSync } from 'node:child_process';
++import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import ts from 'typescript';
++const source = readFileSync(new URL('./src/flac-mp4.ts', import.meta.url), 'utf8');
++const { outputText } = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } });
++const { flacInit, flacFrame, flacFragment, FLAC_BLOCK } = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
++const rate = 48000, channels = 2, blocks = 300;
++const pcm = new Uint8Array(blocks * FLAC_BLOCK * channels * 2);
++let seed = 12345;
++for (let i = 0; i < pcm.length; i++) { seed = (seed * 1103515245 + 12345) >>> 0; pcm[i] = seed >>> 24; }
++const parts = [flacInit(rate, channels)];
++const step = FLAC_BLOCK * channels * 2;
++for (let n = 0; n < blocks; n++) {
++  parts.push(flacFragment(n + 1, n * FLAC_BLOCK, flacFrame(n, rate, channels, pcm.subarray(n * step, (n + 1) * step)), FLAC_BLOCK));
++}
++const dir = mkdtempSync(join(tmpdir(), 'flac-check-'));
++const file = join(dir, 'lpcm.mp4');
++writeFileSync(file, Buffer.concat(parts));
++let decoded;
++try {
++  decoded = execFileSync('ffmpeg', ['-v', 'error', '-i', file, '-f', 's16le', '-acodec', 'pcm_s16le', '-'], { maxBuffer: 1 << 26 });
++} catch (error) {
++  if (error.code === 'ENOENT') { console.log('FLAC check skipped: ffmpeg not installed'); process.exit(0); }
++  throw error;
++}
++assert.equal(decoded.length, pcm.length, 'every sample comes back');
++assert.ok(Buffer.from(pcm).equals(decoded), 'samples are bit-exact');
++console.log(`FLAC framing: ${blocks} blocks (${(blocks * FLAC_BLOCK / rate).toFixed(1)} s) decoded bit-exact by ffmpeg`);

@@ -1,0 +1,536 @@
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -239,6 +239,20 @@
+         return null
+     }
+ 
++    /** Viewer action: persist the same manual pause as the settings page before ending the live owner. */
++    @Synchronized
++    fun pausePhone(address: String): String? {
++        if (presenceHelper == null) return "unsupported"
++        val phone = PhoneList.normalize(address)
++        if (!PhoneList.ADDRESS.matches(phone)) return "invalid"
++        if (closed.get()) return "closed"
++        if (cablePhone || switchingTo != null) return "busy"
++        if (connectedWirelessPhone != phone || activeSession == null || activeSession !== connectedSession)
++            return "not-active"
++        if (!presence("pause", phone)) return "pause-failed"
++        return if (disconnectPhone(phone)) null else "busy"
++    }
++
+     /** Settings-page request: stop only this wireless owner, after the helper has paused its invitations. */
+     @Synchronized
+     private fun disconnectPhone(phone: String): Boolean {
+@@ -410,6 +424,7 @@
+         hub.onPhones = { withWiredRow(phonesJson()) }
+         hub.onSwitchCable = ::switchToCable
+         hub.onSwitchPhone = ::switchPhone
++        hub.onDisconnectPhone = ::pausePhone
+         hub.onMicrophoneData = { opus, payload -> bridge.sendMicrophonePayload(payload, opus) }
+         hub.onViewerJoined = { streamType ->
+             if (bridge.hasRecoveryHandler) {
+diff --git a/server/src/main/kotlin/com/playport/server/WebHub.kt b/server/src/main/kotlin/com/playport/server/WebHub.kt
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -247,6 +247,7 @@
+ 
+     /** Explicitly switch CarPlay to a paired phone: null on success, or an error code for the page. */
+     @Volatile var onSwitchPhone: ((String) -> String?)? = null
++    @Volatile var onDisconnectPhone: ((String) -> String?)? = null
+ 
+     /** Move CarPlay onto the USB cable (the viewer's wired row): null on success, or an error code. */
+     @Volatile var onSwitchCable: (() -> String?)? = null
+@@ -508,48 +509,56 @@
+                     ?: PhoneList.body(supported = false, raw = null)
+                 call.respondText(body, io.ktor.http.ContentType.Application.Json)
+             }
+-            post("/api/phones/switch") {
+-                if (call.request.queryParameters["token"] != config.accessToken || !call.fromOwnPage()) {
+-                    call.respondText(
+-                        """{"error":"invalid token"}""",
+-                        io.ktor.http.ContentType.Application.Json,
+-                        io.ktor.http.HttpStatusCode.Forbidden,
+-                    )
+-                    return@post
+-                }
+-                val request = try {
+-                    json.decodeFromString(PhoneSwitchRequest.serializer(), call.receiveText())
+-                } catch (_: Exception) {
+-                    call.respondText(
+-                        """{"error":"invalid"}""",
+-                        io.ktor.http.ContentType.Application.Json,
+-                        io.ktor.http.HttpStatusCode.BadRequest,
+-                    )
+-                    return@post
+-                }
+-                val cableSwitch = onSwitchCable
+-                val switcher: ((String) -> String?)? = if (request.cable) cableSwitch?.let { s -> { _: String -> s() } }
+-                    else onSwitchPhone
+-                if (switcher == null) {
+-                    call.respondText(
+-                        json.encodeToString(PhoneSwitchError.serializer(), PhoneSwitchError("unsupported")),
+-                        io.ktor.http.ContentType.Application.Json,
+-                        io.ktor.http.HttpStatusCode.Conflict,
+-                    )
+-                    return@post
+-                }
+-                val error = withContext(Dispatchers.IO) { switcher.invoke(PhoneList.normalize(request.address)) }
+-                if (error != null) {
+-                    val code = if (error == "invalid") io.ktor.http.HttpStatusCode.BadRequest
+-                        else io.ktor.http.HttpStatusCode.Conflict
+-                    call.respondText(
+-                        json.encodeToString(PhoneSwitchError.serializer(), PhoneSwitchError(error)),
+-                        io.ktor.http.ContentType.Application.Json,
+-                        code,
+-                    )
+-                    return@post
+-                }
+-                call.respondText("""{"ok":true}""", io.ktor.http.ContentType.Application.Json)
++            for (action in listOf("switch", "disconnect")) {
++                post("/api/phones/$action") {
++                    if (call.request.queryParameters["token"] != config.accessToken || !call.fromOwnPage()) {
++                        call.respondText(
++                            """{"error":"invalid token"}""",
++                            io.ktor.http.ContentType.Application.Json,
++                            io.ktor.http.HttpStatusCode.Forbidden,
++                        )
++                        return@post
++                    }
++                    val request = try {
++                        json.decodeFromString(PhoneSwitchRequest.serializer(), call.receiveText())
++                    } catch (_: Exception) {
++                        call.respondText(
++                            """{"error":"invalid"}""",
++                            io.ktor.http.ContentType.Application.Json,
++                            io.ktor.http.HttpStatusCode.BadRequest,
++                        )
++                        return@post
++                    }
++                    if (action == "disconnect" && (request.cable || !PhoneList.ADDRESS.matches(PhoneList.normalize(request.address)))) {
++                        call.respondText("""{"error":"invalid"}""", io.ktor.http.ContentType.Application.Json,
++                            io.ktor.http.HttpStatusCode.BadRequest)
++                        return@post
++                    }
++                    val cableSwitch = onSwitchCable
++                    val switcher: ((String) -> String?)? = if (action == "disconnect") onDisconnectPhone
++                        else if (request.cable) cableSwitch?.let { s -> { _: String -> s() } }
++                        else onSwitchPhone
++                    if (switcher == null) {
++                        call.respondText(
++                            json.encodeToString(PhoneSwitchError.serializer(), PhoneSwitchError("unsupported")),
++                            io.ktor.http.ContentType.Application.Json,
++                            io.ktor.http.HttpStatusCode.Conflict,
++                        )
++                        return@post
++                    }
++                    val error = withContext(Dispatchers.IO) { switcher.invoke(PhoneList.normalize(request.address)) }
++                    if (error != null) {
++                        val code = if (error == "invalid") io.ktor.http.HttpStatusCode.BadRequest
++                            else io.ktor.http.HttpStatusCode.Conflict
++                        call.respondText(
++                            json.encodeToString(PhoneSwitchError.serializer(), PhoneSwitchError(error)),
++                            io.ktor.http.ContentType.Application.Json,
++                            code,
++                        )
++                        return@post
++                    }
++                    call.respondText("""{"ok":true}""", io.ktor.http.ContentType.Application.Json)
++                }
+             }
+             webSocket("/ws") {
+                 val token = call.request.queryParameters["token"]
+diff --git a/web/package.json b/web/package.json
+--- a/web/package.json
++++ b/web/package.json
+@@ -5,7 +5,7 @@
+   "type": "module",
+   "scripts": {
+     "dev": "vite",
+-    "test": "node check.mjs && node check-audio.mjs && node check-audio-mix.mjs && node check-car.mjs && node check-browser.mjs && node check-flac.mjs && node check-codec-startup.mjs && node check-live-mode.mjs && node check-pcm-resampler.mjs && node check-navigation-pcm.mjs",
++    "test": "node check.mjs && node check-audio.mjs && node check-audio-mix.mjs && node check-car.mjs && node check-browser.mjs && node check-flac.mjs && node check-codec-startup.mjs && node check-live-mode.mjs && node check-pcm-resampler.mjs && node check-navigation-pcm.mjs && node check-phone-actions.mjs",
+     "build": "tsc && vite build",
+     "preview": "vite preview"
+   },
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -4,9 +4,9 @@
+   boxLinkHintLive: ['离开画面，配对手机、更换热点', 'Leaves the picture to pair phones or change the hotspot'],
+   addPhoneLink: ['添加 iPhone', 'Add iPhone'], addPhoneLinkHint: ['离开画面，配对一部新手机', 'Leaves the picture to pair a new phone'],
+   boxSettingsLink: ['全部设置', 'All settings'], boxSettingsLinkHint: ['网络、热点、声音、域名、更新', 'Network, hotspot, sound, domain, updates'],
+-  devices: ['已连接的手机', 'Phones'], devicesHint: ['点一下就切到那一行：有线、无线、这部、那部都能随意切，和盒子怎么上网无关。现在这部不断 WiFi，只是 CarPlay 断开；无线一般 10–30 秒接上，对方的蓝牙要打开。', 'Tap a row to move CarPlay there: wired or wireless, this phone or another, independent of how the box reaches the internet. The current phone stays on Wi-Fi; wireless takes about 10–30 s with Bluetooth on.'],
++  devices: ['已连接的手机', 'Phones'], devicesHint: ['点一下就切到那一行：有线、无线、这部、那部都能随意切，和盒子怎么上网无关。现在这部不断 WiFi，只是 CarPlay 断开；无线一般 10–30 秒接上，对方的蓝牙要打开。点“断开”会暂停这部手机的自动连接，点手机可恢复。', 'Tap a row to move CarPlay there: wired or wireless, this phone or another, independent of how the box reaches the internet. The current phone stays on Wi-Fi; wireless takes about 10–30 s with Bluetooth on. Disconnect pauses this phone’s automatic connection; tap its row to resume.'],
+   deviceInUse: ['正在使用', 'In use'], deviceLast: ['上次使用', 'Last used'], deviceIdle: ['未连接', 'Not connected'], deviceSwitch: ['切换到这部', 'Switch to this'],
+-  devicesOne: ['目前只配对了这一部；配对第二部后，可以直接在这里切换。', 'Only one phone is paired; add a second to switch here.'],
++  devicesOne: ['可在这里连接或断开无线 CarPlay；断开后暂停自动连接，配对和 Wi-Fi 保留。', 'Connect or disconnect wireless CarPlay here. Disconnect pauses automatic connection and keeps pairing and Wi-Fi.'],
+   deviceSwitching: ['正在切换到「{name}」，现在这部会先断开 CarPlay…', 'Switching to “{name}”; the current CarPlay ends first…'],
+   deviceUnsupported: ['这部盒子不能切换手机。', 'This box cannot switch phones.'], deviceNotPaired: ['这部手机没有配对，请先在盒子的设置页添加。', 'This phone is not paired; add it on the box settings page.'],
+   deviceCable: ['这部盒子只能用数据线，不能切到无线。', 'This box only offers the cable; wireless is not available.'],
+@@ -15,6 +15,10 @@
+   deviceCableOff: ['后台设置了「只用无线」，数据线不做 CarPlay。', 'The box is set to wireless only; the cable carries no CarPlay.'],
+   deviceCableDetail: ['数据线连接', 'On the USB cable'],
+   deviceBusy: ['正在切换，请稍等。', 'A switch is already in progress.'], deviceFail: ['切换失败，请稍后重试。', 'Switch failed. Try again later.'],
++  deviceConnect: ['连接', 'Connect'], deviceDisconnect: ['断开', 'Disconnect'], deviceDisconnecting: ['正在断开…', 'Disconnecting…'],
++  deviceDisconnected: ['已断开，自动连接已暂停；点这部手机可重新连接。', 'Disconnected. Automatic connection is paused; tap this phone to connect again.'],
++  deviceDisconnectFail: ['断开失败，请稍后重试。', 'Could not disconnect. Try again later.'],
++  deviceNotActive: ['这部手机的连接状态已变化，请重新打开设置。', 'This phone’s connection changed. Reopen settings.'],
+   deviceNoPhones: ['还没有配对的手机。', 'No paired phones yet.'],
+   pictureHint: ['夜间、画质、语言', 'Night, picture, language'], soundHint: ['音量、声音输出', 'Volume and sound output'], displaySettings: ['画面参数', 'Display settings'], performanceMode: ['高清画质', 'Sharper picture'], performanceModeHint: ['开：按 iPhone 能给的最清楚尺寸解码，再缩到窗口里，更清楚但更吃车机性能，画面卡就关掉；关：按窗口实际尺寸（最小宽度 720），更省但可能偏软', 'On: decode the sharpest size the iPhone offers and shrink it into the window, sharper but heavier (turn it off if the picture stutters); off: the window own size (min width 720), lighter but may look soft'], customSize: ['自定义分辨率', 'Custom resolution'], customSizeHint: ['关：跟随窗口。开：在下面「画面参数」里填宽度、高度，点「应用并重连」生效', 'Off: follow the window. On: enter width and height under Display settings below, then Apply and reconnect'], language: ['语言', 'Language'],
+   waiting: ['正在等待 iPhone', 'Waiting for iPhone'], waitingHint: ['已添加的 iPhone 打开蓝牙和 Wi-Fi 后会自动连接。第一次使用，请先添加 iPhone。', 'An added iPhone connects by itself with Bluetooth and Wi-Fi on. First time here? Add your iPhone.'],
+diff --git a/web/src/main.ts b/web/src/main.ts
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -143,17 +143,29 @@
+ /** 'cable' or a phone address while a switch request is under way. */
+ let switchingTo: string | null = null;
+ let deviceNotice = '';
++let disconnectingPhone: string | null = null;
++let devicesRevision = 0;
+ const deviceAddress = (phone: BoxPhone) => `蓝牙 …${phone.address.slice(-5)}`;
+-function deviceRow(label: string, detail: string, active: boolean, value: string, onPick: (() => void) | null) {
++function deviceRow(label: string, detail: string, active: boolean, value: string, onPick: (() => void) | null, onDisconnect: (() => void) | null = null) {
+   const row = document.createElement(onPick ? 'button' : 'div') as HTMLDivElement & HTMLButtonElement;
+   row.className = active ? 'cell on' : 'cell';
+-  if (onPick) { row.type = 'button'; row.disabled = switchingTo !== null; row.onclick = onPick; }
++  if (onPick) { row.type = 'button'; row.disabled = switchingTo !== null || disconnectingPhone !== null; row.onclick = onPick; }
+   const main = document.createElement('span'); main.className = 'main';
+   const name = document.createElement('b'); name.textContent = label;
+   const sub = document.createElement('span'); sub.textContent = detail;
+   main.append(name, sub);
+   const right = document.createElement('span'); right.className = 'value'; right.textContent = value;
+-  row.append(main, right); deviceList.append(row);
++  row.append(main, right);
++  if (onDisconnect) {
++    const button = document.createElement('button');
++    button.type = 'button'; button.className = 'device-disconnect';
++    button.textContent = t(disconnectingPhone ? 'deviceDisconnecting' : 'deviceDisconnect');
++    button.setAttribute('aria-label', `${t('deviceDisconnect')} · ${label}`);
++    button.disabled = switchingTo !== null || disconnectingPhone !== null;
++    button.onclick = onDisconnect;
++    row.append(button);
++  }
++  deviceList.append(row);
+ }
+ function renderDevices() {
+   deviceList.textContent = '';
+@@ -167,14 +179,14 @@
+     devicesStatus.textContent = deviceNotice;
+     return;
+   }
+-  // With a single row there is nothing to switch to: show it, not a button that picks itself.
++  // An inactive single phone can be connected again after a manual disconnect.
+   const canSwitch = rows > 1;
+   if (wiredRow) {
+     const active = cableLive || wiredRow === 'starting';
+     const value = cableLive ? t('deviceInUse') : wiredRow === 'starting' ? t('deviceStarting')
+       : switchingTo === 'cable' ? t('deviceSwitchingShort') : t('deviceSwitch');
+     deviceRow(`${t('deviceWired')} · ${wiredName || 'iPhone'}`, t('deviceCableDetail'), active, value,
+-      !active && canSwitch ? () => { void switchTo(null); } : null);
++      !active ? () => { void switchTo(null); } : null);
+   }
+   for (const phone of boxPhones) {
+     // While CarPlay is on the cable no wireless row is in use (the box may still name the last one).
+@@ -183,8 +195,9 @@
+     const detail = phone.last && !active && canSwitch ? `${t('deviceLast')} · ${deviceAddress(phone)}` : deviceAddress(phone);
+     const value = active ? t('deviceInUse')
+       : switchingTo === phone.address ? t('deviceSwitchingShort')
+-      : canSwitch ? t('deviceSwitch') : phone.last ? t('deviceLast') : t('deviceIdle');
+-    deviceRow(label, detail, active, value, !active && canSwitch ? () => { void switchTo(phone); } : null);
++      : canSwitch ? t('deviceSwitch') : t('deviceConnect');
++    deviceRow(label, detail, active, value, !active ? () => { void switchTo(phone); } : null,
++      active ? () => { void disconnectFrom(phone); } : null);
+   }
+   devicesStatus.textContent = deviceNotice || (canSwitch ? t('devicesHint') : t('devicesOne'));
+ }
+@@ -192,11 +205,13 @@
+   if (!token) return;
+   if (devicesLoading) { devicesRefreshPending = true; return; }
+   devicesLoading = true;
++  const revision = devicesRevision;
+   deviceNotice = '';
+   try {
+     const r = await fetch(`/api/phones?token=${encodeURIComponent(token)}`, { cache: 'no-store' });
+     if (!r.ok) throw new Error();
+     const body = await r.json() as BoxPhones;
++    if (revision !== devicesRevision) return;
+     if (!body.supported) { devicesBlock.hidden = true; return; }
+     boxPhones = Array.isArray(body.phones) ? body.phones : [];
+     const legacyCable = typeof body.cable === 'string' && body.cable ? body.cable : '';
+@@ -207,8 +222,8 @@
+     devicesBlock.hidden = false;
+     renderDevices();
+   } catch {
+-    // An older receiver has no such endpoint: the section simply stays hidden.
+-    devicesBlock.hidden = true;
++    // Ignore a response begun before a user action.
++    if (revision === devicesRevision) devicesBlock.hidden = true;
+   } finally {
+     devicesLoading = false;
+     if (devicesRefreshPending) {
+@@ -225,12 +240,15 @@
+     case 'no-cable': return t('deviceNoCable');
+     case 'cable-off': return t('deviceCableOff');
+     case 'busy': return t('deviceBusy');
++    case 'not-active': return t('deviceNotActive');
++    case 'pause-failed': return t('deviceDisconnectFail');
+     default: return t('deviceFail');
+   }
+ }
+ /** phone null: the wired row. */
+ async function switchTo(phone: BoxPhone | null) {
+-  if (switchingTo) return;
++  if (switchingTo || disconnectingPhone) return;
++  ++devicesRevision;
+   switchingTo = phone ? phone.address : 'cable';
+   renderDevices();
+   try {
+@@ -257,6 +275,33 @@
+     deviceNotice = deviceError((error as Error).message);
+   } finally {
+     switchingTo = null;
++    if (!devicesBlock.hidden) renderDevices();
++  }
++}
++/** Pause automatic wireless invitations as well as closing this session. Pairing and Wi-Fi stay. */
++async function disconnectFrom(phone: BoxPhone) {
++  if (switchingTo || disconnectingPhone) return;
++  ++devicesRevision;
++  disconnectingPhone = phone.address;
++  deviceNotice = '';
++  renderDevices();
++  try {
++    const r = await fetch(`/api/phones/disconnect?token=${encodeURIComponent(token)}`, {
++      method: 'POST', headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify({ address: phone.address }),
++    });
++    const body = await r.json().catch(() => ({})) as { error?: string };
++    if (!r.ok) throw new Error(body.error || 'pause-failed');
++    boxPhones = boxPhones.map(entry => entry.address === phone.address ? { ...entry, active: false } : entry);
++    deviceNotice = t('deviceDisconnected');
++    toast(deviceNotice);
++  } catch (error) {
++    const code = (error as Error).message;
++    deviceNotice = ['busy', 'not-active', 'unsupported', 'not-paired'].includes(code)
++      ? deviceError(code) : t('deviceDisconnectFail');
++  } finally {
++    ++devicesRevision;
++    disconnectingPhone = null;
+     if (!devicesBlock.hidden) renderDevices();
+   }
+ }
+@@ -815,7 +860,7 @@
+   connection.send({type:'stats',stats:{ev,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,width:screen.clientWidth,height:screen.clientHeight,want:wantFullscreen?1:0,...viewport()}});
+ }
+ /** Which page build runs (raised with each build tried in the car). */
+-const BUILD = 2026110401;
++const BUILD = 2026110402;
+ /** What the browser says of the space it gives the page, to find the car's bar over a fullscreen page (2026-10-13):
+  *  window, visual viewport (and its offset), screen, available screen, outer window, pixel ratio. */
+ function viewport(): Record<string, number> {
+diff --git a/web/src/style.css b/web/src/style.css
+--- a/web/src/style.css
++++ b/web/src/style.css
+@@ -50,6 +50,10 @@
+ .cell .main span { display:block; color:var(--secondary); font-size:13px; line-height:1.35; margin-top:1px; }
+ .cell .value { color:var(--secondary); font-size:15px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; max-width:55%; }
+ .cell.on .value { color:var(--tint); }
++.device-disconnect { flex:none; min-width:64px; min-height:44px; padding:8px; border:0; border-radius:8px;
++  color:var(--tint); background:none; font:inherit; cursor:pointer; }
++.device-disconnect:active { background:var(--press); }
++.device-disconnect:disabled { opacity:.5; cursor:default; }
+ .tile { width:30px; height:30px; flex:none; border-radius:7px; display:grid; place-items:center; color:#fff; }
+ .tile .ico { width:19px; height:19px; }
+ .tile.blue { background:var(--tint); } .tile.green { background:var(--green); } .tile.gray { background:var(--gray); }
+diff --git a/server/src/test/kotlin/com/playport/server/PhoneDisconnectApiTest.kt b/server/src/test/kotlin/com/playport/server/PhoneDisconnectApiTest.kt
+new file mode 100644
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/PhoneDisconnectApiTest.kt
+@@ -0,0 +1,48 @@
++package com.playport.server
++
++import io.ktor.server.engine.embeddedServer
++import io.ktor.server.netty.Netty
++import kotlinx.coroutines.*
++import org.junit.Assert.*
++import org.junit.Test
++import java.net.URI
++import java.net.http.*
++import java.nio.file.Files
++
++class PhoneDisconnectApiTest {
++    @Test fun disconnectRequiresOwnPageAndValidWirelessPhoneAndKeepsSwitchWorking() {
++        val dir = Files.createTempDirectory("phone-disconnect")
++        val scope = CoroutineScope(Dispatchers.Default)
++        val token = "0123456789abcdef0123456789abcdef"
++        val hub = WebHub(ServerConfig(identityDir=dir,stateDir=dir,accessToken=token),DisplayState(640,480,30,100),scope)
++        val calls = mutableListOf<String>()
++        hub.onDisconnectPhone = { calls.add("disconnect:$it"); null }
++        hub.onSwitchPhone = { calls.add("switch:$it"); null }
++        hub.onSwitchCable = { calls.add("cable"); null }
++        val server = embeddedServer(Netty,port=0,host="127.0.0.1") { hub.install(this,dir) }.start(false)
++        try {
++            val port = runBlocking { server.engine.resolvedConnectors().first().port }
++            val origin = "http://127.0.0.1:$port"
++            val client = HttpClient.newHttpClient()
++            val body = """{"address":"02:00:00:00:00:0a"}"""
++            fun request(data: String = body, action: String = "disconnect", credential: String = token, source: String = origin): Int =
++                client.send(HttpRequest.newBuilder(URI("$origin/api/phones/$action?token=$credential"))
++                    .header("Origin",source).header("Content-Type","application/json")
++                    .POST(HttpRequest.BodyPublishers.ofString(data)).build(), HttpResponse.BodyHandlers.ofString()).statusCode()
++            assertEquals(403,request(credential="bad"))
++            assertEquals(403,request(source="https://outside.example"))
++            assertEquals(400,request("not json"))
++            assertEquals(400,request("{}"))
++            assertEquals(400,request("""{"cable":true}"""))
++            assertTrue(calls.isEmpty())
++            assertEquals(200,request())
++            assertEquals(200,request(action="switch"))
++            assertEquals(200,request("""{"cable":true}""",action="switch"))
++            assertEquals(listOf("disconnect:02:00:00:00:00:0A","switch:02:00:00:00:00:0A","cable"),calls)
++            hub.onDisconnectPhone = { "not-active" }
++            assertEquals(409,request())
++            hub.onDisconnectPhone = null
++            assertEquals(409,request())
++        } finally { server.stop(0,1000); scope.cancel(); dir.toFile().deleteRecursively() }
++    }
++}
+diff --git a/server/src/test/kotlin/com/playport/server/ViewerPhonePauseTest.kt b/server/src/test/kotlin/com/playport/server/ViewerPhonePauseTest.kt
+new file mode 100644
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/ViewerPhonePauseTest.kt
+@@ -0,0 +1,51 @@
++package com.playport.server
++
++import com.shilapi.xcertplay.airplay.*
++import java.net.Socket
++import java.nio.file.Files
++import org.junit.Assert.*
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++
++class ViewerPhonePauseTest {
++    @get:Rule val temp = TemporaryFolder()
++    private val phone = "02:00:00:00:00:01"
++    private fun field(s: CarPlayServer, n: String) = CarPlayServer::class.java.getDeclaredField(n).also { it.isAccessible = true }
++    private fun run(fail: Boolean = false, block: (CarPlayServer, AirPlaySession) -> Unit) {
++        val root = temp.newFolder().toPath()
++        val helper = root.resolve("presence.py")
++        Files.writeString(helper, """
++            import sys
++            if sys.argv[1] == 'pause' and ${if (fail) "True" else "False"}: sys.exit(1)
++            print('ok')
++        """.trimIndent())
++        CarPlayServer(ServerConfig(identityDir=root,stateDir=root.resolve("state"),bindAddress="127.0.0.1",wireless=true)).use { s ->
++            field(s,"presenceHelper").set(s,helper.toString())
++            field(s,"selectedPhone").set(s,phone)
++            val listener = field(s,"listener").get(s) as AirPlaySessionListener
++            val session = AirPlaySession(Socket(),s.airPlayConfig,s.identity,PairingStore(),null,listener,object: AirPlayMediaHandler {})
++            listener.onSessionActive(session)
++            block(s,session)
++        }
++    }
++    @Test fun pauseClosesOwnerAndCancelsRecovery() = run { s, _ ->
++        assertNull(s.pausePhone(phone))
++        assertNull(field(s,"activeSession").get(s))
++        assertNull((field(s,"sessionRecovery").get(s) as WirelessSessionRecovery).candidate(System.nanoTime()/1_000_000))
++        assertFalse(field(s,"bootInvite").getBoolean(s))
++        assertEquals(0,field(s,"quickRetriesLeft").getInt(s))
++    }
++    @Test fun failedDurablePauseDoesNotDropTheSession() = run(true) { s, session ->
++        assertEquals("pause-failed",s.pausePhone(phone))
++        assertSame(session,field(s,"activeSession").get(s))
++    }
++    @Test fun stalePhoneAndCableCannotDisconnectCurrentOwner() = run { s, session ->
++        assertEquals("invalid",s.pausePhone("wrong"))
++        assertEquals("not-active",s.pausePhone("02:00:00:00:00:02"))
++        assertSame(session,field(s,"activeSession").get(s))
++        field(s,"cablePhone").setBoolean(s,true)
++        assertEquals("busy",s.pausePhone(phone))
++        assertSame(session,field(s,"activeSession").get(s))
++    }
++}
+diff --git a/web/check-phone-actions.mjs b/web/check-phone-actions.mjs
+new file mode 100644
+--- /dev/null
++++ b/web/check-phone-actions.mjs
+@@ -0,0 +1,78 @@
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import vm from 'node:vm';
++import ts from 'typescript';
++const main = readFileSync(new URL('./src/main.ts', import.meta.url), 'utf8');
++const source = main.slice(main.indexOf('interface BoxPhone'), main.indexOf('function fit()'));
++const code = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
++class Element {
++  constructor(tag = 'div') { this.tagName = tag; this.children = []; this.hidden = false; this.attributes = {}; }
++  set textContent(value) { this.text = value; this.children = []; }
++  get textContent() { return this.text || ''; }
++  append(...nodes) { this.children.push(...nodes); }
++  setAttribute(key, value) { this.attributes[key] = value; }
++}
++const phone = { address: '02:00:00:00:00:01', name: 'Test iPhone', active: true, last: true };
++function setup() {
++  const nodes = {}, requests = [], timers = [];
++  const context = vm.createContext({
++    el: id => nodes[id] ??= new Element(), document: { createElement: tag => new Element(tag) },
++    t: key => key, token: 'synthetic-token', panel: { open: true }, toast() {},
++    window: { setTimeout: callback => timers.push(callback) },
++    fetch: async (url, init) => {
++      requests.push({ url, init });
++      return { ok: true, json: async () => init?.method === 'POST' ? { ok: true } : { supported: true, phones: [phone] } };
++    },
++  });
++  vm.runInContext(code, context);
++  return { context, nodes, requests, run: text => vm.runInContext(text, context) };
++}
++{
++  const { nodes, requests, run } = setup();
++  await run('loadDevices()');
++  const row = nodes['device-list'].children[0];
++  assert.equal(row.tagName, 'div', 'current phone has a separate action, no nested buttons');
++  const button = row.children.find(e => e.className === 'device-disconnect');
++  assert.equal(button.textContent, 'deviceDisconnect');
++  assert.equal(button.disabled, false);
++  assert.match(button.attributes['aria-label'], /Test iPhone/);
++  await run('disconnectFrom(boxPhones[0])');
++  assert.match(requests.at(-1).url, /\/api\/phones\/disconnect\?token=/);
++  assert.equal(JSON.parse(requests.at(-1).init.body).address, phone.address);
++  const reconnect = nodes['device-list'].children[0];
++  assert.equal(reconnect.tagName, 'button', 'one paired phone can reconnect after pause');
++  assert.equal(reconnect.children.at(-1).textContent, 'deviceConnect');
++  assert.equal(nodes['devices-status'].textContent, 'deviceDisconnected');
++  await run('switchTo(boxPhones[0])');
++  assert.match(requests.at(-1).url, /\/api\/phones\/switch\?token=/);
++}
++{
++  const { context, nodes, run } = setup();
++  await run('loadDevices()');
++  let finish, calls = 0;
++  context.fetch = () => { calls++; return new Promise(resolve => { finish = resolve; }); };
++  const pending = run('disconnectFrom(boxPhones[0])');
++  assert.equal(nodes['device-list'].children[0].children.at(-1).disabled, true);
++  await run('disconnectFrom(boxPhones[0])');
++  await run('switchTo(boxPhones[0])');
++  assert.equal(calls, 1, 'in-flight action prevents duplicate disconnect and switch');
++  finish({ ok: false, json: async () => ({ error: 'pause-failed' }) });
++  await pending;
++  assert.equal(run('boxPhones[0].active'), true, 'failure does not claim disconnection');
++  assert.equal(nodes['devices-status'].textContent, 'deviceDisconnectFail');
++  assert.equal(nodes['device-list'].children[0].children.at(-1).disabled, false);
++}
++{
++  const { context, run } = setup();
++  await run('loadDevices()');
++  let finish;
++  context.fetch = (_url, init) => init?.method === 'POST'
++    ? Promise.resolve({ ok: true, json: async () => ({ ok: true }) })
++    : new Promise(resolve => { finish = resolve; });
++  const stale = run('loadDevices()');
++  await run('disconnectFrom(boxPhones[0])');
++  finish({ ok: true, json: async () => ({ supported: true, phones: [phone] }) });
++  await stale;
++  assert.equal(run('boxPhones[0].active'), false, 'old GET cannot undo completed disconnect');
++}
++console.log('Phone actions: live disconnect, single-phone reconnect, failures, busy guard and stale read passed.');

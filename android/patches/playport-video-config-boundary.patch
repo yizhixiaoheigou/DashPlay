@@ -1,0 +1,25 @@
+diff --git a/protocol/src/main/java/com/shilapi/xcertplay/airplay/ScreenStream.kt b/protocol/src/main/java/com/shilapi/xcertplay/airplay/ScreenStream.kt
+--- a/protocol/src/main/java/com/shilapi/xcertplay/airplay/ScreenStream.kt
++++ b/protocol/src/main/java/com/shilapi/xcertplay/airplay/ScreenStream.kt
+@@ -179,11 +179,19 @@
+         for (index in 4..payload.size - 4) {
+             val fourcc = String(payload, index, 4, Charsets.US_ASCII)
+             when (fourcc) {
+-                "hvcC" -> return VideoCodec.H265 to payload.copyOfRange(index + 4, payload.size)
+-                "avcC" -> return VideoCodec.H264 to payload.copyOfRange(index + 4, payload.size)
++                "hvcC" -> return VideoCodec.H265 to configurationBoxPayload(payload, index)
++                "avcC" -> return VideoCodec.H264 to configurationBoxPayload(payload, index)
+             }
+         }
+         return if (looksLikeAvcC(payload)) VideoCodec.H264 to payload else VideoCodec.H265 to payload
++    }
++
++    /** Codec records end at their box boundary, before sibling metadata such as colr. */
++    private fun configurationBoxPayload(payload: ByteArray, typeOffset: Int): ByteArray {
++        val start = typeOffset - 4
++        val size = readU32Be(payload, start)
++        require(size >= 8 && size <= payload.size - start) { "Invalid video configuration box length" }
++        return payload.copyOfRange(typeOffset + 4, start + size)
+     }
+ 
+     private fun looksLikeAvcC(payload: ByteArray): Boolean {

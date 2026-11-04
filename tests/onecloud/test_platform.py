@@ -426,6 +426,17 @@ class PlatformTests(unittest.TestCase):
         self.assertNotIn('scan_freq', (self.root / 'wpa.conf').read_text())
 
     @patch('platform_debian.subprocess.run')
+    def test_legacy_join_accepts_explicit_open_hotspot(self, run):
+        run.return_value = Mock(returncode=0, stdout='Connected to synthetic\nfreq: 5180')
+        with patch.object(self.platform, 'start'), patch.object(self.platform, 'ipv4_address', return_value='192.0.2.9'):
+            self.assertTrue(self.platform.join_wifi({'ssid':'Public','passphrase':'','security':'open'}, {},
+                                                   lambda *a, **k: None, 20))
+        conf = (self.root / 'wpa.conf').read_text()
+        self.assertIn('key_mgmt=NONE', conf)
+        self.assertNotIn('psk=', conf)
+        self.assertNotIn('SAE', conf)
+
+    @patch('platform_debian.subprocess.run')
     def test_join_preserves_lease_escaping_and_timeout_cleanup(self, run):
         run.return_value = Mock(returncode=0, stdout='Connected to synthetic\nfreq: 5180')
         car = {'ssid': 'Test"\\', 'passphrase': 'synthetic"\\'}

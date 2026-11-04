@@ -1,0 +1,253 @@
+diff --git a/web/src/video.ts b/web/src/video.ts
+--- a/web/src/video.ts
++++ b/web/src/video.ts
+@@ -3,4 +3,5 @@
+ interface DecoderState {
+   decoder: VideoDecoder;
++  config: VideoDecoderConfig;
+   usesDescription: boolean;
+   timestampUs: number;
+@@ -17,4 +18,13 @@
+ 
+ const STALL_TIMEOUT_MS = 2500;
++/** The page is behind once this many frames given to the decoder are still not painted, the oldest of them for over
++ *  BEHIND_MS: it then skips picture frames up to the next keyframe, which it shows at once (stale frames dropped). The
++ *  box only sees what reached the page (LagGate), not a decoder slower than the stream: a Zeekr 7X (Chrome 124,
++ *  2026-10-19, 60 fps asked, ~17-20 ms a frame) had 504 to 1689 frames queued, seconds behind and never catching up.
++ *  A still screen leaves one or two frames held in the decoder, a burst after a hiccup is young: neither counts. */
++const BEHIND_FRAMES = 8;
++const BEHIND_MS = 200;
++/** While skipping, the phone is asked for a keyframe at most this often (the box passes every ask on). */
++const KEYFRAME_ASK_MS = 1000;
+ 
+ /** Decodes CarPlay's H.264/H.265 stream with WebCodecs and paints it to a canvas. */
+@@ -57,8 +67,12 @@
+   decodeLatencyMs = 0;
+   private readonly arrivals = new Map<number, number>();
+-  /** For the box's viewer log: gaps in an otherwise flowing stream (network or box) and frames the decoder held long. */
+-  private stall = { stalls: 0, stallMaxMs: 0, slowFrames: 0, paintMaxMs: 0 };
++  /** For the box's viewer log: gaps in an otherwise flowing stream (network or box), frames the decoder held long,
++   *  frames skipped to catch up and the keyframes it caught up at. */
++  private stall = VideoPlayer.noStalls();
+   private lastGaps = [Infinity, Infinity];
+-  takeStalls() { const stall = this.stall; this.stall = { stalls: 0, stallMaxMs: 0, slowFrames: 0, paintMaxMs: 0 }; return stall; }
++  private skipping = false;
++  private keyframeAskedAt = -Infinity;
++  private static noStalls() { return { stalls: 0, stallMaxMs: 0, slowFrames: 0, paintMaxMs: 0, skipped: 0, caughtUp: 0 }; }
++  takeStalls() { const stall = this.stall; this.stall = VideoPlayer.noStalls(); return stall; }
+ 
+   configure(message: VideoConfigMessage): void {
+@@ -109,5 +123,5 @@
+       return;
+     }
+-    this.adopt(decoder, descriptionPresent, message);
++    this.adopt(decoder, config, descriptionPresent, message);
+   }
+ 
+@@ -134,5 +148,5 @@
+         continue;
+       }
+-      this.adopt(decoder, candidate.description !== undefined, message);
++      this.adopt(decoder, config, candidate.description !== undefined, message);
+       return;
+     }
+@@ -144,7 +158,9 @@
+   }
+ 
+-  private adopt(decoder: VideoDecoder, usesDescription: boolean, message: VideoConfigMessage): void {
++  private adopt(decoder: VideoDecoder, config: VideoDecoderConfig, usesDescription: boolean, message: VideoConfigMessage): void {
++    this.skipping = false;
+     this.state = {
+       decoder,
++      config,
+       usesDescription,
+       timestampUs: 0,
+@@ -172,4 +188,18 @@
+     const data = state.usesDescription ? annexBToAvcc(message.data) : message.data;
+     if (data.length === 0) return;
++    const oldest = this.arrivals.size >= BEHIND_FRAMES ? this.arrivals.values().next().value : undefined;
++    const behind = oldest !== undefined && now - oldest > BEHIND_MS;
++    if (message.keyframe) {
++      if (this.skipping || behind) this.catchUp(state);
++    } else if (this.skipping || behind) {
++      this.skipping = true;
++      this.stall.skipped++;
++      // Not asked while the page is hidden (the car shows something else): the next frame once shown asks.
++      if (now - this.keyframeAskedAt >= KEYFRAME_ASK_MS && !document.hidden) {
++        this.keyframeAskedAt = now;
++        this.onRequestKeyframe();
++      }
++      return;
++    }
+     state.timestampUs += state.frameIntervalUs;
+     this.arrivals.set(state.timestampUs, this.lastArrivalAt);
+@@ -188,4 +218,17 @@
+   }
+ 
++  /** Drops what the decoder still holds (all older than this keyframe), so the keyframe is painted next. */
++  private catchUp(state: DecoderState): void {
++    this.skipping = false;
++    this.stall.caughtUp++;
++    this.arrivals.clear();
++    try {
++      state.decoder.reset();
++      state.decoder.configure(state.config);
++    } catch {
++      // A decoder that cannot reset decodes the keyframe after what it holds.
++    }
++  }
++
+   close(): void {
+     const state = this.state;
+@@ -262,6 +305,10 @@
+     context.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
+     const arrived = this.arrivals.get(frame.timestamp);
++    // Frames come out in order: any older still listed were never painted (the decoder let them go).
++    for (const timestamp of this.arrivals.keys()) {
++      if (timestamp > frame.timestamp) break;
++      this.arrivals.delete(timestamp);
++    }
+     if (arrived !== undefined) {
+-      this.arrivals.delete(frame.timestamp);
+       const latency = performance.now() - arrived;
+       this.decodeLatencyMs = this.decodeLatencyMs ? this.decodeLatencyMs * 0.9 + latency * 0.1 : latency;
+diff --git a/web/src/display-fit.ts b/web/src/display-fit.ts
+--- a/web/src/display-fit.ts
++++ b/web/src/display-fit.ts
+@@ -27,4 +27,12 @@
+  *  receiver's DisplayState.MAX_AREAS must allow as many. */
+ export const MAX_AREAS = 8;
++/** 60 fps the browser's decoder cannot keep up with: the page catches up at a keyframe now and then (video.ts), each a
++ *  visible jump. This many 10 s reports in a row with at least two catch-ups each take automatic display to 30 fps
++ *  (a Zeekr 7X decodes about 50 a second, 2026-10-19). Returns the new run of such reports and whether to lower now. */
++export const BEHIND_REPORTS = 2;
++export function frameRateCheck(run: number, caughtUp: number, fps: number): { run: number; lower: boolean } {
++  const next = caughtUp >= 2 && fps === 60 ? run + 1 : 0;
++  return next >= BEHIND_REPORTS ? { run: 0, lower: true } : { run: next, lower: false };
++}
+ /** Both orientations are declared together only while the stream grows by at most this much over one orientation's. */
+ export const MIXED_GROWTH = 1.1;
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -24,4 +24,5 @@
+   deferred: ['已记下，下次连接 iPhone 时生效，不打断当前画面。', 'Saved for the next connection; the picture is not interrupted now.'],
+   nextSession: ['新画质下次连接生效', 'new quality on next connection'],
++  fpsLowered: ['车机解码跟不上 60 帧，已自动改为 30 帧（重新连接一次）。', 'This browser cannot decode 60 fps in time; switched to 30 fps (one reconnect).'],
+   adjusting: ['正在按新画面重新连接 iPhone…', 'Reconnecting the iPhone for the new picture size…'],
+   loadFail: ['读取失败，请检查盒子连接后重试。', 'Could not load settings. Check the receiver connection and retry.'],
+diff --git a/web/src/main.ts b/web/src/main.ts
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -7,5 +7,5 @@
+ import { SystemMedia } from './media-session';
+ import { LagProbe } from './lag';
+-import { suggestedResolution, areaPlan, areaSize, areaFor, sameStream, showsShape, type Area } from './display-fit';
++import { suggestedResolution, areaPlan, areaSize, areaFor, sameStream, showsShape, frameRateCheck, type Area } from './display-fit';
+ import { t, language, setLanguage, type Key } from './i18n';
+ import { isNight, parseNightMode } from './night';
+@@ -118,4 +118,12 @@
+   if (slowReports >= 3 && fastDecoder()) { saveFlag('f50-fast-decoder', '0'); lastAutoTarget = ''; scheduleAuto(); }
+ }
++/** Automatic display only, once per browser: 60 fps chosen again by hand afterwards stays. */
++let behindRun = 0;
++function judgeFrameRate(caughtUp: number) {
++  const check = frameRateCheck(behindRun, caughtUp, display?.fps ?? 0); behindRun = check.run;
++  if (!check.lower || !display || !autoFit.checked || displayBusy || readFlag('f50-fps-lowered') === '1') return;
++  saveFlag('f50-fps-lowered', '1'); toast(t('fpsLowered'));
++  void saveDisplay({ ...display, fps: 30 }, { reason: 'decoder' });
++}
+ function send(message: ClientMessage) { if (active) connection.send(message); }
+ // Compatible display (compat-display.ts): automatic by the browser's version, or the switch in Display; chosen once
+@@ -459,5 +467,5 @@
+ }
+ /** Which page build runs (raised with each build tried in the car). */
+-const BUILD = 202610171100;
++const BUILD = 202610212300;
+ /** What the browser says of the space it gives the page, to find the car's bar over a fullscreen page (2026-10-13):
+  *  window, visual viewport (and its offset), screen, available screen, outer window, pixel ratio. */
+@@ -544,10 +552,11 @@
+ }, 1000);
+ window.setInterval(()=>{
+-  const now=performance.now(),seconds=Math.max(1,(now-reportStart)/1000);
++  const now=performance.now(),seconds=Math.max(1,(now-reportStart)/1000),stalls=video.takeStalls();
+   send({type:'stats',stats:{fps:reportFrames/seconds,decodeMs:video.decodeLatencyMs,queue:video.decodeQueueSize,
+     kbps:reportBytes*8/1000/seconds,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,
+     width:canvas.width,height:canvas.height,...(touchCount?{touchMs:touchSum/touchCount,touches:touchCount}:{}),...(musicBytes?{musicKbps:musicBytes*8/1000/seconds}:{}),
+-    ...startupStats(),chrome:chromeMajor,compat:compatDisplay?1:0,build:BUILD,webView,carMusic:carMusic?1:0,teslaMode:teslaMode?1:0,promptGain,...(revived?{revived}:{}),fastDecoder:fastDecoder()?1:0,hevcDecodes:hevcDecodes?1:0,hevc:display?.hevc?1:0,...microphone.report(),...audio.farReport(),...media.report(),...musicTimeline(),...audio.musicReport(),...video.takeStalls(),...lag.take(performance.now())}});
++    ...startupStats(),chrome:chromeMajor,compat:compatDisplay?1:0,build:BUILD,webView,carMusic:carMusic?1:0,teslaMode:teslaMode?1:0,promptGain,...(revived?{revived}:{}),fastDecoder:fastDecoder()?1:0,hevcDecodes:hevcDecodes?1:0,hevc:display?.hevc?1:0,...microphone.report(),...audio.farReport(),...media.report(),...musicTimeline(),...audio.musicReport(),...stalls,...lag.take(performance.now())}});
+   judgeDecoder(video.decodeLatencyMs, reportFrames/seconds);
++  if (active) judgeFrameRate(stalls.caughtUp);
+   reportFrames=0;reportBytes=0;reportStart=now;touchSum=0;touchCount=0;musicBytes=0;
+ },10000);
+diff --git a/web/check-car.mjs b/web/check-car.mjs
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -7,5 +7,10 @@
+   return import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
+ }
+-const {suggestedResolution,aspectChanged,shownSize,areaPlan,areaSize,areaFor,sameStream,showsShape,MAX_AREAS}=await load('display-fit');
++const {suggestedResolution,aspectChanged,shownSize,areaPlan,areaSize,areaFor,sameStream,showsShape,MAX_AREAS,frameRateCheck}=await load('display-fit');
++{ // 60 fps the decoder cannot keep up with (Zeekr 7X): two 10 s reports in a row with two catch-ups each go to 30 fps.
++  let c=frameRateCheck(0,3,60);assert.deepEqual(c,{run:1,lower:false},'one report is not enough');
++  assert.deepEqual(frameRateCheck(c.run,2,60),{run:0,lower:true},'two in a row lower it');
++  assert.deepEqual(frameRateCheck(c.run,1,60),{run:0,lower:false},'a single catch-up in between starts over');
++  assert.deepEqual(frameRateCheck(1,5,30),{run:0,lower:false},'30 fps is never lowered'); }
+ { // XPeng fullscreen is 876x579 or 876x641 CSS px (dock shown or not): 1280x846 or 1280x936 (F50 drive 2026-10-13).
+   // With view areas the page (1280x756) and both fullscreen heights are areas: learned once, then switched.
+@@ -95,6 +100,53 @@
+   player.state={usesDescription:false,timestampUs:0,frameIntervalUs:16667,decoder:{decode(){},decodeQueueSize:0}};
+   for(const t of [0,20,40,400,420,1400,2400]){clock=t;player.pushFrame({data:new Uint8Array([1]),keyframe:false});}
+-  assert.deepEqual(player.takeStalls(),{stalls:1,stallMaxMs:360,slowFrames:0,paintMaxMs:0},'Only a gap with frames flowing on both sides counts; motion ending into an idle screen (1 frame/s) does not');
+-  assert.deepEqual(player.takeStalls(),{stalls:0,stallMaxMs:0,slowFrames:0,paintMaxMs:0},'Counters restart for each report');
++  assert.deepEqual(player.takeStalls(),{stalls:1,stallMaxMs:360,slowFrames:0,paintMaxMs:0,skipped:0,caughtUp:0},'Only a gap with frames flowing on both sides counts; motion ending into an idle screen (1 frame/s) does not');
++  assert.deepEqual(player.takeStalls(),{stalls:0,stallMaxMs:0,slowFrames:0,paintMaxMs:0,skipped:0,caughtUp:0},'Counters restart for each report');
++  Object.defineProperty(performance,'now',{value:realNow,configurable:true,writable:true}); }
++{ // A decoder slower than the stream (Zeekr 7X, 2026-10-19: 60 fps asked, 504 to 1689 frames queued, seconds behind):
++  // the page skips picture frames up to the next keyframe and shows that one at once.
++  let clock=0;const realNow=performance.now;Object.defineProperty(performance,'now',{value:()=>clock,configurable:true,writable:true});
++  globalThis.EncodedVideoChunk=class {constructor(v){Object.assign(this,v);}};
++  globalThis.document={hidden:false};
++  const {VideoPlayer}=await load('video',s=>s.replace(/^import .*?;$/gm,''));
++  let asks=0;const canvas={getContext(){return {drawImage(){}};},width:1280,height:720};
++  const player=new VideoPlayer(canvas,()=>{},()=>{},()=>{asks++;});
++  const decoded=[];let resets=0;
++  const decoder={decodeQueueSize:0,decode(c){decoded.push(c);},reset(){resets++;decoded.length=0;},configure(){}};
++  player.state={decoder,config:{codec:'avc1'},usesDescription:false,timestampUs:0,frameIntervalUs:16667,width:1280,height:720};
++  const push=(t,keyframe=false)=>{clock=t;player.pushFrame({data:new Uint8Array([1]),keyframe});};
++  const paint=chunk=>player.paint({timestamp:chunk.timestamp,displayWidth:1280,displayHeight:720});
++  // Painted as fast as they come: never behind.
++  for(let t=0;t<2000;t+=17){push(t,t===0);paint(decoded.at(-1));}
++  assert.deepEqual([asks,player.takeStalls().skipped],[0,0],'a decoder that keeps up');
++  // The decoder stops painting: once 8 frames wait, the oldest over 200 ms, frames are skipped and a keyframe asked.
++  decoded.length=0;let t=2000;
++  for(;t<2400;t+=17)push(t);
++  const held=decoded.length;
++  assert.ok(held>=8&&held<=14,`skips from the 8th waiting frame over 200 ms (${held} decoded)`);
++  assert.equal(asks,1,'one keyframe asked');
++  for(;t<3500;t+=17)push(t);
++  assert.equal(decoded.length,held,'nothing more is decoded');
++  assert.equal(asks,2,'asked again after a second, no more often');
++  document.hidden=true;for(;t<5000;t+=17)push(t);
++  assert.equal(asks,2,'not asked while the page is hidden');
++  document.hidden=false;push(t+=17);
++  assert.equal(asks,3,'asked once shown again');
++  push(t+=17,true);
++  assert.equal(resets,1,'the keyframe drops what the decoder held');
++  assert.equal(decoded.length,1,'and is decoded at once');
++  paint(decoded[0]);push(t+=17);
++  assert.equal(decoded.length,2,'then frames are decoded again');
++  const stalls=player.takeStalls();
++  assert.equal(stalls.caughtUp,1);assert.ok(stalls.skipped>100,'the skipped frames are counted for the viewer log');
++  // A still screen keeps a frame or two in the decoder for a second each: never behind.
++  decoded.length=0;
++  for(let i=0;i<10;i++){push(t+=1000);if(decoded.length>2)paint(decoded.at(-3));}
++  assert.equal(decoded.length,10,'a still screen is never skipped');
++  // A burst after a hiccup: many frames at once, none old.
++  paint(decoded.at(-1));decoded.length=0;for(let i=0;i<12;i++)push(t+=1);
++  assert.equal(decoded.length,12,'a burst is decoded');
++  // A frame painted removes older ones the decoder let go, so they never count as waiting.
++  paint(decoded.at(-1));assert.equal(player.arrivals.size,0,'nothing older stays listed');
++  delete globalThis.document;
+   Object.defineProperty(performance,'now',{value:realNow,configurable:true,writable:true}); }
+ { // Each keyframe the box asks for comes with the same codec config again (twice, 110 times in a 42-minute drive):

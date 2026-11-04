@@ -35,6 +35,7 @@ class TlsActivity : Activity() {
             startActivity(Intent(this, AutomaticTlsActivity::class.java))
         }.apply { id = R.id.tls_automatic })
         root.addView(ui.text(R.style.Text_Small, "导入域名对应的 PEM 证书链与私钥。域名需能解析到本机，证书需被车机信任；本次导入不会自动修改 DNS。"))
+        root.addView(ui.text(R.style.Text_Small, getString(R.string.browser_scheme_hint)))
         val snapshot = DashPlayService.snapshot()
         root.addView(ui.text(R.style.Text_Small, "当前域名解析目标：" +
             (if (TeslaRootAccess.active) TeslaRootPlan.ADDRESS else snapshot.network?.address?.hostAddress ?: "等待网络")))
@@ -73,7 +74,7 @@ class TlsActivity : Activity() {
             }
         }
         root.addView(ownNameCheck)
-        root.addView(ui.text(R.style.Text_Small, "车机连本机热点时，直接回答「自己的域名就在这里」，车机没网也能用域名打开。一般保持打开；若车机自带应用因此上不了网，可关掉。在非特斯拉模式下需点击下方按钮授权 Root 接管 53 端口（或已开启特斯拉联网检查 / USB 热点共享）。"))
+        root.addView(ui.text(R.style.Text_Small, "为连接本机热点的设备提供域名解析，使车机在无互联网时仍能通过域名访问接收端。如果影响车机自带应用联网，可关闭此项。在非特斯拉模式下需点击下方按钮授权 Root 接管 53 端口（或已开启特斯拉联网检查 / USB 热点共享）。"))
         button("授权 Root 启用热点域名回答", View.generateViewId()) {
             work { settings.enableHotspotOwnNameRoot(); DashPlayService.restart(this) }
         }

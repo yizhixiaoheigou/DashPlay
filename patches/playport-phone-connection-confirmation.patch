@@ -1,0 +1,318 @@
+diff --git a/web/src/main.ts b/web/src/main.ts
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -145,11 +145,34 @@
+ let deviceNotice = '';
+ let disconnectingPhone: string | null = null;
+ let devicesRevision = 0;
++/** An accepted invitation is still pending until the box reports an actual active session. */
++let connectingTo: string | null = null;
++let connectingUntil = 0, devicesPollTimer = 0;
++const devicesBusy = () => switchingTo !== null || disconnectingPhone !== null || connectingTo !== null;
++devicesStatus.setAttribute('role', 'status');
++devicesStatus.setAttribute('aria-live', 'polite');
++function endDeviceConnection(notice = '') {
++  connectingTo = null;
++  window.clearTimeout(devicesPollTimer); devicesPollTimer = 0;
++  deviceNotice = notice;
++}
++function pollDeviceConnection() {
++  window.clearTimeout(devicesPollTimer); devicesPollTimer = 0;
++  if (!connectingTo) return;
++  const remaining = connectingUntil - Date.now();
++  if (remaining <= 0) {
++    ++devicesRevision;
++    endDeviceConnection(t('deviceConnectTimeout'));
++    renderDevices();
++    return;
++  }
++  devicesPollTimer = window.setTimeout(() => { void loadDevices(); }, Math.min(1500, remaining));
++}
+ const deviceAddress = (phone: BoxPhone) => `蓝牙 …${phone.address.slice(-5)}`;
+ function deviceRow(label: string, detail: string, active: boolean, value: string, onPick: (() => void) | null, onDisconnect: (() => void) | null = null) {
+   const row = document.createElement(onPick ? 'button' : 'div') as HTMLDivElement & HTMLButtonElement;
+   row.className = active ? 'cell on' : 'cell';
+-  if (onPick) { row.type = 'button'; row.disabled = switchingTo !== null || disconnectingPhone !== null; row.onclick = onPick; }
++  if (onPick) { row.type = 'button'; row.disabled = devicesBusy(); row.onclick = onPick; }
+   const main = document.createElement('span'); main.className = 'main';
+   const name = document.createElement('b'); name.textContent = label;
+   const sub = document.createElement('span'); sub.textContent = detail;
+@@ -161,7 +184,7 @@
+     button.type = 'button'; button.className = 'device-disconnect';
+     button.textContent = t(disconnectingPhone ? 'deviceDisconnecting' : 'deviceDisconnect');
+     button.setAttribute('aria-label', `${t('deviceDisconnect')} · ${label}`);
+-    button.disabled = switchingTo !== null || disconnectingPhone !== null;
++    button.disabled = devicesBusy();
+     button.onclick = onDisconnect;
+     row.append(button);
+   }
+@@ -183,7 +206,7 @@
+   const canSwitch = rows > 1;
+   if (wiredRow) {
+     const active = cableLive || wiredRow === 'starting';
+-    const value = cableLive ? t('deviceInUse') : wiredRow === 'starting' ? t('deviceStarting')
++    const value = cableLive ? t('deviceInUse') : wiredRow === 'starting' || connectingTo === 'cable' ? t('deviceStarting')
+       : switchingTo === 'cable' ? t('deviceSwitchingShort') : t('deviceSwitch');
+     deviceRow(`${t('deviceWired')} · ${wiredName || 'iPhone'}`, t('deviceCableDetail'), active, value,
+       !active ? () => { void switchTo(null); } : null);
+@@ -193,43 +216,49 @@
+     const active = !cableLive && wiredRow !== 'starting' && phone.active === true;
+     const label = `${t('deviceWireless')} · ${phone.name || phone.address}`;
+     const detail = phone.last && !active && canSwitch ? `${t('deviceLast')} · ${deviceAddress(phone)}` : deviceAddress(phone);
+-    const value = active ? t('deviceInUse')
++    const value = active ? t('deviceInUse') : connectingTo === phone.address ? t('deviceStarting')
+       : switchingTo === phone.address ? t('deviceSwitchingShort')
+       : canSwitch ? t('deviceSwitch') : t('deviceConnect');
+     deviceRow(label, detail, active, value, !active ? () => { void switchTo(phone); } : null,
+       active ? () => { void disconnectFrom(phone); } : null);
+   }
+-  devicesStatus.textContent = deviceNotice || (canSwitch ? t('devicesHint') : t('devicesOne'));
++  devicesStatus.textContent = deviceNotice || (connectingTo ? t('deviceStarting') : canSwitch ? t('devicesHint') : t('devicesOne'));
+ }
+ async function loadDevices() {
+   if (!token) return;
+   if (devicesLoading) { devicesRefreshPending = true; return; }
+   devicesLoading = true;
+   const revision = devicesRevision;
+-  deviceNotice = '';
++  if (!connectingTo) deviceNotice = '';
++  const abort = new AbortController(), timeout = window.setTimeout(() => abort.abort(), 8000);
+   try {
+-    const r = await fetch(`/api/phones?token=${encodeURIComponent(token)}`, { cache: 'no-store' });
++    const r = await fetch(`/api/phones?token=${encodeURIComponent(token)}`, { cache: 'no-store', signal: abort.signal });
+     if (!r.ok) throw new Error();
+     const body = await r.json() as BoxPhones;
+-    if (revision !== devicesRevision) return;
+-    if (!body.supported) { devicesBlock.hidden = true; return; }
++    if (revision !== devicesRevision || switchingTo || disconnectingPhone) return;
++    // BlueZ can be temporarily busy during the invitation; the accepted action still needs confirmation.
++    if (!body.supported) { if (!connectingTo) devicesBlock.hidden = true; return; }
+     boxPhones = Array.isArray(body.phones) ? body.phones : [];
+     const legacyCable = typeof body.cable === 'string' && body.cable ? body.cable : '';
+     // An older receiver only names the phone using CarPlay on the cable.
+     wiredRow = body.wired === 'live' || body.wired === 'starting' || body.wired === 'available' ? body.wired
+       : legacyCable ? 'live' : null;
+     wiredName = (typeof body.wiredName === 'string' && body.wiredName) || legacyCable;
++    if (connectingTo === 'cable' ? wiredRow === 'live'
++      : connectingTo && boxPhones.some(phone => phone.address === connectingTo && phone.active === true) && wiredRow !== 'live' && wiredRow !== 'starting')
++      endDeviceConnection();
+     devicesBlock.hidden = false;
+     renderDevices();
+   } catch {
+     // Ignore a response begun before a user action.
+-    if (revision === devicesRevision) devicesBlock.hidden = true;
++    if (revision === devicesRevision && !connectingTo) devicesBlock.hidden = true;
+   } finally {
++    window.clearTimeout(timeout);
+     devicesLoading = false;
+     if (devicesRefreshPending) {
+       devicesRefreshPending = false;
+-      if (panel.open) void loadDevices();
+-    }
++      if (panel.open || connectingTo) void loadDevices();
++    } else pollDeviceConnection();
+   }
+ }
+ function deviceError(code: string): string {
+@@ -247,40 +276,44 @@
+ }
+ /** phone null: the wired row. */
+ async function switchTo(phone: BoxPhone | null) {
+-  if (switchingTo || disconnectingPhone) return;
++  if (devicesBusy()) return;
+   ++devicesRevision;
+   switchingTo = phone ? phone.address : 'cable';
++  deviceNotice = '';
+   renderDevices();
++  const abort = new AbortController(), timeout = window.setTimeout(() => abort.abort(), 20000);
+   try {
+     const r = await fetch(`/api/phones/switch?token=${encodeURIComponent(token)}`, {
+-      method: 'POST', headers: { 'Content-Type': 'application/json' },
++      method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: abort.signal,
+       body: JSON.stringify(phone ? { address: phone.address } : { cable: true }),
+     });
+     const body = await r.json().catch(() => ({})) as { error?: string };
+     if (!r.ok) throw new Error(body.error || '');
+-    // The row in use loses CarPlay (not the Wi-Fi); show the chosen one as in use and confirm from the box
+-    // again in a few seconds, once the new session is up.
++    // Accepted only: the old session ended, but the new phone has not necessarily connected.
++    connectingTo = phone ? phone.address : 'cable';
++    connectingUntil = Date.now() + 90_000;
++    boxPhones = boxPhones.map(entry => ({ ...entry, active: false }));
+     if (phone) {
+       if (wiredRow) wiredRow = 'available';
+-      boxPhones = boxPhones.map(entry => ({ ...entry, active: entry.address === phone.address }));
+     } else {
+       wiredRow = 'starting';
+-      boxPhones = boxPhones.map(entry => ({ ...entry, active: false }));
+     }
+     deviceNotice = '';
+     toast(t('deviceSwitching').replace('{name}', phone ? `${t('deviceWireless')} · ${phone.name || phone.address}`
+       : `${t('deviceWired')} · ${wiredName || 'iPhone'}`));
+-    window.setTimeout(() => { if (!devicesBlock.hidden) void loadDevices(); }, 8000);
+   } catch (error) {
+     deviceNotice = deviceError((error as Error).message);
+   } finally {
++    window.clearTimeout(timeout);
++    ++devicesRevision;
+     switchingTo = null;
+     if (!devicesBlock.hidden) renderDevices();
++    if (connectingTo) void loadDevices();
+   }
+ }
+ /** Pause automatic wireless invitations as well as closing this session. Pairing and Wi-Fi stay. */
+ async function disconnectFrom(phone: BoxPhone) {
+-  if (switchingTo || disconnectingPhone) return;
++  if (devicesBusy()) return;
+   ++devicesRevision;
+   disconnectingPhone = phone.address;
+   deviceNotice = '';
+@@ -860,7 +893,7 @@
+   connection.send({type:'stats',stats:{ev,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,width:screen.clientWidth,height:screen.clientHeight,want:wantFullscreen?1:0,...viewport()}});
+ }
+ /** Which page build runs (raised with each build tried in the car). */
+-const BUILD = 2026110402;
++const BUILD = 2026110403;
+ /** What the browser says of the space it gives the page, to find the car's bar over a fullscreen page (2026-10-13):
+  *  window, visual viewport (and its offset), screen, available screen, outer window, pixel ratio. */
+ function viewport(): Record<string, number> {
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -16,6 +16,7 @@
+   deviceCableDetail: ['数据线连接', 'On the USB cable'],
+   deviceBusy: ['正在切换，请稍等。', 'A switch is already in progress.'], deviceFail: ['切换失败，请稍后重试。', 'Switch failed. Try again later.'],
+   deviceConnect: ['连接', 'Connect'], deviceDisconnect: ['断开', 'Disconnect'], deviceDisconnecting: ['正在断开…', 'Disconnecting…'],
++  deviceConnectTimeout: ['尚未确认连接成功，请检查手机蓝牙和 CarPlay 状态后重试。', 'Connection was not confirmed. Check the phone’s Bluetooth and CarPlay, then try again.'],
+   deviceDisconnected: ['已断开，自动连接已暂停；点这部手机可重新连接。', 'Disconnected. Automatic connection is paused; tap this phone to connect again.'],
+   deviceDisconnectFail: ['断开失败，请稍后重试。', 'Could not disconnect. Try again later.'],
+   deviceNotActive: ['这部手机的连接状态已变化，请重新打开设置。', 'This phone’s connection changed. Reopen settings.'],
+diff --git a/web/check-phone-actions.mjs b/web/check-phone-actions.mjs
+--- a/web/check-phone-actions.mjs
++++ b/web/check-phone-actions.mjs
+@@ -14,18 +14,20 @@
+ }
+ const phone = { address: '02:00:00:00:00:01', name: 'Test iPhone', active: true, last: true };
+ function setup() {
+-  const nodes = {}, requests = [], timers = [];
++  const nodes = {}, requests = [], timers = new Map();
++  let timerId = 0, now = 0;
+   const context = vm.createContext({
+     el: id => nodes[id] ??= new Element(), document: { createElement: tag => new Element(tag) },
+     t: key => key, token: 'synthetic-token', panel: { open: true }, toast() {},
+-    window: { setTimeout: callback => timers.push(callback) },
++    window: { setTimeout: (callback, delay) => { timers.set(++timerId, {callback, delay}); return timerId; }, clearTimeout: id => timers.delete(id) },
++    AbortController, Date: { now: () => now },
+     fetch: async (url, init) => {
+       requests.push({ url, init });
+       return { ok: true, json: async () => init?.method === 'POST' ? { ok: true } : { supported: true, phones: [phone] } };
+     },
+   });
+   vm.runInContext(code, context);
+-  return { context, nodes, requests, run: text => vm.runInContext(text, context) };
++  return { context, nodes, requests, timers, advance: ms => { now += ms; }, run: text => vm.runInContext(text, context) };
+ }
+ {
+   const { nodes, requests, run } = setup();
+@@ -44,7 +46,7 @@
+   assert.equal(reconnect.children.at(-1).textContent, 'deviceConnect');
+   assert.equal(nodes['devices-status'].textContent, 'deviceDisconnected');
+   await run('switchTo(boxPhones[0])');
+-  assert.match(requests.at(-1).url, /\/api\/phones\/switch\?token=/);
++  assert.match(requests.findLast(r => r.init?.method === 'POST').url, /\/api\/phones\/switch\?token=/);
+ }
+ {
+   const { context, nodes, run } = setup();
+@@ -76,3 +78,92 @@
+   assert.equal(run('boxPhones[0].active'), false, 'old GET cannot undo completed disconnect');
+ }
+ console.log('Phone actions: live disconnect, single-phone reconnect, failures, busy guard and stale read passed.');
++{
++  const { context, nodes, requests, run } = setup();
++  context.fetch = async (url, init) => {
++    requests.push({url, init});
++    return {ok:true, json:async()=>init?.method === 'POST' ? {ok:true}
++      : {supported:true, phones:[{...phone, active:false}]}};
++  };
++  await run('loadDevices()');
++  await run('switchTo(boxPhones[0])');
++  assert.equal(run('boxPhones[0].active'),false,'an accepted invitation is not an active session');
++  assert.equal(nodes['device-list'].children[0].children[1].textContent,'deviceStarting');
++  assert.equal(nodes['device-list'].children[0].children.some(e=>e.className==='device-disconnect'),false);
++  assert.equal(nodes['device-list'].children[0].disabled,true,'do not repeat a pending invitation');
++  const posts = requests.filter(r=>r.init?.method==='POST').length;
++  await run('switchTo(boxPhones[0])'); await run('disconnectFrom(boxPhones[0])');
++  assert.equal(requests.filter(r=>r.init?.method==='POST').length,posts);
++  context.fetch=async()=>({ok:true,json:async()=>({supported:true,phones:[phone]})});
++  await run('loadDevices()');
++  // If the post-action read was still finishing, consume its queued follow-up.
++  for(let i=0;i<8;i++) await Promise.resolve();
++  await run('loadDevices()');
++  assert.equal(nodes['device-list'].children[0].children[1].textContent,'deviceInUse');
++  assert.equal(nodes['device-list'].children[0].children.at(-1).className,'device-disconnect');
++  assert.equal(nodes['device-list'].children[0].children.at(-1).disabled,false);
++}
++{
++  const {context,nodes,advance,run}=setup();
++  context.fetch=async(_url,init)=>({ok:true,json:async()=>init?.method==='POST'?{ok:true}:{supported:true,phones:[{...phone,active:false}]}});
++  await run('loadDevices()'); await run('switchTo(boxPhones[0])');
++  for(let i=0;i<8;i++) await Promise.resolve();
++  advance(91_000); await run('loadDevices()');
++  assert.equal(nodes['devices-status'].textContent,'deviceConnectTimeout');
++  assert.equal(nodes['device-list'].children[0].disabled,false,'timeout allows another request');
++  assert.equal(nodes['device-list'].children[0].children.at(-1).textContent,'deviceConnect');
++}
++{
++  const {context,nodes,run}=setup();
++  await run('loadDevices()');
++  let finishPost,finishGet;
++  context.fetch=(_url,init)=>new Promise(resolve=>{if(init?.method==='POST')finishPost=resolve;else finishGet=resolve;});
++  const switching=run('switchTo({...boxPhones[0], active:false})');
++  const stale=run('loadDevices()'); // This GET started DURING the POST, not before it.
++  finishPost({ok:true,json:async()=>({ok:true})}); await switching;
++  finishGet({ok:true,json:async()=>({supported:true,phones:[phone]})}); await stale;
++  assert.equal(run('boxPhones[0].active'),false,'a GET from during POST cannot falsely complete the connection');
++  assert.equal(nodes['device-list'].children[0].children[1].textContent,'deviceStarting');
++}
++{
++  const {context,nodes,run}=setup();
++  context.fetch=async(_url,init)=>({ok:!init?.method,json:async()=>init?.method?{error:'not-paired'}:{supported:true,phones:[{...phone,active:false}]}});
++  await run('loadDevices()'); await run('switchTo(boxPhones[0])');
++  assert.equal(nodes['devices-status'].textContent,'deviceNotPaired');
++  assert.equal(nodes['device-list'].children[0].disabled,false);
++  assert.equal(run('boxPhones[0].active'),false);
++}
++console.log('Connection confirmation: accepted vs live, bounded wait, rejected request and GET during POST passed.');
++{
++  const {context,nodes,timers,advance,run}=setup();
++  context.fetch=async(_url,init)=>({ok:true,json:async()=>init?.method==='POST'?{ok:true}:{supported:true,phones:[{...phone,active:false}]}});
++  await run('loadDevices()'); await run('switchTo(boxPhones[0])');
++  for(let i=0;i<8;i++) await Promise.resolve();
++  context.panel.open=false;
++  context.fetch=async()=>({ok:true,json:async()=>({supported:false})});
++  await run('loadDevices()');
++  assert.equal(nodes['devices-block'].hidden,false,'BlueZ busy must not hide an accepted pending action');
++  assert.equal(run('connectingTo'),phone.address);
++  context.fetch=async()=>{throw new Error('temporary network loss');};
++  const poll=[...timers.values()].find(t=>t.delay===1500);
++  assert.ok(poll,'confirmation schedules a follow-up without needing panel interaction');
++  poll.callback(); for(let i=0;i<8;i++) await Promise.resolve();
++  assert.equal(nodes['devices-block'].hidden,false,'temporary lookup failures keep the pending action visible');
++  advance(91_000);
++  [...timers.values()].find(t=>t.delay===1500).callback();
++  for(let i=0;i<8;i++) await Promise.resolve();
++  assert.equal(nodes['devices-status'].textContent,'deviceConnectTimeout');
++  assert.equal(nodes['device-list'].children[0].disabled,false);
++}
++{
++  const {context,nodes,run}=setup();
++  let wired='available';
++  context.fetch=async(_url,init)=>({ok:true,json:async()=>init?.method==='POST'?{ok:true}:{supported:true,phones:[],wired,wiredName:'Synthetic cable'}});
++  await run('loadDevices()'); await run('switchTo(null)');
++  for(let i=0;i<8;i++) await Promise.resolve();
++  assert.equal(nodes['device-list'].children[0].children[1].textContent,'deviceStarting');
++  wired='live'; await run('loadDevices()');
++  assert.equal(nodes['device-list'].children[0].children[1].textContent,'deviceInUse');
++  assert.equal(run('connectingTo'),null);
++}
++console.log('Connection polling: closed panel, temporary fetch failure, timeout recovery and wired confirmation passed.');

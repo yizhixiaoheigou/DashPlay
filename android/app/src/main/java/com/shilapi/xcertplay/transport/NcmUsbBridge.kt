@@ -26,7 +26,11 @@ class NcmUsbBridge internal constructor(
     private val statusEndpoint: UsbEndpoint?,
     private val claimedInterfaces: List<UsbInterface>,
     descriptorHostMac: ByteArray?,
+    private val pendingData: UsbInterface?,
+    private val controlId: Int,
+    private val receiveMask: Int?,
 ) : Closeable {
+    private val activation = UsbDataActivation(pendingData == null)
     private val descriptorMac = descriptorHostMac?.copyOf()
     val hostMac: ByteArray? get() = descriptorMac?.copyOf()
     private val stateLock = Any()
@@ -60,6 +64,8 @@ class NcmUsbBridge internal constructor(
     fun send(frame: ByteArray, timeoutMillis: Int) = synchronized(writeLock) {
         checkOpen()
         require(timeoutMillis > 0) { "timeoutMillis must be positive" }
+        // TUN router solicitations may precede iAP2 authentication; no bulk endpoint is active yet.
+        if (!activation.isActive()) return@synchronized
         val sequence = synchronized(stateLock) {
             checkOpenLocked()
             this.sequence.also { this.sequence = (this.sequence + 1) and 0xffff }
@@ -92,6 +98,7 @@ class NcmUsbBridge internal constructor(
      */
     fun recv(timeoutMillis: Long): ByteArray? {
         require(timeoutMillis > 0) { "timeoutMillis must be positive" }
+        if (!activation.await(timeoutMillis)) return null
         synchronized(readLock) {
             checkOpen()
             if (frames.isNotEmpty()) return pollFrame()
@@ -110,7 +117,17 @@ class NcmUsbBridge internal constructor(
         }
     }
 
+    /** Called once after iAP2 authentication and receiver preparation, before StartSession. */
+    fun activate() = activation.activate {
+        checkOpen()
+        val data = checkNotNull(pendingData)
+        if (!connection.setInterface(data)) throw java.io.IOException("Android could not activate the NCM data alternate")
+        configureReceiveFilter(connection, controlId, receiveMask)
+        Log.i(IphoneCarPlayConfiguration.TAG, "ncm data activated iface=${data.id}/${data.alternateSetting}")
+    }
+
     override fun close() {
+        activation.close()
         statusRunning.set(false)
         val requestToClose = synchronized(stateLock) {
             if (closed) return
@@ -303,7 +320,8 @@ class NcmUsbBridge internal constructor(
         private const val NANOS_PER_MILLISECOND = 1_000_000L
 
         /** Claims and activates the NCM control/data interfaces; owns the connection on success. */
-        fun open(connection: UsbDeviceConnection, function: NcmFunctionDiscovery.NcmFunction): NcmUsbBridge {
+        fun open(connection: UsbDeviceConnection, function: NcmFunctionDiscovery.NcmFunction, configurationId: Int,
+            deferActivation: Boolean = false): NcmUsbBridge {
             val claimed = ArrayList<UsbInterface>(2)
             try {
                 val descriptorHostMac = readNcmHostMac(connection, function.control.id)
@@ -341,16 +359,22 @@ class NcmUsbBridge internal constructor(
                     }
                     claimed.add(function.data)
                 }
-                val altSelected = connection.setInterface(function.data)
+                val defer = deferActivation && function.idleData != null
+                val initialData = if (defer) checkNotNull(function.idleData) else function.data
+                val altSelected = connection.setInterface(initialData)
                 Log.i(
                     IphoneCarPlayConfiguration.TAG,
-                    "setInterface iface=${function.data.id}/${function.data.alternateSetting} ok=$altSelected",
+                    "setInterface iface=${initialData.id}/${initialData.alternateSetting} ok=$altSelected deferred=$defer",
                 )
                 if (!altSelected) {
                     throw java.io.IOException(
                         "Android could not select the NCM data alternate setting",
                     )
                 }
+                // Claiming from the kernel does not initialise the host's receive filter. Send
+                // the CDC request only when this active NCM function advertises support.
+                val receiveMask = NcmPacketFilter.receiveMask(connection.rawDescriptors, configurationId, function.control.id)
+                if (!defer) configureReceiveFilter(connection, function.control.id, receiveMask)
                 Log.i(
                     IphoneCarPlayConfiguration.TAG,
                     "ncm status endpoint=${function.statusIn?.address?.let { "0x${it.toString(16)}" } ?: "none"}",
@@ -362,6 +386,9 @@ class NcmUsbBridge internal constructor(
                     function.statusIn,
                     claimed,
                     descriptorHostMac,
+                    if (defer) function.data else null,
+                    function.control.id,
+                    receiveMask,
                 )
             } catch (error: Throwable) {
                 for (usbInterface in claimed.asReversed()) {
@@ -374,6 +401,16 @@ class NcmUsbBridge internal constructor(
                 connection.close()
                 if (error is java.io.IOException) throw error
                 throw java.io.IOException("Android NCM open failed", error)
+            }
+        }
+
+        private fun configureReceiveFilter(connection: UsbDeviceConnection, controlId: Int, receiveMask: Int?) {
+            if (receiveMask != null) {
+                val result = connection.controlTransfer(0x21, 0x43, receiveMask, controlId, null, 0, USB_CONTROL_TIMEOUT_MILLIS)
+                // Optional firmware rejection keeps the old path available; no reset or retry loop.
+                Log.i(IphoneCarPlayConfiguration.TAG, "ncm receive filter iface=$controlId mask=$receiveMask result=$result")
+            } else {
+                Log.i(IphoneCarPlayConfiguration.TAG, "ncm receive filter iface=$controlId skipped: support not advertised")
             }
         }
 

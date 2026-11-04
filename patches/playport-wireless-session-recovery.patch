@@ -1,0 +1,288 @@
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -104,6 +104,7 @@
+     @Volatile private var presenceLearned = false
+     @Volatile private var lastPeer: String? = null
+ 
++    private val sessionRecovery = WirelessSessionRecovery()
+     private val cableRecovery = CableRecovery()
+     @Volatile private var cableWirelessPhone: String? = null
+     /** Learned from this cable's authenticated Lockdown session, never from a display name. */
+@@ -201,7 +202,7 @@
+                 wiredName = null
+                 wired?.reselect()
+             }
+-            cableRecovery.cancel()
++            cableRecovery.cancel(); sessionRecovery.cancel()
+             selectedPhone = phone
+             switchingTo = phone
+             // Only the chosen phone's own handoff may admit an unidentified peer; an old boot grant or the
+@@ -240,7 +241,7 @@
+     @Synchronized
+     private fun disconnectPhone(phone: String): Boolean {
+         if (closed.get() || cablePhone || selectedPhone != phone) return false
+-        cableRecovery.cancel()
++        cableRecovery.cancel(); sessionRecovery.cancel()
+         bootInvite = false
+         switchingTo = null
+         invitedPhone = null
+@@ -304,11 +305,12 @@
+ 
+     private val listener = object : AirPlaySessionListener {
+         override fun onSessionActive(session: AirPlaySession) {
+-            cableRecovery.cancel()
++            cableRecovery.cancel(); sessionRecovery.cancel()
+             log.info("CarPlay session active peer={}", session.host)
+             activeSession = session
+             connectedWirelessPhone = if (session === wiredSession) null else selectedPhone ?: config.bluetoothDeviceAddress
+             connectedSession = session
++            sessionRecovery.active(connectedWirelessPhone)
+             bootInvite = false
+             invitedPhone = null
+             switchingTo = null
+@@ -325,6 +327,7 @@
+             if (activeSession !== session) return
+             activeSession = null
+             if (connectedSession === session) {
++                if (!closed.get() && !cablePhone) sessionRecovery.ended(System.nanoTime() / 1_000_000)
+                 connectedSession = null
+                 connectedWirelessPhone = null
+             }
+@@ -463,7 +466,7 @@
+     fun setCablePhone(present: Boolean) {
+         if (present) {
+             cablePresent = true
+-            cableRecovery.cancel()
++            cableRecovery.cancel(); sessionRecovery.cancel()
+             if (!cablePhone) cableWirelessPhone = null
+         }
+         if (cablePhone == present) return
+@@ -536,7 +539,7 @@
+             if (closed.get()) return "closed"
+             // Paused before the helper confirms, so neither the supervisor nor a quick retry invites a phone
+             // over Wi-Fi in between; setCablePhone(true) then finds it already done.
+-            cableRecovery.cancel()
++            cableRecovery.cancel(); sessionRecovery.cancel()
+             cablePhone = true
+             switchingTo = null
+             invitedPhone = null
+@@ -824,7 +827,7 @@
+         return true
+     }
+ 
+-    /** Only a fresh Wi-Fi presence proof permits re-invitation after the boot attempt. */
++    /** Presence gates normal invitations; a just-ended live owner has one bounded recovery attempt. */
+     private fun startSupervisor() {
+         if (!config.wireless) return
+         Thread({
+@@ -857,6 +860,7 @@
+                     }
+                     when (idleTimer.action(now, hub.viewerCount > 0, activeSession)) {
+                         IdleAction.RELEASE -> {
++                            sessionRecovery.cancel()
+                             log.info("no viewer for {} s: CarPlay released until a page opens", releaseMs / 1000)
+                             synchronized(this@CarPlayServer) {
+                                 ++wirelessGeneration
+@@ -897,7 +901,7 @@
+                     }
+                     if (cableRecovery.active(wirelessPhone(), now)) {
+                         if (selectedPhone == null || !presence("allowed", selectedPhone!!)) {
+-                            cableRecovery.cancel()
++                            cableRecovery.cancel(); sessionRecovery.cancel()
+                         } else {
+                             if (cableRecovery.take(wirelessPhone(), now, wireless?.running == true)) {
+                                 log.info("retrying wireless after cable unplug; waiting for the phone to join Wi-Fi")
+@@ -911,6 +915,7 @@
+                         continue
+                     }
+                     bootInvite = false
++                    if (recoverWirelessSession(now)) continue
+                     invitedPhone?.takeIf { now - invitedAt >= DECLINE_AFTER_MS }?.let { phone ->
+                         // An online phone that ignores invitations must not block the next person.
+                         invitedPhone = null
+@@ -997,6 +1002,7 @@
+             areas.joinToString(",") { "${it.width}x${it.height}" }.ifEmpty { "-" }, reason,
+         )
+         val wasActive = activeSession != null
++        sessionRecovery.cancel()
+         closingForDisplay.set(wasActive)
+         val keepLink = displayKeepLinkMs()
+         if (wasActive && keepLink > 0 && wireless?.running == true) {
+@@ -1028,6 +1034,25 @@
+     private fun displayKeepLinkMs(): Long =
+         System.getenv("CARPLAY_DISPLAY_KEEP_LINK_MS")?.toLongOrNull()?.coerceIn(0, 20_000) ?: 0L
+ 
++    /** A lost live owner gets one attempt even after leaving our AP to provide a personal hotspot.
++     * This does not change the iPhone Wi-Fi switch, and does not renew failed negotiations.
++     */
++    @Synchronized
++    private fun recoverWirelessSession(now: Long): Boolean {
++        if (closed.get() || cablePhone || activeSession != null || switchingTo != null) return false
++        val phone = sessionRecovery.candidate(now) ?: return false
++        if (selectedPhone != phone || !presence("allowed", phone)) {
++            sessionRecovery.cancel()
++            return false
++        }
++        // Presence helper may block; recheck the current session and the monotonic expiry afterwards.
++        if (closed.get() || cablePhone || activeSession != null || switchingTo != null || selectedPhone != phone) return false
++        if (!sessionRecovery.take(System.nanoTime() / 1_000_000, phone)) return false
++        log.info("wireless session lost; inviting its previous owner once without Wi-Fi presence")
++        restartWireless(confirmedPresent = true)
++        return true
++    }
++
+     /** confirmedPresent: the caller has just seen the selected phone on the network (skips a ~2.4 s re-check). */
+     @Synchronized
+     private fun restartWireless(confirmedPresent: Boolean = false) {
+@@ -1068,7 +1093,7 @@
+ 
+     override fun close() {
+         if (!closed.compareAndSet(false, true)) return
+-        cableRecovery.cancel()
++        cableRecovery.cancel(); sessionRecovery.cancel()
+         // The session first: the phone learns at once that CarPlay is over (it stayed open through the 10 s mDNS
+         // goodbye on every stop or restart, F50 2026-10-14).
+         runCatching { activeSession?.close() }
+diff --git a/server/src/main/kotlin/com/playport/server/WirelessSessionRecovery.kt b/server/src/main/kotlin/com/playport/server/WirelessSessionRecovery.kt
+new file mode 100644
+--- /dev/null
++++ b/server/src/main/kotlin/com/playport/server/WirelessSessionRecovery.kt
+@@ -0,0 +1,28 @@
++package com.playport.server
++
++/** One bounded invitation for the owner of a previously active wireless session.
++ * A failed negotiation cannot renew it; intentional disconnects cancel both owner and grant.
++ */
++internal class WirelessSessionRecovery {
++    private var owner: String? = null
++    private var pending: String? = null
++    private var expires = 0L
++
++    @Synchronized fun active(phone: String?) { cancel(); owner = phone }
++    @Synchronized fun ended(now: Long) {
++        val phone = owner ?: return
++        owner = null
++        pending = phone
++        expires = now + 45_000L
++    }
++    @Synchronized fun candidate(now: Long): String? {
++        if (now >= expires) pending = null
++        return pending
++    }
++    @Synchronized fun take(now: Long, phone: String): Boolean {
++        if (candidate(now) != phone) return false
++        pending = null
++        return true
++    }
++    @Synchronized fun cancel() { owner = null; pending = null; expires = 0L }
++}
+diff --git a/server/src/test/kotlin/com/playport/server/WirelessSessionRecoveryTest.kt b/server/src/test/kotlin/com/playport/server/WirelessSessionRecoveryTest.kt
+new file mode 100644
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/WirelessSessionRecoveryTest.kt
+@@ -0,0 +1,28 @@
++package com.playport.server
++
++import org.junit.Assert.*
++import org.junit.Test
++
++class WirelessSessionRecoveryTest {
++    @Test fun liveOwnerHasOnlyOneAttemptAndNegotiationCannotRenewIt() {
++        val r = WirelessSessionRecovery()
++        r.ended(0); assertNull(r.candidate(1))
++        r.active("a"); r.ended(1000)
++        assertEquals("a", r.candidate(2000))
++        assertFalse(r.take(2000, "b"))
++        assertTrue(r.take(2000, "a")); assertFalse(r.take(2001, "a"))
++        r.ended(3000); assertNull(r.candidate(3001))
++    }
++    @Test fun grantExpiresAndIntentionalDisconnectCancelsBothStates() {
++        val r = WirelessSessionRecovery()
++        r.active("a"); r.ended(1000); assertNull(r.candidate(46000))
++        r.active("a"); r.cancel(); r.ended(50000); assertNull(r.candidate(50001))
++        r.active("a"); r.ended(60000); r.cancel(); assertNull(r.candidate(60001))
++    }
++    @Test fun newLiveOwnerReplacesGrantAndWiredCannotArmIt() {
++        val r = WirelessSessionRecovery()
++        r.active("a"); r.ended(1000); r.active("b"); assertNull(r.candidate(2000))
++        r.ended(3000); assertTrue(r.take(4000, "b"))
++        r.active(null); r.ended(5000); assertNull(r.candidate(5001))
++    }
++}
+diff --git a/server/src/test/kotlin/com/playport/server/WirelessSessionRecoveryIntegrationTest.kt b/server/src/test/kotlin/com/playport/server/WirelessSessionRecoveryIntegrationTest.kt
+new file mode 100644
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/WirelessSessionRecoveryIntegrationTest.kt
+@@ -0,0 +1,71 @@
++package com.playport.server
++
++import com.shilapi.xcertplay.airplay.*
++import java.net.Socket
++import java.nio.file.Files
++import org.junit.Assert.*
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++
++class WirelessSessionRecoveryIntegrationTest {
++    @get:Rule val temp = TemporaryFolder()
++    private val a = "02:00:00:00:00:0A"
++    private val b = "02:00:00:00:00:0B"
++    private fun field(s: CarPlayServer, n: String) = CarPlayServer::class.java.getDeclaredField(n).also { it.isAccessible = true }
++    private fun set(s: CarPlayServer, n: String, v: Any?) = field(s,n).set(s,v)
++    private fun listener(s: CarPlayServer) = field(s,"listener").get(s) as AirPlaySessionListener
++    private fun session(s: CarPlayServer) = AirPlaySession(Socket(), s.airPlayConfig, s.identity, PairingStore(), null, listener(s), object: AirPlayMediaHandler {})
++    private fun pending(s: CarPlayServer) = (field(s,"sessionRecovery").get(s) as WirelessSessionRecovery).candidate(System.nanoTime()/1_000_000)
++    private fun recover(s: CarPlayServer): Boolean {
++        val m = CarPlayServer::class.java.getDeclaredMethod("recoverWirelessSession", Long::class.javaPrimitiveType)
++        m.isAccessible=true; return m.invoke(s,System.nanoTime()/1_000_000) as Boolean
++    }
++    private fun run(allowed: Boolean = true, block: (CarPlayServer) -> Unit) {
++        val root=temp.newFolder().toPath()
++        val helper=root.resolve("presence.py")
++        Files.writeString(helper,"import sys\nif sys.argv[1] == 'allowed' and ${if (allowed) "True" else "False"}: print('ok')\nelse: sys.exit(1)\n")
++        CarPlayServer(ServerConfig(identityDir=root, stateDir=root.resolve("state"), bindAddress="127.0.0.1",wireless=true)).use {
++            set(it,"presenceHelper",helper.toString());set(it,"selectedPhone",a);block(it)
++        }
++    }
++    @Test fun vanishedWifiOwnerIsInvitedOnceWithoutPresence() = run { s ->
++        val live=session(s);listener(s).onSessionActive(live);live.close()
++        assertEquals(a,pending(s));assertTrue(recover(s));assertFalse(recover(s))
++        assertEquals(a,field(s,"invitedPhone").get(s))
++    }
++    @Test fun pausedOwnerCannotBeInvited() = run(false) { s ->
++        val live=session(s);listener(s).onSessionActive(live);live.close()
++        assertFalse(recover(s));assertNull(pending(s))
++    }
++    @Test fun manualDisconnectDoesNotArmRecovery() = run { s ->
++        val live=session(s);listener(s).onSessionActive(live)
++        val m=CarPlayServer::class.java.getDeclaredMethod("disconnectPhone",String::class.java);m.isAccessible=true
++        assertEquals(true,m.invoke(s,a));assertNull(pending(s));assertFalse(recover(s))
++    }
++    @Test fun cableTakeoverCancelsOwnerBeforeClose() = run { s ->
++        val live=session(s);listener(s).onSessionActive(live)
++        s.setCablePhone(true);assertNull(pending(s));assertFalse(recover(s))
++    }
++    @Test fun lateCloseAndChangedSelectionCannotInvitePreviousOwner() = run { s ->
++        val old=session(s);listener(s).onSessionActive(old)
++        set(s,"selectedPhone",b);val next=session(s);listener(s).onSessionActive(next)
++        old.close();assertNull(pending(s));next.close();assertEquals(b,pending(s))
++        set(s,"selectedPhone",a);assertFalse(recover(s));assertNull(pending(s))
++    }
++    @Test fun displayRestartCancelsAutomaticLossRecovery() = run { s ->
++        val live=session(s);listener(s).onSessionActive(live)
++        s.applyDisplay(DisplayRequest(1024,600))
++        assertNull(pending(s));assertFalse(recover(s))
++    }
++    @Test fun anotherNegotiationDoesNotConsumeThePendingGrant() = run { s ->
++        val live=session(s);listener(s).onSessionActive(live);live.close()
++        val negotiating=session(s);set(s,"activeSession",negotiating)
++        assertFalse(recover(s));assertEquals(a,pending(s))
++        negotiating.close();assertTrue(recover(s))
++    }
++    @Test fun negotiationOnlyAndWiredSessionDoNotArmRecovery() = run { s ->
++        val negotiation=session(s);set(s,"activeSession",negotiation);negotiation.close();assertNull(pending(s))
++        val wired=session(s);set(s,"wiredSession",wired);listener(s).onSessionActive(wired);wired.close();assertNull(pending(s))
++    }
++}

@@ -22,7 +22,6 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.OutputStream
-import java.security.MessageDigest
 
 /** LAN management, including before identity/setup. Viewer authorization never grants management access. */
 class AndroidManagement(private val context: Context, private val restart: () -> Unit) {
@@ -154,6 +153,25 @@ class AndroidManagement(private val context: Context, private val restart: () ->
                 catch (_: IllegalArgumentException) { error(call, "手机操作格式无效。", HttpStatusCode.BadRequest) }
                 catch (_: IllegalStateException) { error(call, "手机设置保存失败，请重试。", HttpStatusCode.Conflict) }
             }
+            /** Pairs an iPhone from this page. Needs Root: Android asks the person at this device to confirm, and a
+             *  browser on another machine cannot. Without Root the answer says so instead of failing silently. */
+            post("/api/android/phones/pair") {
+                if (!authorized(call)) return@post
+                try {
+                    val bytes = ByteArrayOutputStream()
+                    receiveBounded(call, bytes, 1024)
+                    val address = JSONObject(bytes.toString("UTF-8")).optString("address").uppercase()
+                    require(address.matches(Regex("[0-9A-F]{2}(:[0-9A-F]{2}){5}"))) { "蓝牙地址格式无效。" }
+                    // Without Root the six digits have to be confirmed on this device, and Android only shows that
+                    // dialog while the settings app is in the foreground (LocalBluetoothPreferences, 2026-11-03).
+                    val started = withContext(Dispatchers.IO) { BluetoothPairing.begin(context, address) }
+                    if (!started) { error(call, "未能发起配对，请确认蓝牙已开启。", HttpStatusCode.Conflict); return@post }
+                    val confirm = if (RootShell.available()) "本机已 Root，确认框会自动处理。"
+                    else "已发起配对：请让系统设置界面在盒子前台，并在该界面点「配对」。"
+                    call.respondText("{\"pairing\":true,\"hint\":\"$confirm\"}", ContentType.Application.Json)
+                } catch (_: UploadTooLarge) { error(call, "请求内容过大。", HttpStatusCode.PayloadTooLarge) }
+                catch (failure: IllegalArgumentException) { error(call, failure.message ?: "配对请求无效。", HttpStatusCode.BadRequest) }
+            }
             post("/api/android/restart") {
                 if (!authorized(call)) return@post
                 call.respondText("{\"restarting\":true}", ContentType.Application.Json)
@@ -213,17 +231,55 @@ class AndroidManagement(private val context: Context, private val restart: () ->
         call.respondText(context.assets.open("manage/$name").bufferedReader().use { it.readText() }, type)
     }
 
+    /** Guards the management routes.
+     *
+     *  The 32-character admin token is gone (owner, 2026-11-03): a device with no screen has to be finishable from a
+     *  browser as soon as the app runs, and that token — only ever shown on the box's own screen — was what stood in
+     *  the way. What remains is the same-origin check, so a page on another site cannot drive these routes.
+     */
     private suspend fun authorized(call: ApplicationCall): Boolean {
         call.response.headers.append("Cache-Control", "no-store")
         val own = WebHub.ownPage(call.request.headers["Origin"],
             "${call.request.local.serverHost}:${call.request.local.serverPort}", call.request.headers["Sec-Fetch-Site"])
-        val token = call.request.headers["X-DashPlay-Admin"].orEmpty()
-        val valid = token.length == 32 && MessageDigest.isEqual(token.toByteArray(), settings.adminToken.toByteArray())
-        if (!own || !valid) {
-            error(call, "请使用设备设置中提供的管理链接。", HttpStatusCode.Forbidden)
+        if (!own) {
+            error(call, "只接受来自本机页面的设置请求。", HttpStatusCode.Forbidden)
             return false
         }
         return true
+    }
+
+    /**
+     * Where the page can be reached, and why not when it cannot (2026-11-03). The HTTPS entry and the plain-HTTP
+     * compatibility entry are separate facts: one being available says nothing about the other.
+     */
+    private fun endpointsJson(): org.json.JSONArray = org.json.JSONArray().apply {
+        val snapshot = DashPlayService.snapshot()
+        if (snapshot.status == Status.RUNNING && snapshot.network != null && DashPlayService.httpsReady) {
+            put(JSONObject().put("scheme", "https").put("purpose", BrowserEndpoint.TLS_PURPOSE)
+                .put("available", true).put("url", "https://${snapshot.address}/"))
+        } else {
+            put(JSONObject().put("scheme", "https").put("purpose", BrowserEndpoint.TLS_PURPOSE)
+                .put("available", false).put("reason", DashPlayService.httpsError ?: "HTTPS 入口尚未就绪"))
+        }
+        val addressState = DashPlayService.addressState()
+        put(JSONObject()
+            .put("scheme", "address").put("purpose", "免 Root 访问地址")
+            .put("available", addressState?.first == TeslaVpnAddress.State.ADDRESS_PRESENT ||
+                addressState?.first == TeslaVpnAddress.State.PEER_VERIFIED)
+            .put("state", addressState?.first?.name ?: "OFF")
+            .put("message", addressState?.second ?: "未启用"))
+        val compat = DashPlayService.compatEndpoint
+        val wanted = settings.compatHttp
+        put(JSONObject()
+            .put("scheme", "http").put("purpose", BrowserEndpoint.COMPAT_PURPOSE).put("enabled", wanted)
+            .put("port", settings.compatHttpPort)
+            .put("available", compat != null)
+            .put("url", compat?.url() ?: "")
+            .put("reason", when {
+                !wanted -> "未启用"
+                compat != null -> ""
+                else -> DashPlayService.compatError ?: "尚未建立"
+            }))
     }
 
     private fun state(): JSONObject {
@@ -231,33 +287,52 @@ class AndroidManagement(private val context: Context, private val restart: () ->
         val hotspot = settings.hotspot()
         val version = runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrDefault("")
         return JSONObject().put("version", version).put("status", snapshot.status.name)
+            .put("viewerUrl", DashPlayService.url?.substringBefore("?") ?: "")
+            .put("detail", snapshot.detail.orEmpty())
+            .put("wirelessProblem", WirelessReadiness.problem(context).orEmpty())
             .put("identity", IdentityImport.present(context)).put("sessionActive", snapshot.sessionActive)
             .put("localHotspot", JSONObject().put("state", DashPlayService.managedHotspot?.phase?.name ?: "OFF")
                 .put("message", DashPlayService.managedHotspot?.message.orEmpty())
                 .put("ssid", DashPlayService.managedHotspot?.connection?.ssid.orEmpty())
                 .put("channel", DashPlayService.managedHotspot?.connection?.channel ?: 0))
             .put("usb", JSONObject().put("enabled", settings.usbEnabled).put("activeMode", settings.usesUsb)
-                .put("state", AndroidWiredController.status).put("message", AndroidWiredController.detail)
+                .put("state", if (settings.usesUsb) AndroidWiredController.status else "OFF")
+                .put("message", if (!settings.usesUsb && !settings.wiredCarPlaySupported) "USB 上网未启用；安卓手机仅支持无线 CarPlay" else AndroidWiredController.detail)
                 .put("internetAllowed", settings.usbInternetAllowed).put("internetReady", settings.usesUsb && settings.usbInternet && UsbVpnService.internetReady)
-                .put("internetMessage", if (!settings.usbInternet) "USB 借网未启用" else if (!settings.usesUsb) "等待启用数据线连接" else UsbVpnService.internetMessage))
-            .put("teslaAccess", TeslaRootAccess.describe().put("enabled", settings.teslaRootAccess).put("checksEnabled", settings.teslaOfflineChecks))
+                .put("internetMessage", when {
+                    !settings.usbInternetRequested -> "通过数据线使用 iPhone 网络已关闭"
+                    !settings.usbEnabled || !settings.usbInternetAllowed -> "已选择使用 iPhone 网络，等待本机启用和授权"
+                    !settings.usesUsb -> "等待启用数据线连接"
+                    else -> UsbVpnService.internetMessage
+                }))
+            .put("teslaAccess", TeslaRootAccess.describe().put("enabled", settings.teslaRootAccess).put("checksEnabled", settings.teslaOfflineChecks)
+                .put("endpoints", endpointsJson()))
             .put("usbShare", UsbShareAccess.describe().put("enabled", settings.usbHotspotShare).put("allowed", settings.usbHotspotShareAllowed))
             .put("ownTls", tlsState())
             .put("update", OnlineUpdate.describe(context))
             .put("viewers", snapshot.viewers).put("capabilities", DeviceCapabilities.describe(context))
             .put("settings", JSONObject().put("deviceName", settings.deviceName)
                 .put("autoHotspot", settings.autoHotspot).put("car", settings.car.name).put("network", settings.network.name)
-                .put("usbInternet", settings.usbInternet)
+                .put("usbInternet", settings.usbInternet).put("usbInternetRequested", settings.usbInternetRequested)
                 .put("usbHotspotShare", settings.usbHotspotShare)
+                .put("deviceKind", settings.deviceKind.name).put("wiredCarPlaySupported", settings.wiredCarPlaySupported)
                 .put("iphoneLink", settings.iphoneLink.name).put("ssid", hotspot?.ssid.orEmpty())
+                .put("externalWifiChoice", settings.externalWifiChoice?.name.orEmpty())
+                .put("currentWifiSsid", CurrentWifi.ssid(context).orEmpty())
+                .put("currentWifiPasswordSaved", CurrentWifi.ssid(context)?.let { it == settings.uplink()?.ssid && (!settings.uplink()?.passphrase.isNullOrEmpty() || settings.securityForNetwork(Network.MIFI) == WifiSecurity.OPEN) } == true)
                 .put("uplinkSsid", settings.uplink()?.ssid.orEmpty())
                 .put("hasUplinkPassword", !settings.uplink()?.passphrase.isNullOrEmpty())
                 .put("hasPassword", !hotspot?.passphrase.isNullOrEmpty()).put("wifiSecurity", settings.wifiSecurity.name)
+                .put("localWifiSecurity", settings.securityForNetwork(Network.THIS_HOTSPOT).name)
+                .put("uplinkWifiSecurity", settings.securityForNetwork(Network.MIFI).name)
                 .put("wifiChannel", settings.wifiChannel).put("audioOutsideCarPlay", settings.audioOutsideCarPlay)
                 .put("idleReleaseSeconds", settings.idleReleaseSeconds).put("startAtBoot", settings.startAtBoot)
                 .put("setupDone", settings.setupDone).put("ownNameOnHotspot", settings.ownNameOnHotspot)
                 .put("hotspotOwnNameRoot", settings.hotspotOwnNameRoot)
-                .put("updateCheck", settings.updateCheck).put("updateMirror", settings.updateMirror))
+                .put("updateCheck", settings.updateCheck).put("updateMirror", settings.updateMirror)
+                .put("compatHttp", settings.compatHttp).put("browserPort", settings.browserPort)
+                .put("compatHttpPort", settings.browserPort)
+                .put("videoTransport", settings.videoTransport.name))
     }
 
     private fun localChain(): List<java.security.cert.X509Certificate>? = runCatching {

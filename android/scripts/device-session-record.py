@@ -6,7 +6,7 @@ state, with the time, to timeline.jsonl. On Ctrl-C (or --seconds) it saves the d
 the diagnostics. Nothing is changed on the device. The admin credential is read from DASHPLAY_ADMIN_TOKEN or
 --token-file and never written to the output.
 
-  DASHPLAY_ADMIN_TOKEN=... python3 android/scripts/device-session-record.py https://192.168.5.49:8080 OUT_DIR
+  DASHPLAY_ADMIN_TOKEN=... python3 android/scripts/device-session-record.py https://192.0.2.10:18743 OUT_DIR
 """
 import argparse
 import json

@@ -13,8 +13,8 @@
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <!-- Searching for the iPhone to add it: location before Android 12, nearby devices after. -->
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="32" />
-    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
     <!-- Finding a DiPlay APK in Download or on a USB stick (TV boxes have no file picker). -->
@@ -42,6 +42,8 @@
 
     <application
         android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:banner="@drawable/tv_banner"
         android:icon="@mipmap/ic_dashplay"
         android:roundIcon="@mipmap/ic_dashplay"
@@ -49,6 +51,7 @@
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
 
+        <activity android:name=".HttpSetupActivity" android:exported="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -88,6 +91,7 @@
         <activity android:name=".SetupActivity" android:exported="false" android:windowSoftInputMode="adjustResize" />
         <activity android:name=".UsbActivity" android:exported="false" />
         <activity android:name=".TeslaAccessActivity" android:exported="false" />
+        <activity android:name=".TeslaAddressProbeActivity" android:exported="false" />
         <activity android:name=".TlsActivity" android:exported="false" />
         <activity android:name=".AutomaticTlsActivity" android:exported="false" android:windowSoftInputMode="adjustResize" />
         <activity android:name=".HotspotActivity" android:exported="false" />

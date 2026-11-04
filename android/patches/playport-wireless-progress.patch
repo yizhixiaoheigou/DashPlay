@@ -1,0 +1,57 @@
+--- a/server/src/main/kotlin/com/playport/server/WirelessBootstrap.kt
++++ b/server/src/main/kotlin/com/playport/server/WirelessBootstrap.kt
+@@ -39,6 +39,7 @@
+ 
+     private fun run() {
+         var failed = false
++        var invitedAddress: String? = null
+         try {
+             val config = server.config
+             val wifi = WifiInfo.detect(config)
+@@ -70,18 +71,21 @@
+                 log.warn("wireless bootstrap skipped: no paired iPhone found; pass --bt-address AA:BB:CC:DD:EE:FF")
+                 return
+             }
++            invitedAddress = deviceAddress
+             val hostBluetoothMac = server.hostBluetoothMac
+             // Closed meanwhile, e.g. an iPhone was plugged into the USB port: no invitation, and no log
+             // line that reads like one (run-receiver.py marks "invitation sent" on it).
+             if (stopped) return
+             log.info("wireless bootstrap: iPhone={} hostBt={} wifi={} ch={}", deviceAddress, hostBluetoothMac, wifi.ssid, wifi.channel)
+ 
++            link?.connectionProgress(deviceAddress, "BLUETOOTH")
+             val stream = synchronized(this) {
+                 if (stopped) return
+                 (link?.open(deviceAddress) ?: BluetoothBridge.open(bridgePath!!, deviceAddress)).also { bridgeProcess = it }
+             }
+             val channel = Iap2Session.openWireless(stream, traceContext = "wireless-rfcomm", onTrace = { log.debug(it) })
+             log.info("wireless iAP2 CSM channel opened over RFCOMM")
++            link?.connectionProgress(deviceAddress, "AUTHENTICATING")
+ 
+             val identification = Iap2IdentificationConfig(
+                 name = server.config.deviceName,
+@@ -116,6 +120,7 @@
+                 onReady = {
+                     log.info("wireless bootstrap accepted by the iPhone; waiting for the Wi-Fi handoff")
+                     server.handoffAccepted()
++                    link?.connectionProgress(deviceAddress, "WIFI_HANDOFF")
+                 },
+                 onProgress = { log.info("wireless $it") },
+             )
+@@ -133,6 +138,7 @@
+         } catch (error: Exception) {
+             if (!stopped) {
+                 log.warn("wireless bootstrap failed: {}", error.message)
++                invitedAddress?.let { server.bluetoothLink?.connectionProgress(it, "FAILED") }
+                 failed = true
+             }
+         } finally {
+@@ -156,6 +162,8 @@
+ 
+     /** A paired iPhone to invite, or null. */
+     fun pairedIphone(): String?
++
++    fun connectionProgress(deviceAddress: String, phase: String) {}
+ 
+     fun open(deviceAddress: String): BlockingDuplexByteStream
+ }

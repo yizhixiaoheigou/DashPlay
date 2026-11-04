@@ -1,0 +1,96 @@
+diff --git a/web/index.html b/web/index.html
+index 2902f09..8256fe2 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -4,8 +4,9 @@
+ <h1 id="browser-check-title" style="font-size:24px">浏览器兼容性检测</h1><p id="browser-check-note">正在检测。如果此提示一直不变，请确认 JavaScript 已启用，或刷新页面重新加载检测脚本。</p><noscript>此浏览器禁用了 JavaScript，无法使用 CarPlay。</noscript><ul id="browser-check-list" style="padding-left:22px"></ul><button id="browser-check-continue" disabled style="padding:12px 20px;font-size:18px">正在检测…</button><p id="browser-check-agent" style="word-wrap:break-word;font-size:12px"></p></section><script src="./browser-check.js"></script><main id="app">
+   <div id="screen-container"><div id="surface"><canvas id="screen" width="1280" height="720" tabindex="0" aria-label="CarPlay" inert></canvas></div></div>
+   <div id="overlay" role="status"><h1>CarPlay</h1><p id="connection-text"></p><p id="connection-hint"></p></div>
+-  <button id="btn-settings" aria-haspopup="dialog" aria-controls="settings"><span aria-hidden="true">⚙</span><span data-i18n="settings">设置</span></button>
++  <button id="btn-settings" aria-haspopup="dialog" aria-controls="settings"><span aria-hidden="true">⚙</span><span data-i18n="settings">盒子设置</span></button>
+   <button id="btn-fullscreen" aria-label="全屏" title="全屏"><svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path class="expand" d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><path class="collapse" d="M3 8h5V3m8 0v5h5M8 21v-5H3m13 5v-5h5"/></svg><span id="fullscreen-label">全屏</span></button>
++  <div id="toast" role="status" hidden></div>
+   <button id="audio-unlock" data-i18n="sound" hidden>轻点启用声音</button>
+   <div id="error-banner" role="alert" hidden><span data-i18n="error"></span><details><summary data-i18n="technical"></summary><p id="error-text"></p></details><button id="dismiss-error" data-i18n="close"></button></div>
+ </main>
+diff --git a/web/src/main.ts b/web/src/main.ts
+index 1f218ee..774646e 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -149,7 +149,15 @@ async function toggleFullscreen() {
+ }
+ el('fullscreen').onclick = toggleFullscreen;
+ el('btn-fullscreen').onclick = toggleFullscreen;
+-document.addEventListener('fullscreenchange', () => { updateFullscreen(); fit(); });
++let toastTimer = 0;
++function toast(message: string) {
++  el('toast').textContent = message; el('toast').hidden = false;
++  window.clearTimeout(toastTimer); toastTimer = window.setTimeout(() => { el('toast').hidden = true; }, 6000);
++}
++document.addEventListener('fullscreenchange', () => {
++  updateFullscreen(); fit();
++  if (document.fullscreenElement) toast(t('fullscreenHint')); else el('toast').hidden = true;
++});
+ document.querySelectorAll<HTMLButtonElement>('[data-command]').forEach(button => button.onclick = () => {
+   const cmd = button.dataset.command;
+   if (cmd === 'home' || cmd === 'back') send({ type:'knob', knob:{ select:false, home:cmd==='home', back:cmd==='back', x:0,y:0,wheel:0 } });
+diff --git a/web/src/style.css b/web/src/style.css
+index 5a23bd6..5a34a66 100644
+--- a/web/src/style.css
++++ b/web/src/style.css
+@@ -38,8 +38,9 @@ fieldset { border:0; padding:0; margin:0; min-width:0; } .pair { display:grid; g
+ 
+ #btn-fullscreen { position:absolute; top:12px;top:max(12px,env(safe-area-inset-top)); right:12px;right:max(12px,env(safe-area-inset-right)); display:flex; align-items:center; gap:8px; min-width:48px; min-height:48px; padding:10px 12px; background:#252b33c9; border-color:#77818e; }
+ #btn-fullscreen:hover, #btn-fullscreen:focus-visible { background:#303945; }
+-/* Live CarPlay keeps the whole picture clear; fullscreen then lives in Settings (opened from the CarPlay gear icon). */
+-#app[data-live=true] #btn-fullscreen { display:none; }
++/* Top-right button only enters fullscreen; once fullscreen it hides and exit lives in Settings (CarPlay gear icon). */
++#btn-fullscreen[data-fullscreen=true] { display:none; }
++#toast { position:absolute; top:max(16px,env(safe-area-inset-top)); left:50%; transform:translateX(-50%); max-width:calc(100vw - 32px); padding:12px 18px; border-radius:12px; background:#252b33f2; border:1px solid #77818e; font-size:17px; line-height:1.5; text-align:center; pointer-events:none; }
+ .fullscreen-action { display:flex; align-items:center; justify-content:center; gap:10px; min-height:56px; margin:18px 0 8px; font-size:19px; }
+ #btn-fullscreen .collapse, #btn-fullscreen[data-fullscreen=true] .expand, #fullscreen .collapse, #fullscreen[data-fullscreen=true] .expand { display:none; }
+ #btn-fullscreen[data-fullscreen=true] .collapse, #fullscreen[data-fullscreen=true] .collapse { display:block; }
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+index b6d14b2..81763f2 100644
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -1,11 +1,11 @@
+ const messages = {
+-  settings: ['设置', 'Settings'], close: ['关闭', 'Close'], language: ['语言', 'Language'],
++  settings: ['盒子设置', 'Box settings'], close: ['关闭', 'Close'], language: ['语言', 'Language'],
+   waiting: ['正在等待 iPhone', 'Waiting for iPhone'], waitingHint: ['手机开启蓝牙并连接盒子 Wi-Fi，已配对手机会自动重连。', 'Enable Bluetooth and join the receiver Wi-Fi. Paired phones reconnect automatically.'],
+   connecting: ['正在连接盒子…', 'Connecting to receiver…'], reconnecting: ['连接中断，正在自动重连…', 'Disconnected. Reconnecting automatically…'],
+   starting: ['已连接，正在等待画面…', 'Connected. Waiting for video…'], live: ['已连接', 'Connected'],
+   access: ['需要首次登录链接', 'First-time access link required'], accessHint: ['请使用私有访问资料中的完整链接打开一次，此浏览器会记住登录。', 'Open the complete link from your private access file once. This browser will remember it.'],
+   sound: ['轻点启用声音', 'Tap to enable sound'], volume: ['音量', 'Volume'],
+-  display: ['画面', 'Display'], fullscreen: ['全屏', 'Fullscreen'], exitFullscreen: ['退出全屏', 'Exit fullscreen'], fullscreenFail: ['此浏览器不允许全屏，画面仍会自动适配窗口。', 'Fullscreen unavailable. The picture still fits this window.'],
++  display: ['画面', 'Display'], fullscreen: ['全屏', 'Fullscreen'], exitFullscreen: ['退出全屏', 'Exit fullscreen'], fullscreenHint: ['已全屏。退出全屏：点 CarPlay 主屏幕上的「盒子设置」图标，再点「退出全屏」。', 'Fullscreen on. To exit, tap the Box settings icon on the CarPlay home screen, then Exit fullscreen.'], fullscreenFail: ['此浏览器不允许全屏，画面仍会自动适配窗口。', 'Fullscreen unavailable. The picture still fits this window.'],
+   auto: ['自动匹配屏幕比例', 'Match screen aspect ratio automatically'], autoHint: ['仅此显示端启用。比例变化时重新协商画面，最多 1920 像素长边；可能短暂重连。', 'Enable on one display only. Aspect changes renegotiate video, up to 1920 pixels on the long edge, and may briefly reconnect.'],
+   width: ['宽度', 'Width'], height: ['高度', 'Height'], apply: ['应用并重连', 'Apply and reconnect'],
+   nightMode: ['夜间模式', 'Night mode'], nightSchedule: ['自动（18:30–06:30 为夜间）', 'Auto (night 18:30–06:30)'], nightSystem: ['跟随车机浏览器深色模式', 'Follow car browser dark mode'], nightDay: ['始终白天', 'Always day'], nightNight: ['始终夜间', 'Always night'],
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+index 60d521b..529b82c 100644
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -89,7 +89,7 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+             microphone = true,
+             manufacturer = config.manufacturer,
+             model = config.model,
+-            oemLabel = "设置",
++            oemLabel = "盒子设置",
+             icons = listOf(AirPlayIcon(180, 180, checkNotNull(javaClass.getResourceAsStream("/f50-settings.png")).use { it.readBytes() })),
+         )
+ 
+diff --git a/server/src/test/kotlin/com/playport/server/OemSettingsTest.kt b/server/src/test/kotlin/com/playport/server/OemSettingsTest.kt
+index 135c6ab..22f5245 100644
+--- a/server/src/test/kotlin/com/playport/server/OemSettingsTest.kt
++++ b/server/src/test/kotlin/com/playport/server/OemSettingsTest.kt
+@@ -13,7 +13,7 @@ class OemSettingsTest {
+         CarPlayServer(ServerConfig(identityDir = root, stateDir = root.resolve("state"), bindAddress = "127.0.0.1")).use { server ->
+             val info = AirPlayInfoPlist.build(server.airPlayConfig)
+             assertEquals(true, info["oemIconVisible"])
+-            assertEquals("设置", info["oemIconLabel"])
++            assertEquals("盒子设置", info["oemIconLabel"])
+             val icon = (info["oemIcons"] as List<*>).single() as Map<*, *>
+             val bytes = icon["imageData"] as ByteArray
+             assertArrayEquals(byteArrayOf(-119,80,78,71,13,10,26,10), bytes.take(8).toByteArray())

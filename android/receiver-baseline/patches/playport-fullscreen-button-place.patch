@@ -1,0 +1,54 @@
+Viewer: the fullscreen button over the picture can sit bottom right or be hidden (2026-10-19).
+
+Users said the round button in the top right corner, shown over live CarPlay outside fullscreen, covers a
+button of CarPlay itself (a music app's search) and cannot be moved. Display gets "画面上的全屏按钮": top right
+(as before), bottom right or hidden, kept in this browser. Fullscreen stays at the top of the settings panel.
+
+--- a/web/index.html
++++ b/web/index.html
+@@ -30,6 +30,7 @@
+   <p class="group-title" data-i18n="display"></p>
+   <div class="group">
+     <label class="cell"><span class="main"><b data-i18n="nightMode"></b><span id="night-status"></span></span><select id="night-mode"><option value="schedule" data-i18n="nightSchedule"></option><option value="system" data-i18n="nightSystem"></option><option value="day" data-i18n="nightDay"></option><option value="night" data-i18n="nightNight"></option></select></label>
++    <label class="cell"><span class="main"><b data-i18n="fullscreenButton"></b><span data-i18n="fullscreenButtonHint"></span></span><select id="fullscreen-button"><option value="top" data-i18n="cornerTop"></option><option value="bottom" data-i18n="cornerBottom"></option><option value="off" data-i18n="cornerOff"></option></select></label>
+     <label class="cell"><span class="main"><b data-i18n="auto"></b></span><input id="auto-fit" class="switch" type="checkbox"/></label>
+     <label class="cell"><span class="main"><b data-i18n="debugHud"></b><span data-i18n="debugHudHint"></span></span><input id="debug-hud-on" class="switch" type="checkbox"/></label>
+     <label class="cell"><span class="main"><b data-i18n="compatDisplay"></b><span data-i18n="compatDisplayHint"></span></span><input id="compat-display-on" class="switch" type="checkbox"/></label>
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -15,6 +15,8 @@
+   nightMode: ['夜间模式', 'Night mode'], nightSchedule: ['自动（18:30–06:30 为夜间）', 'Auto (night 18:30–06:30)'], nightSystem: ['跟随车机浏览器深色模式', 'Follow car browser dark mode'], nightDay: ['始终白天', 'Always day'], nightNight: ['始终夜间', 'Always night'],
+   nightNow: ['当前请求：', 'Requested now: '], nightOn: ['夜间', 'night'], nightOff: ['白天', 'day'], browserDark: ['车机浏览器报告深色模式', 'Car browser reports dark mode'], browserLight: ['车机浏览器报告浅色模式', 'Car browser reports light mode'],
+   latency: ['解码延迟', 'Decode delay'],
++  fullscreenButton: ['画面上的全屏按钮', 'Fullscreen button on the picture'], fullscreenButtonHint: ['挡住 CarPlay 里的按钮时换个位置或不显示；全屏仍可在本页顶部点', 'Move or hide it if it covers a CarPlay button; fullscreen stays at the top of this page'],
++  cornerTop: ['右上角', 'Top right'], cornerBottom: ['右下角', 'Bottom right'], cornerOff: ['不显示', 'Hidden'],
+   debugHud: ['画面上显示调试信息', 'Debug info over the picture'], debugHudHint: ['帧率、分辨率、码率、声音，右下角', 'Frame rate, size, bitrate, sound; bottom right'],
+   compatDisplay: ['兼容显示', 'Compatible display'], compatDisplayHint: ['有声音但画面黑屏时打开（老车机浏览器默认打开）；切换后页面会刷新', 'Turn on if there is sound but no picture (on by default in older car browsers); the page reloads'],
+   ui: ['界面大小', 'UI size'], fps: ['帧率', 'Frame rate'], codec: ['视频编码', 'Video codec'], codecAuto: ['自动', 'Automatic'], standard: ['标准', 'Standard'], large: ['大', 'Large'], small: ['小', 'Small'],
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -298,6 +298,12 @@
+   } catch { error(t('fullscreenFail')); }
+   updateFullscreen();
+ }
++/** Where the button over the live picture sits, or none: it may cover a CarPlay button (a music app's search,
++ *  2026-10-19). Kept in this browser; fullscreen stays in Settings either way. */
++const fullscreenPlace = el<HTMLSelectElement>('fullscreen-button');
++fullscreenPlace.value = ['bottom', 'off'].includes(readFlag('f50-fullscreen-button')) ? readFlag('f50-fullscreen-button') : 'top';
++el('btn-fullscreen').dataset.place = fullscreenPlace.value;
++fullscreenPlace.onchange = () => { saveFlag('f50-fullscreen-button', fullscreenPlace.value); el('btn-fullscreen').dataset.place = fullscreenPlace.value; };
+ el('fullscreen').onclick = toggleFullscreen;
+ el('btn-fullscreen').onclick = toggleFullscreen;
+ el('welcome-fullscreen').onclick = toggleFullscreen;
+--- a/web/src/style.css
++++ b/web/src/style.css
+@@ -104,7 +104,8 @@
+ #btn-fullscreen { position:absolute; top:max(12px,env(safe-area-inset-top)); right:max(12px,env(safe-area-inset-right));
+   width:48px; height:48px; padding:0; border-radius:50%; display:grid; place-items:center; transition:transform .1s ease-out; }
+ #btn-fullscreen:active { transform:scale(.92); }
+-#app:not([data-live=true]) #btn-fullscreen, #btn-fullscreen[data-fullscreen=true] { display:none; }
++#app:not([data-live=true]) #btn-fullscreen, #btn-fullscreen[data-fullscreen=true], #btn-fullscreen[data-place=off] { display:none; }
++#btn-fullscreen[data-place=bottom] { top:auto; bottom:max(12px,env(safe-area-inset-bottom)); }
+ .capsule { position:absolute; left:50%; transform:translateX(-50%); max-width:calc(100vw - 32px); padding:12px 20px; border-radius:22px;
+   background:rgba(44,44,46,.92); -webkit-backdrop-filter:blur(20px); backdrop-filter:blur(20px); border:.5px solid rgba(255,255,255,.14);
+   color:#fff; font-size:16px; line-height:1.45; text-align:center; box-shadow:0 8px 30px rgba(0,0,0,.4); }

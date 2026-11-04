@@ -1,0 +1,217 @@
+diff --git a/web/src/audio.ts b/web/src/audio.ts
+--- a/web/src/audio.ts
++++ b/web/src/audio.ts
+@@ -1,4 +1,5 @@
+ import { MusicOutput } from './music-output';
++import { PcmResampler } from './pcm-resampler';
+ import { audioStartTime } from './audio-timing';
+ import { AudioCodec, type AudioConfigMessage, type AudioPacketMessage } from './protocol';
+ import { baseGain, clampPercent, effectiveGain } from './audio-mix';
+@@ -12,6 +13,7 @@
+   music: MusicOutput | null;
+   decoder: AudioDecoder | null;
+   nextPlayTime: number;
++  resampler: PcmResampler | null;
+   gain: GainNode;
+   /** What [gain] feeds: the master node, or this category's limiter while it is above 100 %. */
+   out: AudioNode;
+@@ -189,6 +191,9 @@
+       music: null,
+       decoder: null,
+       nextPlayTime: 0,
++      resampler: message.name === 'default' && message.codec === AudioCodec.Lpcm &&
++        message.sampleRate > 0 && message.sampleRate <= 16000 && message.sampleRate < this.context.sampleRate
++        ? new PcmResampler(message.sampleRate, this.context.sampleRate, message.channels) : null,
+       gain: streamGain,
+       out,
+     };
+@@ -351,19 +356,22 @@
+ 
+   private playPcm(state: StreamState, payload: Uint8Array): void {
+     if (!this.unlocked || payload.length < 2) return;
+-    const sampleCount = Math.floor(payload.length / 2);
+     const channels = Math.max(1, state.channels);
+-    const frames = Math.max(1, Math.floor(sampleCount / channels));
++    const frames = Math.floor(payload.length / (2 * channels));
++    if (frames === 0) return;
+     const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+-    const buffer = this.context.createBuffer(channels, frames, state.sampleRate);
+-    for (let channel = 0; channel < channels; channel += 1) {
+-      const plane = new Float32Array(frames);
+-      for (let frame = 0; frame < frames; frame += 1) {
++    let planes = Array.from({ length: channels }, () => new Float32Array(frames));
++    for (let channel = 0; channel < channels; channel++) {
++      for (let frame = 0; frame < frames; frame++) {
+         const offset = (frame * channels + channel) * 2;
+-        plane[frame] = view.getInt16(offset, true) / 32768;
+-      }
+-      buffer.copyToChannel(plane, channel);
+-    }
++        planes[channel][frame] = view.getInt16(offset, true) / 32768;
++      }
++    }
++    if (state.resampler) planes = state.resampler.push(planes);
++    if (planes[0].length === 0) return;
++    const buffer = this.context.createBuffer(channels, planes[0].length,
++      state.resampler ? this.context.sampleRate : state.sampleRate);
++    planes.forEach((plane, channel) => buffer.copyToChannel(plane, channel));
+     this.schedule(state, buffer);
+   }
+ 
+diff --git a/web/src/main.ts b/web/src/main.ts
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -814,7 +814,7 @@
+   connection.send({type:'stats',stats:{ev,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,width:screen.clientWidth,height:screen.clientHeight,want:wantFullscreen?1:0,...viewport()}});
+ }
+ /** Which page build runs (raised with each build tried in the car). */
+-const BUILD = 2026110301;
++const BUILD = 2026110401;
+ /** What the browser says of the space it gives the page, to find the car's bar over a fullscreen page (2026-10-13):
+  *  window, visual viewport (and its offset), screen, available screen, outer window, pixel ratio. */
+ function viewport(): Record<string, number> {
+diff --git a/web/package.json b/web/package.json
+--- a/web/package.json
++++ b/web/package.json
+@@ -5,7 +5,7 @@
+   "type": "module",
+   "scripts": {
+     "dev": "vite",
+-    "test": "node check.mjs && node check-audio.mjs && node check-audio-mix.mjs && node check-car.mjs && node check-browser.mjs && node check-flac.mjs && node check-codec-startup.mjs && node check-live-mode.mjs",
++    "test": "node check.mjs && node check-audio.mjs && node check-audio-mix.mjs && node check-car.mjs && node check-browser.mjs && node check-flac.mjs && node check-codec-startup.mjs && node check-live-mode.mjs && node check-pcm-resampler.mjs && node check-navigation-pcm.mjs",
+     "build": "tsc && vite build",
+     "preview": "vite preview"
+   },
+diff --git a/web/src/pcm-resampler.ts b/web/src/pcm-resampler.ts
+new file mode 100644
+--- /dev/null
++++ b/web/src/pcm-resampler.ts
+@@ -0,0 +1,61 @@
++/** Streaming upsampling for low-rate navigation PCM. Each browser AudioBufferSource resamples in isolation;
++ * preserving history here avoids inserting filter edges every 7.5 ms. Output uses the context's native rate.
++ * The 32-tap windowed-sinc filter needs 16 source frames of lookahead (2 ms at 8 kHz), not a media buffer.
++ * Deliberately only an upsampler: other audio paths keep their existing decoder and timing. */
++export class PcmResampler {
++  private readonly radius = 16;
++  private readonly phases = 1024;
++  private readonly kernels: Float32Array[];
++  private history: Float32Array[];
++  private offset = 0;
++  private received = 0;
++  private produced = 0;
++
++  constructor(private readonly inputRate: number, private readonly outputRate: number, private readonly channels: number) {
++    if (!Number.isFinite(inputRate) || !Number.isFinite(outputRate) || inputRate <= 0 || outputRate < inputRate ||
++        !Number.isInteger(channels) || channels < 1 || channels > 8) throw new Error('Invalid PCM resampler format');
++    this.history = Array.from({ length: channels }, () => new Float32Array());
++    this.kernels = Array.from({ length: this.phases + 1 }, (_, phase) => {
++      const fraction = phase / this.phases;
++      const weights = new Float32Array(this.radius * 2);
++      let sum = 0;
++      for (let tap = 0; tap < weights.length; tap++) {
++        const distance = tap - this.radius + 1 - fraction;
++        const sinc = Math.abs(distance) < 1e-9 ? 1 : Math.sin(Math.PI * distance) / (Math.PI * distance);
++        const window = 0.5 + 0.5 * Math.cos(Math.PI * distance / this.radius);
++        weights[tap] = sinc * window; sum += weights[tap];
++      }
++      for (let tap = 0; tap < weights.length; tap++) weights[tap] /= sum;
++      return weights;
++    });
++  }
++
++  push(planes: Float32Array[]): Float32Array<ArrayBuffer>[] {
++    if (planes.length !== this.channels || planes.some(p => p.length !== planes[0].length)) throw new Error('Invalid PCM planes');
++    this.history = this.history.map((old, channel) => {
++      const joined = new Float32Array(old.length + planes[channel].length);
++      joined.set(old); joined.set(planes[channel], old.length); return joined;
++    });
++    this.received += planes[0].length;
++    // Absolute integer counters avoid packet-dependent rounding and long-session clock drift.
++    const end = Math.max(this.produced, Math.ceil((this.received - this.radius) * this.outputRate / this.inputRate));
++    const output = Array.from({ length: this.channels }, () => new Float32Array(end - this.produced));
++    for (let frame = this.produced; frame < end; frame++) {
++      const position = frame * this.inputRate / this.outputRate, index = Math.floor(position);
++      const kernel = this.kernels[Math.round((position - index) * this.phases)];
++      for (let channel = 0; channel < this.channels; channel++) {
++        let value = 0;
++        for (let tap = 0; tap < kernel.length; tap++) {
++          const sample = index - this.radius + 1 + tap - this.offset;
++          if (sample >= 0 && sample < this.history[channel].length) value += this.history[channel][sample] * kernel[tap];
++        }
++        output[channel][frame - this.produced] = value;
++      }
++    }
++    this.produced = end;
++    const keep = Math.max(0, Math.floor(end * this.inputRate / this.outputRate) - this.radius + 1);
++    const discard = Math.max(0, keep - this.offset);
++    this.history = this.history.map(p => p.slice(discard)); this.offset += discard;
++    return output;
++  }
++}
+diff --git a/web/check-pcm-resampler.mjs b/web/check-pcm-resampler.mjs
+new file mode 100644
+--- /dev/null
++++ b/web/check-pcm-resampler.mjs
+@@ -0,0 +1,27 @@
++import assert from 'node:assert/strict';
++import {readFileSync} from 'node:fs';
++import ts from 'typescript';
++const source=readFileSync(new URL('./src/pcm-resampler.ts',import.meta.url),'utf8');
++const {outputText}=ts.transpileModule(source,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ESNext}});
++const {PcmResampler}=await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
++for(const rate of [44100,48000]) {
++ const input=Float32Array.from({length:8000},(_,i)=>.4*Math.sin(2*Math.PI*997*i/8000));
++ const right=input.map(v=>-v);
++ const full=new PcmResampler(8000,rate,2).push([input,right]);
++ for(const sizes of [[60],[1,7,31,60,320,9]]) {
++  const stream=new PcmResampler(8000,rate,2), output=[[],[]];let at=0,n=0;
++  while(at<input.length){const end=Math.min(input.length,at+sizes[n++%sizes.length]);const chunk=stream.push([input.slice(at,end),right.slice(at,end)]);chunk.forEach((p,c)=>output[c].push(...p));at=end;}
++  for(let c=0;c<2;c++)assert.deepEqual(Float32Array.from(output[c]),full[c],`packetization must not change samples at ${rate} Hz`);
++  assert.ok(stream.history[0].length<=32,'history bounded independently of stream duration');
++ }
++ assert.equal(full[0].length,Math.ceil((8000-16)*rate/8000),'only 2 ms lookahead, no 40 ms aggregation');
++ let error=0;
++ for(let i=1000;i<full[0].length-1000;i++)error+=(full[0][i]-.4*Math.sin(2*Math.PI*997*i/rate))**2;
++ assert.ok(Math.sqrt(error/(full[0].length-2000))<.001,'low-rate sine remains clean after continuous upsampling');
++ const silence=new PcmResampler(8000,rate,2).push([new Float32Array(800),new Float32Array(800)]);
++ assert.ok(silence.every(p=>p.every(v=>v===0)),'silence cannot create hiss');
++}
++const fresh=new PcmResampler(8000,48000,1);assert.ok(fresh.push([new Float32Array(60)] )[0].every(v=>v===0),'new stream has no previous samples');
++assert.throws(()=>new PcmResampler(48000,8000,1));
++assert.throws(()=>fresh.push([new Float32Array(2),new Float32Array(2)]));
++console.log('Streaming PCM: packet boundaries, 44.1/48 kHz, stereo, signal accuracy, silence, bounded history and reset passed');
+diff --git a/web/check-navigation-pcm.mjs b/web/check-navigation-pcm.mjs
+new file mode 100644
+--- /dev/null
++++ b/web/check-navigation-pcm.mjs
+@@ -0,0 +1,30 @@
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import vm from 'node:vm';
++import ts from 'typescript';
++import { setImmediate as settle } from 'node:timers/promises';
++const source = name => readFileSync(new URL(`./src/${name}.ts`, import.meta.url), 'utf8');
++function evaluate(code, scope, name) {
++ const js=ts.transpileModule(code.replace(/^import .*;\n/gm,'').replace(/export /g,''),{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ESNext}}).outputText;
++ return vm.runInNewContext(`${js}\n${name}`,scope);
++}
++const timers=new Map();let serial=0;
++const win={setTimeout:fn=>{timers.set(++serial,fn);return serial;},clearTimeout:id=>timers.delete(id)};
++class Node { gain={value:1}; threshold={value:0};knee={value:0};ratio={value:0};attack={value:0};release={value:0}; connect(out){this.out=out;} disconnect(){this.out=null;} }
++class Context {state='running';sampleRate=48000;currentTime=0;destination=new Node();createGain(){return new Node();}createDynamicsCompressor(){return new Node();}resume(){this.state='running';return Promise.resolve();}suspend(){this.state='suspended';return Promise.resolve();}}
++const scope={window:win,AudioContext:Context,MusicOutput:{supported:()=>false},performance:{now:()=>0},AudioCodec:{Lpcm:3,AacLc:1,Opus:2},pageDropsMusic:(drop,name)=>drop&&name==='media',baseGain:(name,boost)=>name==='default'?boost:1,clampPercent:(_,v)=>v,effectiveGain:(base,v)=>base*v/100,audioStartTime:()=>0};
++scope.PcmResampler=evaluate(source('pcm-resampler'),{},'PcmResampler');
++const Engine=evaluate(source('audio'),scope,'AudioEngine');
++const config=(name='default',streamType=101)=>({kind:'audio-config',name,streamType,codec:3,sampleRate:16000,channels:2,description:new Uint8Array()});
++const failures=[];
++async function test(name,fn){try{await fn();console.log('PASS',name);}catch(e){failures.push(name);console.error('FAIL',name,e.message);}}
++await test('navigation PCM uses native-rate buffers, keeps channels and isolates a new stream',()=>{
++ const buffers=[];Context.prototype.createBuffer=function(channels,length,rate){const planes=[];const b={duration:length/rate,copyToChannel:(p,c)=>planes[c]=p,rate,planes};buffers.push(b);return b;};
++ Context.prototype.createBufferSource=function(){return {connect(){},disconnect(){},start(){}};};
++ const a=new Engine(()=>{});a.unlocked=true;a.handleConfig({...config(),sampleRate:8000});
++ const bytes=new Uint8Array(240);const v=new DataView(bytes.buffer);for(let i=0;i<60;i++){v.setInt16(i*4,8000,true);v.setInt16(i*4+2,-8000,true);}
++ a.handlePacket({streamType:101,data:bytes});assert.equal(buffers[0].rate,48000);assert.ok(buffers[0].planes[0].some(x=>x>0));assert.ok(buffers[0].planes[1].every((x,i)=>Math.abs(x+buffers[0].planes[0][i])<1e-7));
++ a.stopAll();a.handleConfig({...config(),sampleRate:8000});a.handlePacket({streamType:101,data:new Uint8Array(240)});assert.ok(buffers.at(-1).planes.every(p=>p.every(x=>x===0)));
++ a.handleConfig(config('telephony',102));assert.equal(a.streams.get(102).resampler,null,'call path unchanged');
++});
++assert.deepEqual(failures,[],`${failures.length} navigation regression(s)`);

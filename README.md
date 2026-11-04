@@ -2,11 +2,21 @@
 
 [English](README.en.md)
 
-把带 Wi-Fi 和蓝牙的 Linux 小盒子变成 CarPlay 接收端：iPhone 用数据线插盒子（有线 CarPlay），或经蓝牙引导连上 Wi-Fi（无线 CarPlay）；车机或任何设备用浏览器打开盒子的网页，就能显示画面、播放声音并触控操作。没有 CarPlay 的车，只要车机有浏览器、能连 WiFi，就可以试。
+DashPlay 让 Linux 盒子、支持的 OpenWrt 设备或安卓设备接收 iPhone 的 CarPlay，由车机或其他设备的浏览器显示画面、播放声音并接收触控。安卓手机仅支持无线 CarPlay；安卓盒子和 Linux/OpenWrt 设备的连接方式取决于系统与硬件。使用前需确认浏览器和接收端能通过网络互访。
 
 DashPlay 基于 [PlayPort](https://github.com/youcci/playport)，提供补丁和配套运行程序：有线 CarPlay（盒子作 USB 主机）、Linux BlueZ 蓝牙桥接、面向车机浏览器的精简界面与系统媒体控制、首次设置与设置页、开机自启与监管等。
 
 > **这不是 Apple 认证产品。** 运行需要你自己提供配件认证身份，见下文“认证身份”。刷机有风险，操作不当可能变砖。
+
+## 按系统选择安装方式
+
+| 设备系统 | 下载与说明 |
+|---|---|
+| Android 手机或电视盒子 | **DashPlay for Android**，两者使用同一个 `DashPlay-android-<版本>.apk`；见[安卓使用说明](docs/DashPlay安卓使用说明.md)和[安卓安装 Skill](skills/dashplay-android-install/SKILL.md)。保留原系统，不需要刷 Linux |
+| Linux（N1 / 玩客云） | 本仓库的程序包及适用刷机包，见下方 Linux 安装与连接说明 |
+| OpenWrt | [openwrt-dashplay](https://github.com/yizhixiaoheigou/openwrt-dashplay) 提供软件包、软件源及 LuCI 页面，使用本仓库的核心程序 |
+
+安卓安装包在本仓库的[发布列表](https://github.com/yizhixiaoheigou/DashPlay/releases)中查找；安卓版本与 Linux/OpenWrt 的日期版本分别编号。没有实际 Android APK 的发布条目不能用于安装。OpenWrt 文件也可能以 `.apk` 结尾，请按平台和完整文件名区分。
 
 ## 怎么装
 
@@ -125,15 +135,19 @@ sh scripts/onecloud/firmware/build-bundle.sh dashplay-bundle.tar   # 程序包�
 
 `scripts/build-playport.sh` 可在隔离 Docker 容器中完成同样的 Gradle 构建与测试。盒子上运行需要 Java 21 和带 asyncio 的 Python 3：玩客云/N1 由 `install.sh` 从 Debian 安装，OpenWrt 由插件的 `dashplay-jre`（Temurin 21 musl 版）与系统软件源提供。
 
-## 安卓版（源码已公开，仍是 beta）
+## DashPlay for Android（安卓版，beta）
 
-同一套接收端也能装进安卓设备：一台闲置安卓手机或安卓电视盒子当接收端，iPhone 插数据线或经蓝牙连 WiFi，车机浏览器看画面。源码在 [`android/`](android/)，和盒子用同一个 PlayPort 基线、同一份补丁序列，差异只在平台层（系统热点、USB 主机、Root、证书）。
+同一套接收端也能装进安卓设备：一台闲置安卓手机或安卓电视盒子当接收端：安卓手机仅支持无线 CarPlay，安卓盒子可按硬件条件使用有线或无线，车机浏览器看画面。源码在 [`android/`](android/)，与 Linux 使用同一个 PlayPort 上游版本；本次安卓构建使用 `android/receiver-baseline/` 固定的公共补丁，再叠加 Android 平台补丁，避免两条发布分支互相覆盖。
 
-- **状态：beta，尚未发布安装包。** 这个仓库里只有源码，发布页还没有 APK；自己构建按 `android/` 里的 Gradle 工程，需要 JDK 25 与 Android SDK 35。
-- 最低安卓 5.0（API 21）。有线 CarPlay 需要设备支持 OTG；无线需要系统热点或 Wi-Fi Direct。
-- 首启会问这台设备是「安卓手机」还是「安卓电视盒子」，只影响排布与措辞，热点、Root、USB 能力都按设备实际情况开放。
-- 不附带 CarPlay 认证身份，和盒子一样由你自己导入。
-- 无线 ADB、`/manage` 管理页、离线更新（系统安装器确认）都在源码里；正式签名与在线更新要等首个 beta 发布。
+- **仍在 beta 验证阶段。** 手机与盒子共用 APK，不分成两个安装包。安装包以发布页实际 Android 资产为准；没有 APK 可等待或明确选择源码构建（JDK 25、Android SDK 35、Node.js）。OpenWrt `.apk` 不是 Android 安装包。
+- 首次设置按问题逐步展开：设备 → 车型 → 车机网络 → 访问路线（HTTP / HTTPS） → iPhone 连接/上网 → 适用时 HTTPS/DNS → 身份/声音/启动方式 → 总结。答案决定下一题；不满足时解释缺失能力并给替代，可保存草稿。见 [使用说明](docs/DashPlay安卓使用说明.md) 和 [分支表与流程图](skills/dashplay-android-install/references/capability-routing.md)。
+- 最低 Android 5.0，当前 APK 支持 ARMv7/ARM64 系统 ABI，不支持 x86。安卓手机必须具备经典蓝牙及可互访 Wi-Fi，不能改用有线；安卓盒子的数据线连接需要 USB Host 和 USB/VPN 授权（不依赖蓝牙）；无线需要经典蓝牙与可互访网络。有线也需要车机到接收端的局域网。没有 SIM 不妨碍本地 CarPlay。
+- 普通浏览器不统一要求 Root。特斯拉可选择 **HTTP 兼容方式（实验性功能）**：无需域名或证书，优先使用 WebRTC 视频，连接失败时改用 JPEG 图片；或选择 **HTTPS 方式**：本机热点需 App 可用的 Root，外部网络需已有车机可访问的接收端地址，再配置域名解析和可信证书。两种方式都需在实际车机上验证。
+- 已有屏幕/遥控器可设置；App 已运行且已连入同网时也可访问管理页，不要求管理密钥。系统授权仍需本机完成。只说明缺什么能力，不指导刷机、获取 ADB 或 Root；AI 按 [安卓安装 Skill](skills/dashplay-android-install/SKILL.md) 逐题协助。
+- 本软件不附带 CarPlay 身份，请自行导入。
+- 安卓网页默认端口为 **18743**，HTTP 与 HTTPS 共用端口。管理页始终是 `http://设备地址:18743/manage`；画面按 App 显示的地址打开。请保留完整的 `http://` 或 `https://` 前缀，不要省略或替换。
+- 同一台 iPhone 使用一个接收端时，请停止其他 DashPlay 设备的接收服务，避免重复无线邀请导致连接被抢占。详情及同签名升级方法见[使用说明](docs/DashPlay安卓使用说明.md)。
+- 当前代码对安卓手机固定使用无线，旧有线/自动配置升级为无线，USB 上网默认关闭且单独授权；对新装且有 USB Host 的安卓盒子预选数据线，首次安装预选通过数据线使用 iPhone 网络，实际使用仍需本机授权；用户明确关闭会保留，向导选择其他上网来源也会更新使用 iPhone 网络意图。已有无线会话插线保持无线。核对所装 APK 是否包含当前实现；源码构建通过不代表真机或发布验收完成。
 
 ## 运行（玩客云 / 斐讯 N1）
 
@@ -157,7 +171,7 @@ python3 -m unittest discover -s tests/bluetooth     # 需要 dbus-daemon 与 dbu
 python3 -m unittest discover -s tests/onecloud      # 设置、多手机、平台、诊断、固件打包；证书测试需 OpenSSL 3
 ```
 
-## 已知问题
+## 已知问题（以下为 Linux/OpenWrt 路线）
 
 - 有线 CarPlay 首次插上时，iPhone 有时 8 秒内不打开画面，盒子会自动重来一次，插线到出画约 50 秒（无线约 45 秒）。
 - 播放页窗口每换一次大小（普通、全屏、分屏、竖屏）都按新尺寸重连一次（无线约 5–6 s，有线约 10 s），每个尺寸用它最清楚的分辨率等比显示、不拉伸；重连期间保留最后一帧。

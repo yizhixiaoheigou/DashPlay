@@ -1,0 +1,37 @@
+Receiver: a phone invited right after pairing is remembered before an idle release ends its session (2026-10-19).
+
+On the F50, a newly paired iPhone was invited at once with no page open for more than the idle wait: its
+session came up and the very next supervisor pass released it, before the pass that would learn the phone's
+Wi-Fi identity ("remember"). Opening the page later found no known phone on the Wi-Fi, so no invitation went
+out and the page stayed on "waiting for the iPhone" until the settings page invited that phone by hand. The
+identity is now learned first in each pass, before the idle decision.
+
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -542,6 +542,14 @@
+                     // The phone on the cable owns CarPlay; its session is no Wi-Fi presence either.
+                     if (cablePhone) { viewerSeenAt = now; continue }
+                     if (hub.viewerCount > 0) viewerSeenAt = now
++                    // Learn the phone's Wi-Fi identity before an idle release can end its session: a phone invited
++                    // right after pairing, with no page open, was released first and then never invited again,
++                    // being unknown on this Wi-Fi (F50, 2026-10-19).
++                    if (activeSession != null && !presenceLearned) lastPeer?.let { peer ->
++                        selectedPhone?.let { phone ->
++                            presenceLearned = presence("remember", peer, phone, activeSession?.controllerId.orEmpty())
++                        }
++                    }
+                     when (idleAction(now, viewerSeenAt, activeSession != null, parked, releaseMs)) {
+                         IdleAction.RELEASE -> {
+                             parked = true
+@@ -567,11 +575,6 @@
+                     if (activeSession != null) {
+                         lastBootstrapAt = now
+                         absentChecks = 0
+-                        if (!presenceLearned) lastPeer?.let { peer ->
+-                            selectedPhone?.let { phone ->
+-                                presenceLearned = presence("remember", peer, phone, activeSession?.controllerId.orEmpty())
+-                            }
+-                        }
+                         continue
+                     }
+                     if (presenceHelper == null) {

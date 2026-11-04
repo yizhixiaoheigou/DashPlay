@@ -16,6 +16,7 @@ object PhoneActions {
         return when (request.action) {
             "connect" -> {
                 val receiver = DashPlayService.activeReceiver() ?: return "请先启动接收服务。"
+                WirelessReadiness.problem(context)?.let { return it }
                 if (!receiver.config.wireless) return "请先完成无线连接的网络与蓝牙设置。"
                 when (receiver.switchPhone(address)) {
                     null -> null

@@ -1,0 +1,36 @@
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -318,9 +318,9 @@
+ // Use that hint on the next page load; slow-decoder fallback still takes effect now.
+ let pageFastDecoder = fastDecoder();
+ function wantHevc() {
+-  // HTTP pictures are decoded by the box. Resizing must not infer its codec from browser WebCodecs.
+-  if (compatEntry) return display?.hevc ?? false;
+   const codec = el<HTMLSelectElement>('codec').value;
++  // Preserve the box codec for automatic HTTP resizing, but honour explicit codec choices.
++  if (compatEntry && codec === 'auto') return display?.hevc ?? false;
+   return codec === 'h265' || (codec === 'auto' && hevcDecodes && readFlag('f50-hevc-failed') !== '1');
+ }
+ let fastReports = 0, slowReports = 0;
+@@ -957,7 +957,7 @@
+   connection.send({type:'stats',stats:{ev,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,width:screen.clientWidth,height:screen.clientHeight,want:wantFullscreen?1:0,...viewport()}});
+ }
+ /** Which page build runs (raised with each build tried in the car). */
+-const BUILD = 2026110416;
++const BUILD = 2026110417;
+ /** What the browser says of the space it gives the page, to find the car's bar over a fullscreen page (2026-10-13):
+  *  window, visual viewport (and its offset), screen, available screen, outer window, pixel ratio. */
+ function viewport(): Record<string, number> {
+--- a/web/check-codec-startup.mjs
++++ b/web/check-codec-startup.mjs
+@@ -91,6 +91,10 @@
+ await adapt();
+ assert.equal(events.length,1);assert.equal(events[0].target.width,1100);assert.equal(events[0].target.height,700);
+ assert.equal(events[0].target.hevc,true,'browser capability must not change box-side JPEG source codec');
++codec='h264';assert.equal(wantHevc(),false,'HTTP must honour explicit H.264 so RTC can run');
++codec='h265';assert.equal(wantHevc(),true,'HTTP must honour explicit H.265 for JPEG');
++codec='auto';assert.equal(wantHevc(),true,'HTTP automatic resize preserves the source codec');
++
+ // A request is not a completed negotiation: do not repeatedly restart during resize.
+ events=[];displayNegotiating=true;screen.clientWidth=800;screen.clientHeight=1000;
+ await adapt();assert.equal(events.length,0);

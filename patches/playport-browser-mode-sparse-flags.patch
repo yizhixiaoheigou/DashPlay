@@ -1,0 +1,50 @@
+diff --git a/web/src/main.ts b/web/src/main.ts
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -386,7 +386,8 @@
+     if (!response.ok) return;
+     value = await response.json() as typeof value;
+   } catch { return; }
+-  if (request !== modeRequest || !value || typeof value.tesla !== 'boolean') return;
++  if (request !== modeRequest || !value || typeof value !== 'object' || Array.isArray(value) ||
++      [value.tesla,value.carMusic,value.carVoice].some(flag => flag !== undefined && typeof flag !== 'boolean')) return;
+   const nextTesla = value.tesla === true;
+   const nextMusic = value.carMusic === true || (value.carMusic === undefined && value.tesla === true);
+   const nextVoice = value.carVoice === true;
+diff --git a/web/check-live-mode.mjs b/web/check-live-mode.mjs
+--- a/web/check-live-mode.mjs
++++ b/web/check-live-mode.mjs
+@@ -7,7 +7,10 @@
+ const source = main.slice(main.indexOf('const TESLA_SOUND_LABELS'), main.indexOf('// Every visible slider'));
+ const elements = ['audioOutput','audioOutputHint','audioOffCarPlay','audioMixHint'].map(key => ({ dataset: { i18n:key } }));
+ const updates = [], passive = [];
+-let response = { tesla:true, carMusic:true, carVoice:true };
++const fixtures = process.env.DASHPLAY_BROWSER_ACCESS_FIXTURES
++  ? JSON.parse(readFileSync(process.env.DASHPLAY_BROWSER_ACCESS_FIXTURES,'utf8'))
++  : {tesla:{tesla:true,carMusic:true,carVoice:true},normal:{},bluetooth:{carMusic:true}};
++let response = fixtures.tesla;
+ const context = vm.createContext({
+   teslaMode:false, carMusic:false, carVoice:false, boxFlags:{}, voices:new Set(), promptGain:()=>1,
+   audio:{ updateMode:value=>updates.push(value) }, media:{ setPassive:value=>passive.push(value) },
+@@ -18,12 +21,20 @@
+ await vm.runInContext('syncBoxMode()', context);
+ assert.equal(context.teslaMode,true); assert.equal(updates.at(-1).dropMusic,true);
+ assert.equal(elements[0].dataset.i18n,'teslaNavOutput');
+-response={tesla:false,carMusic:false,carVoice:false};
++response=fixtures.normal;
+ await vm.runInContext('syncBoxMode()', context);
+ assert.equal(context.teslaMode,false); assert.equal(updates.at(-1).dropMusic,false);
+ assert.equal(elements[0].dataset.i18n,'audioOutput','reverse switch restores normal labels');
+ assert.deepEqual(passive,[true,false]);
+ assert.equal(context.boxFlags.playportTeslaMode,false,'microphone and other consumers follow live mode');
++response=fixtures.bluetooth;await vm.runInContext('syncBoxMode()',context);
++assert.equal(context.teslaMode,false);assert.equal(context.carMusic,true);
++response=fixtures.normal;await vm.runInContext('syncBoxMode()',context);
++assert.equal(context.carMusic,false);assert.equal(context.boxFlags.playportCarMusic,false);
++for (const invalid of [null,[],{tesla:'false'},{carMusic:1}]) {
++ response=invalid;await vm.runInContext('syncBoxMode()',context);
++ assert.equal(context.teslaMode,false);assert.equal(context.carMusic,false);
++}
+ // Two reconnects: a late response from the old connection must not overwrite the new mode.
+ const pending=[];context.fetch=()=>new Promise(resolve=>pending.push(resolve));
+ const first=vm.runInContext('syncBoxMode()',context), second=vm.runInContext('syncBoxMode()',context);

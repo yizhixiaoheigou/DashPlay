@@ -19,8 +19,7 @@ class LicensesActivity : Activity() {
         root.addView(ui.text(R.style.Text_Head, "第三方组件"))
         root.addView(ui.text(R.style.Text_Small, read("third-party.txt")))
         root.addView(ui.text(R.style.Text_Head, "许可证全文"))
-        for (name in listOf("Apache-2.0.txt", "MIT.txt", "BSD-3-Clause.txt",
-            "GPL-2.0-with-Classpath-exception.txt", "GPL-3.0.txt", "USB-NOTICE.txt")) {
+        for (name in assets.list("licenses").orEmpty().filter { it != "third-party.txt" }.sorted()) {
             val body = read(name)
             if (body.isNotBlank()) {
                 root.addView(ui.text(R.style.Text_Name, name))

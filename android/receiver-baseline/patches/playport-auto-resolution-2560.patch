@@ -1,0 +1,55 @@
+Viewer: auto resolution goes up to 2560 on the long side once the browser decodes fast (2026-10-19).
+
+Auto took the screen's real pixels but stopped at 1920, so a 2.5K screen got 1920 scaled up while owners set
+2560 by hand. With a fast decoder (the same gate as real pixels and H.265) the cap is now 2560; a slow decoder
+keeps 1920. A Tesla's 1920x1200 panel and the XPeng (about 1533 wide) ask for what they did before.
+
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -20,6 +20,12 @@
+     assert.deepEqual(next.display,{...display,area:index},'every later change only switches area');
+     display=next.display; }
+   assert.equal(areaPlan(display,page,false,shapes),null,'the same shape never'); }
++// Auto with a fast decoder goes up to 2560 on the long side (user 2026-10-19: owners set 2560 by hand on 2.5K screens);
++// a Tesla's 1920x1200 panel (1254x784 CSS px at 1.53) stays as it was.
++assert.deepEqual(suggestedResolution(2560,1440,2560),{width:2560,height:1440},'a 2.5K screen gets its own pixels');
++assert.deepEqual(suggestedResolution(3840,2160,2560),{width:2560,height:1440},'never beyond 2560');
++assert.deepEqual(suggestedResolution(1254*1.53,784*1.53,2560),{width:1918,height:1200},'Tesla: same as before');
++assert.deepEqual(suggestedResolution(2560,1440),{width:1920,height:1080},'1920 unless asked for more');
+ assert.deepEqual(shownSize(1280,846,1280,756),{width:1280,height:756},'fullscreen picture fills the normal page without bars');
+ assert.deepEqual(shownSize(1280,756,1280,846),{width:1280,height:846},'and the other way round');
+ assert.deepEqual(shownSize(1280,846,1082,1280),{width:1082,height:1280},'no black bars even before a portrait renegotiation');
+--- a/web/src/display-fit.ts
++++ b/web/src/display-fit.ts
+@@ -1,7 +1,8 @@
+-/** Match aspect rather than blindly multiplying by DPR (a 4K car panel need not decode 4K). */
+-export function suggestedResolution(width: number, height: number) {
++/** Match aspect rather than blindly multiplying by DPR (a 4K car panel need not decode 4K): the long side 1280 to
++ *  `max` (1920; auto with a fast decoder asks for up to 2560, as owners of 2.5K screens set by hand, 2026-10-19). */
++export function suggestedResolution(width: number, height: number, max = 1920) {
+   const ratio = Math.min(4, Math.max(0.25, width / Math.max(1, height)));
+-  const long = Math.max(1280, Math.min(1920, Math.max(width, height)));
++  const long = Math.max(1280, Math.min(max, Math.max(width, height)));
+   let w = ratio >= 1 ? long : long * ratio;
+   let h = ratio >= 1 ? long / ratio : long;
+   const grow = Math.max(1, 480 / Math.min(w, h));
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -89,7 +89,7 @@
+ }
+ /** Auto quality (2026-10-14; a Tesla decodes a frame in ~1 ms, the XPeng in 60-100 ms): once this browser has
+  *  shown it decodes fast (f50-fast-decoder, from the 10 s reports), auto picks the resolution from the screen's real
+- *  pixels (CSS size x device pixel ratio, long side 1280-1920) and H.265 when the browser decodes it; a slow decoder
++ *  pixels (CSS size x device pixel ratio, long side 1280-2560) and H.265 when the browser decodes it; a slow decoder
+  *  keeps the CSS-size choice and H.264. The codec list (auto / H.264 / H.265) overrides. */
+ function readFlag(key: string) { try { return localStorage.getItem(key) ?? ''; } catch { return ''; } }
+ function saveFlag(key: string, value: string) { try { localStorage.setItem(key, value); } catch { /* Then auto stays as it was. */ } }
+@@ -393,7 +393,7 @@
+ }
+ function autoTarget() {
+   const pixels=fastDecoder()?Math.min(2,Math.max(1,window.devicePixelRatio||1)):1;
+-  return suggestedResolution(screen.clientWidth*pixels,screen.clientHeight*pixels);
++  return suggestedResolution(screen.clientWidth*pixels,screen.clientHeight*pixels,fastDecoder()?2560:1920);
+ }
+ el<HTMLSelectElement>('codec').value = readFlag('f50-codec') || 'auto';
+ el<HTMLSelectElement>('codec').onchange=() => { saveFlag('f50-codec', el<HTMLSelectElement>('codec').value); lastAutoTarget=''; scheduleAuto(); };

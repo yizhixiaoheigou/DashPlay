@@ -857,6 +857,16 @@ class PersistentStationAdapterTests(unittest.TestCase):
         self.assertFalse(any(cmd[:2] == ['iw', 'dev'] and cmd[-1] == 'link' for cmd in commands))
         self.assertIn(['iw', 'dev', 'wlan-test', 'set', 'power_save', 'off'], commands)
 
+    def test_open_station_uses_no_key_and_keeps_frequency_lock(self):
+        with patch('platform_debian.subprocess.run'), patch.object(self.p, 'start'):
+            self.p.start_phone_station({'ssid': 'Public', 'passphrase': '', 'security': 'open'}, 5180)
+        conf = (self.root / 'wpa.conf').read_text()
+        self.assertIn('key_mgmt=NONE', conf)
+        self.assertNotIn('psk=', conf)
+        self.assertNotIn('SAE', conf)
+        self.assertIn('scan_freq=5180', conf)
+        self.assertIn('freq_list=5180', conf)
+
     def test_stop_disables_dhcp_and_only_flushes_station(self):
         with patch('platform_debian.subprocess.run') as run, patch.object(self.p, 'stop_child') as stop:
             self.p.stop_phone_station()

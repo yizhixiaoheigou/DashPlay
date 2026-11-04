@@ -429,7 +429,8 @@ class PhoneUplink:
         self.started = True
         self.set_status('wired' if cable else 'offline',
                         '已接有线网络；局域网保持可用' if cable else
-                        tesla_hidden_reason(hidden) if hidden else '盒子热点就绪；后台寻找手机热点')
+                        tesla_hidden_reason(hidden) if hidden else
+                        self.missing_hotspot_reason() if not self.saved else '盒子热点就绪；后台寻找手机热点')
         # usb_tether: give the cable's lease a few seconds before chasing the hotspot. A service restart with
         # the cable plugged used to decide "no cable" before the address arrived, join the hotspot, then
         # switch back — each move rebuilt the AP and restarted the receiver (4 receiver starts in 15 s,
@@ -577,6 +578,12 @@ class PhoneUplink:
         except NETWORK_ERRORS as error:
             self.defer('上联连接失败（' + type(error).__name__ + '）；保持局域网')
 
+    def missing_hotspot_reason(self):
+        if not self.saved:
+            return ('USB 网络尚未就绪；未设置备用 WiFi，局域网保持可用' if self.share else
+                    '未设置上网热点；局域网保持可用')
+        return ('未找到备用热点 ' if self.share else '未找到手机热点 ') + self.saved['ssid'] + '；局域网保持可用'
+
     def tick(self):
         if not self.started:
             return
@@ -655,7 +662,7 @@ class PhoneUplink:
             if frequency:
                 self.connect(frequency)
             else:
-                self.set_status('offline', '没找到手机热点；局域网保持可用')
+                self.set_status('offline', self.missing_hotspot_reason())
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             # A failed status query is not proof of disassociation. Do not tear down the LAN.
             self.status['uplink_error'] = type(error).__name__

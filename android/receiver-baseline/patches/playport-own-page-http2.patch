@@ -1,0 +1,41 @@
+Own-page check: the address the request went to from the connection point, so HTTP/2 passes (2026-10-13).
+
+The check took the Host header, which HTTP/2 does not have (:authority instead): a phone's display request
+over HTTP/2 got a 403 ("暂未完成自动匹配") while the WebSocket, over HTTP/1.1, worked. It now uses the
+connection point's host and port, filled from either, and compares host and port with the scheme's default port.
+On the F50: the display request from the page 200 over HTTP/1.1 and HTTP/2; from another origin 403 over both.
+
+--- a/server/src/main/kotlin/com/playport/server/WebHub.kt
++++ b/server/src/main/kotlin/com/playport/server/WebHub.kt
+@@ -521,12 +521,16 @@
+             if (fetchSite != null && fetchSite != "same-origin" && fetchSite != "none") return false
+             if (origin == null) return true
+             val uri = runCatching { java.net.URI(origin) }.getOrNull() ?: return false
+-            val authority = (uri.host ?: return false) + if (uri.port == -1) "" else ":${uri.port}"
+-            return host != null && authority.equals(host, ignoreCase = true)
++            val defaultPort = when (uri.scheme) { "https" -> 443; "http" -> 80; else -> return false }
++            val wanted = runCatching { java.net.URI("${uri.scheme}://$host") }.getOrNull() ?: return false
++            return uri.host != null && uri.host.equals(wanted.host, ignoreCase = true) &&
++                (if (uri.port == -1) defaultPort else uri.port) == (if (wanted.port == -1) defaultPort else wanted.port)
+         }
+ 
++        // The address the request went to: the Host header (HTTP/1.1) or :authority (HTTP/2, no Host header,
++        // so the phone's display request got a 403 on 2026-10-13), from the connection point of either.
+         private fun io.ktor.server.application.ApplicationCall.fromOwnPage(): Boolean = ownPage(
+-            request.headers["Origin"], request.headers["Host"] ?: request.headers[":authority"], request.headers["Sec-Fetch-Site"])
++            request.headers["Origin"], "${request.local.serverHost}:${request.local.serverPort}", request.headers["Sec-Fetch-Site"])
+ 
+         const val MIC_FRAME_LPCM = 0x10
+         const val MIC_FRAME_OPUS = 0x11
+--- a/server/src/test/kotlin/com/playport/server/OwnPageTest.kt
++++ b/server/src/test/kotlin/com/playport/server/OwnPageTest.kt
+@@ -12,6 +12,9 @@
+         assertTrue(WebHub.ownPage(null, "192.168.77.1:18443", "same-origin"))   // a same-origin GET carries no Origin
+         assertTrue(WebHub.ownPage(null, "192.168.77.1:18443", null))            // not a browser: the token still applies
+         assertTrue(WebHub.ownPage(null, null, "none"))                          // typed into the address bar
++        // HTTP/2 has no Host header: the address comes from the connection point (403 on a phone, 2026-10-13).
++        assertTrue(WebHub.ownPage("https://mycar.duckdns.org:18443", "mycar.duckdns.org:18443", "same-origin"))
++        assertTrue(WebHub.ownPage("https://dashplay.lan", "dashplay.lan:443", null))   // the default port left out
+     }
+ 
+     @Test fun anotherSiteIsRefused() {

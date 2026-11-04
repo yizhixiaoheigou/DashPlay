@@ -1,0 +1,222 @@
+diff --git a/web/check-car.mjs b/web/check-car.mjs
+index 59e3a5a..84f0c3d 100644
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -237,3 +237,13 @@ console.log('Tesla fullscreen: only with its video sites reachable.');
+   }
+   globalThis.window=savedWindow;globalThis.fetch=savedFetch;globalThis.localStorage=savedStorage;
+ }
++
++{ // Debug overlay (2026-10-16): three short lines, the music bitrate on the music stream, nothing for no picture yet.
++  const {hudLines}=await load('debug-hud');
++  const sample={width:1280,height:846,fps:29.6,hevc:false,videoKbps:2412,decodeMs:63.4,queue:1,rttMs:41.2,
++    audio:[{name:'media',codec:'AAC',sampleRate:44100,channels:2},{name:'default',codec:'PCM',sampleRate:16000,channels:1}],musicKbps:256.4,playing:true};
++  assert.deepEqual(hudLines(sample,true),['1280×846 · 30 fps · H.264 · 2.4 Mbps','解码 63 ms · 队列 1 · 往返 41 ms','声音 音乐 AAC 44.1 kHz 256 kbps · 播报 PCM 16 kHz 单声道']);
++  assert.deepEqual(hudLines({...sample,width:0,hevc:null,rttMs:-1,audio:[],musicKbps:0,playing:false},false),
++    ['No picture yet','Decode 63 ms · Queue 1 · RTT –','Sound none']);
++  assert.equal(hudLines({...sample,playing:false},true)[2].endsWith('（静音中）'),true);
++}
+diff --git a/web/index.html b/web/index.html
+index c10b847..622b3d5 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -15,6 +15,7 @@
+   </div></div>
+   <button id="btn-fullscreen" class="glass" type="button" aria-label="全屏" title="全屏"><svg class="ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path class="expand" d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><path class="collapse" d="M3 8h5V3m8 0v5h5M8 21v-5H3m13 5v-5h5"/></svg><span id="fullscreen-label" class="sr">全屏</span></button>
+   <div id="toast" class="capsule" role="status" hidden></div>
++  <div id="debug-hud" aria-hidden="true" hidden></div>
+   <button id="audio-unlock" class="capsule" data-i18n="sound" hidden>轻点启用声音</button>
+   <div id="error-banner" role="alert" hidden><b data-i18n="error"></b><details><summary data-i18n="technical"></summary><p id="error-text"></p></details><button id="dismiss-error" class="text" data-i18n="close"></button></div>
+ </main>
+@@ -30,6 +31,7 @@
+   <div class="group">
+     <label class="cell"><span class="main"><b data-i18n="nightMode"></b><span id="night-status"></span></span><select id="night-mode"><option value="schedule" data-i18n="nightSchedule"></option><option value="system" data-i18n="nightSystem"></option><option value="day" data-i18n="nightDay"></option><option value="night" data-i18n="nightNight"></option></select></label>
+     <label class="cell"><span class="main"><b data-i18n="auto"></b></span><input id="auto-fit" class="switch" type="checkbox"/></label>
++    <label class="cell"><span class="main"><b data-i18n="debugHud"></b><span data-i18n="debugHudHint"></span></span><input id="debug-hud-on" class="switch" type="checkbox"/></label>
+     <details><summary class="cell"><span class="main"><b data-i18n="custom"></b></span><span id="display-status" class="value" role="status"></span><span class="chev"></span></summary>
+       <form id="display-form" class="inner"><fieldset id="display-fields"><div class="pair"><label><span data-i18n="width"></span><input id="width" type="number" min="480" max="3840" step="2" required/></label><label><span data-i18n="height"></span><input id="height" type="number" min="480" max="3840" step="2" required/></label></div><div class="pair"><label><span data-i18n="ui"></span><select id="ui-scale"><option value="85" data-i18n="small"></option><option value="100" data-i18n="standard"></option><option value="115" data-i18n="large"></option></select></label><label><span data-i18n="fps"></span><select id="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label></div><div class="pair"><label><span data-i18n="codec"></span><select id="codec"><option value="auto" data-i18n="codecAuto"></option><option value="h264">H.264</option><option value="h265">H.265</option></select></label></div></fieldset><button id="apply" class="btn" data-i18n="apply"></button></form></details>
+   </div>
+diff --git a/web/src/audio.ts b/web/src/audio.ts
+index 0720b6e..87cc654 100644
+--- a/web/src/audio.ts
++++ b/web/src/audio.ts
+@@ -221,6 +221,12 @@ export class AudioEngine {
+     this.sleepWhenIdle();
+   }
+ 
++  /** The streams now open, for the debug overlay (debug-hud.ts). */
++  describe(): { name: string; codec: string; sampleRate: number; channels: number }[] {
++    const codecs: Record<number, string> = { [AudioCodec.AacLc]: 'AAC', [AudioCodec.Opus]: 'Opus', [AudioCodec.Lpcm]: 'PCM' };
++    return Array.from(this.streams.values(), s => ({ name: s.name, codec: codecs[s.codec] ?? String(s.codec), sampleRate: s.sampleRate, channels: s.channels }));
++  }
++
+   /** Music element counters for the viewer log (music-output.ts). */
+   musicReport(): Record<string, number> {
+     const total: Record<string, number> = {};
+diff --git a/web/src/debug-hud.ts b/web/src/debug-hud.ts
+new file mode 100644
+index 0000000..25f6b47
+--- /dev/null
++++ b/web/src/debug-hud.ts
+@@ -0,0 +1,34 @@
++/** Debug overlay over the picture (2026-10-16, asked for in the car): a few numbers only, refreshed once a second
++ *  while the switch in Display is on. It takes no touches (pointer-events: none), so CarPlay under it works as usual. */
++export interface HudSample {
++  width: number; height: number; fps: number; hevc: boolean | null;
++  videoKbps: number; decodeMs: number; queue: number;
++  /** Last ping round trip to the box (the pong queues behind every frame not yet sent), -1 before the first. */
++  rttMs: number;
++  /** Each audio stream now open (audio.ts describe()), and the music bitrate as the iPhone sends it. */
++  audio: { name: string; codec: string; sampleRate: number; channels: number }[];
++  musicKbps: number; playing: boolean;
++}
++
++const NAMES: Record<string, [string, string]> = {
++  media: ['音乐', 'Music'], default: ['播报', 'Prompts'], telephony: ['通话', 'Call'],
++  speechrecognition: ['Siri', 'Siri'], alert: ['提示音', 'Alert'],
++};
++
++function rate(kbps: number) { return kbps >= 1000 ? `${(kbps / 1000).toFixed(1)} Mbps` : `${Math.round(kbps)} kbps`; }
++
++export function hudLines(s: HudSample, zh: boolean): string[] {
++  const i = zh ? 0 : 1;
++  const codec = s.hevc === null ? '' : s.hevc ? ' · H.265' : ' · H.264';
++  const lines = [
++    s.width ? `${s.width}×${s.height} · ${Math.round(s.fps)} fps${codec} · ${rate(s.videoKbps)}` : (zh ? '尚无画面' : 'No picture yet'),
++    `${zh ? '解码' : 'Decode'} ${Math.round(s.decodeMs)} ms · ${zh ? '队列' : 'Queue'} ${s.queue} · ${zh ? '往返' : 'RTT'} ${s.rttMs >= 0 ? `${Math.round(s.rttMs)} ms` : '–'}`,
++  ];
++  const audio = s.audio.map(a => {
++    const name = NAMES[a.name]?.[i] ?? a.name;
++    const music = a.name === 'media' && s.musicKbps > 0 ? ` ${rate(s.musicKbps)}` : '';
++    return `${name} ${a.codec} ${(a.sampleRate / 1000).toFixed(a.sampleRate % 1000 ? 1 : 0)} kHz${a.channels === 1 ? ' ' + (zh ? '单声道' : 'mono') : ''}${music}`;
++  });
++  lines.push(`${zh ? '声音' : 'Sound'} ${audio.length ? audio.join(' · ') : (zh ? '无' : 'none')}${audio.length && !s.playing ? (zh ? '（静音中）' : ' (silent)') : ''}`);
++  return lines;
++}
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+index 517a25c..98bbd80 100644
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -15,6 +15,7 @@ const messages = {
+   nightMode: ['夜间模式', 'Night mode'], nightSchedule: ['自动（18:30–06:30 为夜间）', 'Auto (night 18:30–06:30)'], nightSystem: ['跟随车机浏览器深色模式', 'Follow car browser dark mode'], nightDay: ['始终白天', 'Always day'], nightNight: ['始终夜间', 'Always night'],
+   nightNow: ['当前请求：', 'Requested now: '], nightOn: ['夜间', 'night'], nightOff: ['白天', 'day'], browserDark: ['车机浏览器报告深色模式', 'Car browser reports dark mode'], browserLight: ['车机浏览器报告浅色模式', 'Car browser reports light mode'],
+   latency: ['解码延迟', 'Decode delay'],
++  debugHud: ['画面上显示调试信息', 'Debug info over the picture'], debugHudHint: ['帧率、分辨率、码率、声音，右下角', 'Frame rate, size, bitrate, sound; bottom right'],
+   ui: ['界面大小', 'UI size'], fps: ['帧率', 'Frame rate'], codec: ['视频编码', 'Video codec'], codecAuto: ['自动', 'Automatic'], standard: ['标准', 'Standard'], large: ['大', 'Large'], small: ['小', 'Small'],
+   loading: ['正在读取…', 'Loading…'], applying: ['正在应用…', 'Applying…'], applied: ['已保存，正在重新连接 CarPlay。', 'Saved. Reconnecting CarPlay.'],
+   loadFail: ['读取失败，请检查盒子连接后重试。', 'Could not load settings. Check the receiver connection and retry.'],
+diff --git a/web/src/lag.ts b/web/src/lag.ts
+index 13130cf..6854fbd 100644
+--- a/web/src/lag.ts
++++ b/web/src/lag.ts
+@@ -10,9 +10,11 @@ export class LagProbe {
+     this.queue.push(now);
+     if (this.queue.length > 30) this.queue.shift();
+   }
++  /** The latest round trip, for the debug overlay; -1 before the first pong. */
++  last = -1;
+   pong(now: number) {
+     const at = this.queue.shift();
+-    if (at !== undefined) this.worst = Math.max(this.worst, now - at);
++    if (at !== undefined) { this.last = now - at; this.worst = Math.max(this.worst, this.last); }
+   }
+   /** The window's worst round trip, counting a pong still on its way by its age; then a new window. */
+   take(now: number): Record<string, number> {
+@@ -21,5 +23,5 @@ export class LagProbe {
+     this.worst = -1;
+     return lag >= 0 ? { lagMs: Math.round(lag) } : {};
+   }
+-  reset() { this.queue.length = 0; this.worst = -1; }
++  reset() { this.queue.length = 0; this.worst = -1; this.last = -1; }
+ }
+diff --git a/web/src/main.ts b/web/src/main.ts
+index 2ba84d3..cfea4f3 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -10,6 +10,7 @@ import { suggestedResolution, areaPlan, areaSize, type Area } from './display-fi
+ import { t, language, setLanguage, type Key } from './i18n';
+ import { isNight, parseNightMode } from './night';
+ import { reachable, TESLA_HOPS } from './tesla-fullscreen';
++import { hudLines } from './debug-hud';
+ import type { ServerMessage, ClientMessage } from './protocol';
+ 
+ function el<T extends HTMLElement = HTMLElement>(id: string): T { return document.getElementById(id) as T; }
+@@ -30,6 +31,8 @@ let reportFrames = 0, reportBytes = 0, reportStart = performance.now();
+ let lastPaintAt = 0, handledDownAt = 0, touchSum = 0, touchCount = 0;
+ // Music as the iPhone sends it (stream 102, AAC): its bitrate is the iPhone's choice.
+ let musicBytes = 0;
++// The same, per second, for the debug overlay (debug-hud.ts).
++let hudFrames = 0, hudBytes = 0, hudMusicBytes = 0, hudStart = performance.now();
+ let state: Key = token ? 'connecting' : 'access';
+ let hint: Key = token ? 'waitingHint' : 'accessHint';
+ let lastAutoTarget = '', autoTimer = 0, displayBusy = false;
+@@ -110,7 +113,7 @@ function send(message: ClientMessage) { if (active) connection.send(message); }
+ const video = new VideoPlayer(canvas, error, () => {
+   if (!active) return;
+   if (!shownOnce) { startup.mark('firstFrameMs'); connection.send({type:'stats', stats:{ev:16,...startupStats()}}); }
+-  frames++; reportFrames++; painted = true; shownOnce = true; el('overlay').hidden = true; el('app').dataset.live = 'true';
++  frames++; reportFrames++; hudFrames++; painted = true; shownOnce = true; el('overlay').hidden = true; el('app').dataset.live = 'true';
+   if (holding) { holding = false; el('toast').hidden = true; }
+   if (wokeAt) { lifeEvent(14, { pictureMs: Math.round(performance.now() - wokeAt) }); wokeAt = 0; }
+   const now = performance.now();
+@@ -159,12 +162,12 @@ const connection = new Connection(token, {
+       case 'video-config': video.configure(message); break;
+       case 'video-frame': video.pushFrame(message); break;
+       case 'audio-config': audio.handleConfig(message); voiceStarted(message.streamType, message.name); break;
+-      case 'audio-packet': if (message.streamType === 102) musicBytes += message.data.length; audio.handlePacket(message); break;
++      case 'audio-packet': if (message.streamType === 102) { musicBytes += message.data.length; hudMusicBytes += message.data.length; } audio.handlePacket(message); break;
+       case 'audio-stopped': audio.stopStream(message.streamType); voiceStopped(message.streamType); break;
+     }
+   },
+   onServer(message) { lastHeard = performance.now(); server(message); },
+-  onBytes(count) { reportBytes += count; lastHeard = performance.now(); },
++  onBytes(count) { reportBytes += count; hudBytes += count; lastHeard = performance.now(); },
+   onState(value) {
+     if (value === 'open' && closedAt) { lifeEvent(11, { downMs: Math.round(performance.now() - closedAt), failures: connection.failures }); closedAt = 0; }
+     if (value === 'closed') { if (!closedAt) closedAt = performance.now(); if (!wokeAt) wokeAt = closedAt; reset(shownOnce); state = 'reconnecting'; }
+@@ -405,7 +408,7 @@ function pageEvent(ev: number) {
+   connection.send({type:'stats',stats:{ev,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,width:screen.clientWidth,height:screen.clientHeight,want:wantFullscreen?1:0,...viewport()}});
+ }
+ /** Which page build runs (raised with each build tried in the car). */
+-const BUILD = 202610142250;
++const BUILD = 202610161700;
+ /** What the browser says of the space it gives the page, to find the car's bar over a fullscreen page (2026-10-13):
+  *  window, visual viewport (and its offset), screen, available screen, outer window, pixel ratio. */
+ function viewport(): Record<string, number> {
+@@ -498,6 +501,20 @@ window.setInterval(()=>{
+   judgeDecoder(video.decodeLatencyMs, reportFrames/seconds);
+   reportFrames=0;reportBytes=0;reportStart=now;touchSum=0;touchCount=0;musicBytes=0;
+ },10000);
++// Debug overlay: off unless turned on in Display (kept in this browser); nothing is counted differently while it is off.
++const hud = el('debug-hud'), hudSwitch = el<HTMLInputElement>('debug-hud-on');
++hudSwitch.checked = readFlag('f50-debug-hud') === '1';
++hudSwitch.onchange = () => { saveFlag('f50-debug-hud', hudSwitch.checked ? '1' : '0'); hud.hidden = !hudSwitch.checked; updateHud(); };
++hud.hidden = !hudSwitch.checked;
++function updateHud() {
++  const now = performance.now(), seconds = Math.max(0.25, (now - hudStart) / 1000);
++  if (!hud.hidden) hud.textContent = hudLines({ width: painted ? canvas.width : 0, height: canvas.height, fps: hudFrames / seconds,
++    hevc: display ? display.hevc : null, videoKbps: hudBytes * 8 / 1000 / seconds, decodeMs: video.decodeLatencyMs,
++    queue: video.decodeQueueSize, rttMs: lag.last, audio: audio.describe(), musicKbps: hudMusicBytes * 8 / 1000 / seconds,
++    playing: audio.isPlaying }, language === 'zh').join('\n');
++  hudFrames = 0; hudBytes = 0; hudMusicBytes = 0; hudStart = now;
++}
++window.setInterval(updateHud, 1000);
+ render();fit();if(token) connection.connect();
+ 
+ nightSelect.onchange = () => { localStorage.setItem('f50-night-mode', nightSelect.value); syncNight(); render(); };
+diff --git a/web/src/style.css b/web/src/style.css
+index abf7c02..c46125e 100644
+--- a/web/src/style.css
++++ b/web/src/style.css
+@@ -104,6 +104,11 @@ fieldset { border:0; padding:0; margin:0; min-width:0; }
+   background:rgba(44,44,46,.92); -webkit-backdrop-filter:blur(20px); backdrop-filter:blur(20px); border:.5px solid rgba(255,255,255,.14);
+   color:#fff; font-size:16px; line-height:1.45; text-align:center; box-shadow:0 8px 30px rgba(0,0,0,.4); }
+ #toast { top:max(16px,env(safe-area-inset-top)); pointer-events:none; animation:drop .3s cubic-bezier(.2,.8,.2,1); }
++/* Debug overlay (debug-hud.ts): bottom right, away from the CarPlay dock on the left; takes no touches. */
++#debug-hud { position:absolute; right:max(8px,env(safe-area-inset-right)); bottom:max(8px,env(safe-area-inset-bottom)); z-index:2;
++  padding:6px 9px; border-radius:8px; background:rgba(0,0,0,.55); color:#fff; pointer-events:none; white-space:pre;
++  font:12px/1.45 ui-monospace,Menlo,Consolas,monospace; font-variant-numeric:tabular-nums; }
++#debug-hud[hidden] { display:none; }
+ #audio-unlock { bottom:max(20px,env(safe-area-inset-bottom)); white-space:nowrap; font-weight:600; min-height:48px; }
+ @keyframes drop { from { opacity:0; transform:translate(-50%,-10px); } }
+ #error-banner { position:absolute; bottom:max(16px,env(safe-area-inset-bottom)); left:16px; right:16px; max-width:560px; max-height:40vh; margin:auto;

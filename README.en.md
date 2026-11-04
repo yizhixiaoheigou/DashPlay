@@ -2,11 +2,21 @@
 
 [中文](README.md)
 
-DashPlay turns a small Linux box with Wi-Fi and Bluetooth into a CarPlay receiver. The iPhone plugs into the box with a cable (wired CarPlay) or is guided onto Wi-Fi over Bluetooth (wireless CarPlay); the head unit, or any device, opens the box's web page in a browser and gets the picture, the sound and touch control. A car without CarPlay can try it as long as its head unit has a browser and can join Wi-Fi.
+DashPlay receives iPhone CarPlay on a Linux box, a supported OpenWrt device, or an Android device. A browser on the head unit or another device displays the picture, plays audio, and provides touch control. Android phones support wireless CarPlay only; connection options on boxes depend on their platform and hardware. The browser and receiver must be reachable over the network.
 
 DashPlay is built on [PlayPort](https://github.com/youcci/playport): patches plus the programs around it, namely wired CarPlay (the box as USB host), a Linux BlueZ Bluetooth bridge, a lean page for head-unit browsers with system media controls, first-run setup and a settings page, and a supervisor that starts everything at boot.
 
 > **This is not an Apple-certified product.** You have to supply your own accessory authentication identity; see "Authentication identity" below. Flashing carries a risk of bricking the device.
+
+## Choose your platform
+
+| Platform | Download and guide |
+|---|---|
+| Android phone or TV box | **DashPlay for Android**: one `DashPlay-android-<version>.apk` for both. Keep Android; no Linux flashing is needed. See the [Android guide](docs/DashPlay安卓使用说明.md) and [installation skill](skills/dashplay-android-install/SKILL.md) (Chinese) |
+| Linux (N1 / OneCloud) | Program bundles and applicable firmware images from this repository; see the Linux instructions below |
+| OpenWrt | Packages, feeds, and LuCI UI in [openwrt-dashplay](https://github.com/yizhixiaoheigou/openwrt-dashplay), using the core program from this repository |
+
+Find Android APKs in the [release list](https://github.com/yizhixiaoheigou/DashPlay/releases). Android versions are separate from dated Linux/OpenWrt versions. Check that a release actually includes the Android asset; OpenWrt files can also end in `.apk` and cannot be installed on Android.
 
 ## Installing
 
@@ -106,20 +116,19 @@ sh scripts/onecloud/firmware/build-bundle.sh dashplay-bundle.tar   # the program
 
 `scripts/build-playport.sh` runs the same Gradle build and tests in an isolated Docker container. On the box DashPlay needs Java 21 and Python 3 with asyncio: OneCloud and N1 get them from Debian through `install.sh`; OpenWrt from the plugin's `dashplay-jre` (Temurin 21, musl build) and the system package feeds.
 
-## Android app (source published, still beta)
+## DashPlay for Android (beta)
 
-The same receiver also runs on an Android device: a spare phone or an Android TV box acts as the
-receiver, the iPhone plugs in over USB or joins over Bluetooth + Wi-Fi, and the car's browser shows
-the screen. Source is in [`android/`](android/), on the same PlayPort baseline and the same patch
-series as the boxes; only the platform layer differs (system hotspot, USB host, Root, certificates).
+Android phones and TV boxes use the same APK. Phones support wireless CarPlay only; boxes support wired, wireless, or automatic selection according to their hardware. Source is in [`android/`](android/), using the pinned PlayPort upstream and Android’s frozen common patches in `android/receiver-baseline/`, followed by its platform adapters. Linux keeps its own root patch series.
 
-- **Status: beta, no APK published yet.** This repository carries the source only; the release page
-  has no APK. Building it needs JDK 25 and Android SDK 35.
-- Android 5.0 (API 21) and up. Wired CarPlay needs USB host (OTG); wireless needs a system hotspot
-  or Wi-Fi Direct.
-- First run asks whether the device is an Android phone or an Android TV box. That only changes
-  layout and wording; hotspot, Root and USB capabilities follow what the device actually supports.
-- No CarPlay identity is bundled; you import your own, as with the boxes.
+- Use an actual `DashPlay-android-<version>.apk` release asset. If none is available, wait for a release or explicitly choose a source build (JDK 25, Android SDK 35, Node.js). Android 5.0+ and an ARMv7/ARM64 system ABI are required; x86 is not supported by the current native libraries.
+- Setup asks one question at a time. Device, car, network, HTTP/HTTPS access, iPhone connection, Internet, identity, audio and startup choices determine the next questions. Missing prerequisites explain the reason and alternatives. See the [usage guide](docs/DashPlay安卓使用说明.md) and [decision tree](skills/dashplay-android-install/references/capability-routing.md) (Chinese).
+- Wireless CarPlay requires classic Bluetooth and a reachable Wi-Fi network. Wired CarPlay is available only on Android boxes with USB host and USB/VPN consent; Bluetooth is not required for wired mode. Even wired CarPlay needs a LAN between the browser and receiver. A SIM is not required for local use.
+- Ordinary browser use does not universally require Root. Tesla can try the experimental **HTTP** route without a domain or certificate: WebRTC video first, JPEG fallback with a maximum image edge of 1280 pixels. A receiver-hosted hotspot needs VPN address validation; an external network uses the receiver's reachable LAN address. **HTTPS** still requires a reachable address, trusted certificate, and working DNS; the receiver-hosted Tesla address path needs Root usable by the app. Both routes require actual head-unit verification, including Wi-Fi retention.
+- The default shared HTTP/HTTPS port is **18743**. Management always uses `http://device-address:18743/manage`, independently of certificates and the HTTP picture option. Open the picture URL shown by the app. Keep the full `http://` or `https://` prefix; do not omit or replace it.
+- Use an existing screen/remote or the management page once the app is running on a reachable LAN; no management key is required. System consent remains local. The [Android skill](skills/dashplay-android-install/SKILL.md) explains prerequisites without teaching flashing or how to obtain ADB/Root.
+- No CarPlay identity is bundled; import your own. Upgrade with an APK signed by the same key, preserving app data. Do not uninstall or clear data to bypass a signature mismatch.
+- Old wired/automatic settings on Android phones migrate to wireless; USB Internet is a separate opt-in, off by default. New USB-host boxes preselect wired CarPlay and USB Internet, subject to consent; explicit opt-outs persist. Plugging in during an active wireless session preserves wireless.
+- When using one receiver with an iPhone, stop other DashPlay receivers to avoid competing wireless invitations. Build tests and desktop browser tests do not establish compatibility with every ROM or vehicle.
 
 ## Running (OneCloud / Phicomm N1)
 
@@ -143,7 +152,7 @@ python3 -m unittest discover -s tests/bluetooth     # needs dbus-daemon and dbus
 python3 -m unittest discover -s tests/onecloud      # settings, several phones, platforms, diagnostics, firmware packing; certificate tests need OpenSSL 3
 ```
 
-## Known issues
+## Known issues (Linux/OpenWrt)
 
 - When the player window and the CarPlay picture have a similar shape (normal view and full screen, for example), the picture is stretched to fill without reconnecting; the first time full screen is entered the box reconnects once at that size (about 8–12 s) and remembers it; very different shapes (portrait, split screen) reconnect at once.
 - Way 1 is cable only; in way 3 the head unit has no internet while it is on the box hotspot; in way 2 a portable Wi-Fi with client isolation makes wireless stutter or fail, so use the cable.

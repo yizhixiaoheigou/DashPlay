@@ -1,0 +1,372 @@
+diff --git a/web/check-live-mode.mjs b/web/check-live-mode.mjs
+new file mode 100644
+index 0000000..f549e4a
+--- /dev/null
++++ b/web/check-live-mode.mjs
+@@ -0,0 +1,69 @@
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import vm from 'node:vm';
++import ts from 'typescript';
++const transpile = source => ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText;
++const main = readFileSync(new URL('./src/main.ts', import.meta.url), 'utf8');
++const source = main.slice(main.indexOf('const TESLA_SOUND_LABELS'), main.indexOf('// Every visible slider'));
++const elements = ['audioOutput','audioOutputHint','audioOffCarPlay','audioMixHint'].map(key => ({ dataset: { i18n:key } }));
++const updates = [], passive = [];
++let response = { tesla:true, carMusic:true, carVoice:true };
++const context = vm.createContext({
++  teslaMode:false, carMusic:false, carVoice:false, boxFlags:{}, voices:new Set(), promptGain:()=>1,
++  audio:{ updateMode:value=>updates.push(value) }, media:{ setPassive:value=>passive.push(value) },
++  document:{ querySelectorAll: selector => elements.filter(e => selector.includes(`"${e.dataset.i18n}"`)) },
++  fetch:async()=>({ok:true,json:async()=>response}), renderAudioMix(){}, render(){}, loadAudioRoutes(){},
++});
++vm.runInContext(transpile(source), context);
++await vm.runInContext('syncBoxMode()', context);
++assert.equal(context.teslaMode,true); assert.equal(updates.at(-1).dropMusic,true);
++assert.equal(elements[0].dataset.i18n,'teslaNavOutput');
++response={tesla:false,carMusic:false,carVoice:false};
++await vm.runInContext('syncBoxMode()', context);
++assert.equal(context.teslaMode,false); assert.equal(updates.at(-1).dropMusic,false);
++assert.equal(elements[0].dataset.i18n,'audioOutput','reverse switch restores normal labels');
++assert.deepEqual(passive,[true,false]);
++assert.equal(context.boxFlags.playportTeslaMode,false,'microphone and other consumers follow live mode');
++// Two reconnects: a late response from the old connection must not overwrite the new mode.
++const pending=[];context.fetch=()=>new Promise(resolve=>pending.push(resolve));
++const first=vm.runInContext('syncBoxMode()',context), second=vm.runInContext('syncBoxMode()',context);
++pending[1]({ok:true,json:async()=>({tesla:true,carMusic:true})});await second;
++pending[0]({ok:true,json:async()=>({tesla:false,carMusic:false})});await first;
++assert.equal(context.teslaMode,true);
++context.fetch=async()=>({ok:true,json:async()=>null});await vm.runInContext('syncBoxMode()',context);
++assert.equal(context.teslaMode,true,'invalid response keeps current mode');
++// Media-card ownership changes in both directions without leaving old hardware-key handlers behind.
++const actions={}, mediaSession={setActionHandler:(name,fn)=>{actions[name]=fn;},setPositionState(){}};
++Object.defineProperty(globalThis,'navigator',{value:{mediaSession},configurable:true});
++const code=transpile(readFileSync(new URL('./src/media-session.ts',import.meta.url),'utf8'));
++const {SystemMedia}=await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
++const media=new SystemMedia(()=>{},()=>{},()=>{},true);
++assert.equal(media.supported,false);
++media.setPassive(false);assert.equal(typeof actions.play,'function');
++media.setPassive(true);assert.equal(actions.play,null);assert.equal(mediaSession.playbackState,'none');
++media.setPassive(false);assert.equal(typeof actions.play,'function');
++console.log('Live mode: bidirectional labels/audio flags/media ownership, stale/invalid responses passed');
++// Audio config may arrive before the settings fetch: switching away from Tesla must restore that stream.
++const node=()=>({gain:{value:1},threshold:{},knee:{},ratio:{},attack:{},release:{},connect(){},disconnect(){}});
++class Context {
++  state='running';destination={};sampleRate=48000;
++  createGain(){return node();} createDynamicsCompressor(){return node();}
++  async resume(){this.state='running';} async suspend(){this.state='suspended';}
++}
++const audioContext=vm.createContext({ AudioContext:Context, window:{clearTimeout(){},setTimeout(){return 1;}},
++  AudioCodec:{Lpcm:1,AacLc:2,Opus:3}, MusicOutput:{supported:()=>false},
++  baseGain:(name,boost)=>name==='default'?boost:1,clampPercent:(_,v)=>v,effectiveGain:(base,percent)=>base*percent/100,
++  pageDropsMusic:(tesla,name)=>tesla&&name==='media', performance:{now:()=>0},
++});
++const audioSource=readFileSync(new URL('./src/audio.ts',import.meta.url),'utf8').replace(/^import .*;$/gm,'').replace('export class AudioEngine','class AudioEngine');
++vm.runInContext(transpile(audioSource),audioContext);
++vm.runInContext(`engine=new AudioEngine(()=>{}, {dropMusic:true,idleClose:true});
++  engine.handleConfig({streamType:100,name:'media',codec:1,sampleRate:48000,channels:2});`,audioContext);
++assert.equal(vm.runInContext('engine.activeStreamNames().length',audioContext),0);
++vm.runInContext('engine.updateMode({dropMusic:false,idleClose:false})',audioContext);
++assert.equal(vm.runInContext('engine.activeStreamNames()[0]',audioContext),'media');
++vm.runInContext('engine.updateMode({dropMusic:true,idleClose:true})',audioContext);
++assert.equal(vm.runInContext('engine.activeStreamNames().length',audioContext),0);
++vm.runInContext('engine.stopStream(100); engine.updateMode({dropMusic:false})',audioContext);
++assert.equal(vm.runInContext('engine.activeStreamNames().length',audioContext),0,'ended streams must not be resurrected');
++console.log('Live audio: config-before-settings recovery, Tesla drop, ended stream cleanup passed');
+diff --git a/web/package.json b/web/package.json
+index a803e89..82230a2 100644
+--- a/web/package.json
++++ b/web/package.json
+@@ -5,7 +5,7 @@
+   "type": "module",
+   "scripts": {
+     "dev": "vite",
+-    "test": "node check.mjs && node check-audio.mjs && node check-audio-mix.mjs && node check-car.mjs && node check-browser.mjs && node check-flac.mjs && node check-codec-startup.mjs",
++    "test": "node check.mjs && node check-audio.mjs && node check-audio-mix.mjs && node check-car.mjs && node check-browser.mjs && node check-flac.mjs && node check-codec-startup.mjs && node check-live-mode.mjs",
+     "build": "tsc && vite build",
+     "preview": "vite preview"
+   },
+diff --git a/web/src/audio.ts b/web/src/audio.ts
+index c24327a..b1844d5 100644
+--- a/web/src/audio.ts
++++ b/web/src/audio.ts
+@@ -23,6 +23,7 @@ export class AudioEngine {
+   private readonly context: AudioContext;
+   private readonly gain: GainNode;
+   private readonly streams = new Map<number, StreamState>();
++  private readonly configs = new Map<number, AudioConfigMessage>();
+   private readonly streamGains = new Map<string, number>();
+   /** Per-category percentage chosen in the box settings: 100 % is the level this page always used. */
+   private readonly percents = new Map<string, number>();
+@@ -41,16 +42,16 @@ export class AudioEngine {
+   /** Navigation prompts and alerts (audioType "default") carry this boost through a limiter: in a Tesla the
+    *  music goes to the car over Bluetooth at the car's volume while prompts come through the browser, and they were
+    *  hard to hear at 1 (2026-10-14). 100 % in the sound-level panel means this same level. */
+-  private readonly promptBoost: number;
++  private promptBoost: number;
+   /** Music over the car's Bluetooth: a Tesla took a browser that has an audio output open, even a silent one, for a
+    *  music source and switched its media card between it and the iPhone's Bluetooth over and over (2026-10-14). The output is closed
+    *  (context suspended) a few seconds after the last stream ends and opened again for the next prompt or call. */
+-  private readonly idleClose: boolean;
++  private idleClose: boolean;
+   private idleTimer = 0;
+   private sleeping = false;
+ 
+   /** Tesla mode: music never plays here (audio-routes.pageDropsMusic); onDroppedMusic tells the page once. */
+-  private readonly dropMusic: boolean;
++  private dropMusic: boolean;
+   private readonly onDroppedMusic: () => void;
+ 
+   constructor(private readonly onError: (message: string) => void,
+@@ -64,6 +65,26 @@ export class AudioEngine {
+     this.idleClose = options.idleClose ?? false;
+   }
+ 
++  /** The box changed its mode while this page stayed open: apply it here instead of making the owner reload.
++   *  The settings change already restarted the session, so the page is reconnecting at the same moment. */
++  updateMode(flags: { promptBoost?: number; idleClose?: boolean; dropMusic?: boolean }): void {
++    const oldDrop = this.dropMusic;
++    if (flags.dropMusic !== undefined) this.dropMusic = flags.dropMusic;
++    if (flags.idleClose !== undefined) this.idleClose = flags.idleClose;
++    if (flags.promptBoost !== undefined) this.promptBoost = Math.min(8, Math.max(1, flags.promptBoost));
++    window.clearTimeout(this.idleTimer);
++    if (!this.idleClose && this.sleeping && this.unlocked) {
++      void this.context.resume().then(() => { this.sleeping = false; }).catch(() => {});
++    }
++    if (oldDrop !== this.dropMusic) {
++      this.retainedMusic?.close(); this.retainedMusic = null;
++      // Config can beat the settings fetch on reconnect. Recover it without another phone/session restart.
++      for (const config of this.configs.values()) if (config.name === 'media') this.handleConfig(config);
++    }
++    for (const name of this.activeStreamNames()) this.applyStreamGain(name);
++    if (this.streams.size === 0) this.sleepWhenIdle();
++  }
++
+   /** idleClose: open the output for a stream, close it again when none is left. */
+   private wake(): void {
+     if (!this.idleClose) return;
+@@ -151,6 +172,7 @@ export class AudioEngine {
+   }
+ 
+   handleConfig(message: AudioConfigMessage): void {
++    this.configs.set(message.streamType, message);
+     this.closeStream(message.streamType);
+     // No stream state: its packets are ignored (handlePacket), and no media element is ever made for it.
+     if (pageDropsMusic(this.dropMusic, message.name)) { this.onDroppedMusic(); return; }
+@@ -252,6 +274,7 @@ export class AudioEngine {
+   }
+ 
+   stopStream(streamType: number): void {
++    this.configs.delete(streamType);
+     const state = this.streams.get(streamType);
+     if (state?.music) {
+       this.retainedMusic?.close();
+@@ -282,6 +305,7 @@ export class AudioEngine {
+   }
+ 
+   stopAll(): void {
++    this.configs.clear();
+     for (const streamType of this.streams.keys()) this.closeStream(streamType);
+     this.retainedMusic?.close(); this.retainedMusic = null;
+     this.lastAudioAt = -Infinity;
+diff --git a/web/src/main.ts b/web/src/main.ts
+index d8b5396..a9035cc 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -139,6 +139,7 @@ let boxPhones: BoxPhone[] = [];
+ let wiredRow: WiredRow | null = null;
+ let wiredName = '';
+ let devicesLoading = false;
++let devicesRefreshPending = false;
+ /** 'cable' or a phone address while a switch request is under way. */
+ let switchingTo: string | null = null;
+ let deviceNotice = '';
+@@ -188,7 +189,8 @@ function renderDevices() {
+   devicesStatus.textContent = deviceNotice || (canSwitch ? t('devicesHint') : t('devicesOne'));
+ }
+ async function loadDevices() {
+-  if (!token || devicesLoading) return;
++  if (!token) return;
++  if (devicesLoading) { devicesRefreshPending = true; return; }
+   devicesLoading = true;
+   deviceNotice = '';
+   try {
+@@ -209,6 +211,10 @@ async function loadDevices() {
+     devicesBlock.hidden = true;
+   } finally {
+     devicesLoading = false;
++    if (devicesRefreshPending) {
++      devicesRefreshPending = false;
++      if (panel.open) void loadDevices();
++    }
+   }
+ }
+ function deviceError(code: string): string {
+@@ -337,25 +343,66 @@ const video = new VideoPlayer(canvas, error, () => {
+ // and whatever else the iPhone still sends. ?promptgain=1..8 overrides the boost. Tesla mode sets it too, and adds
+ // the Tesla browser's ways (fullscreen below, microphone gain in mic.ts).
+ const boxFlags = window as unknown as { playportCarMusic?: boolean; playportCarVoice?: boolean; playportTeslaMode?: boolean; playportAudioRoutes?: unknown };
+-const carMusic = boxFlags.playportCarMusic === true;
+-const teslaMode = boxFlags.playportTeslaMode === true;
++// The box owns this mode, and this page follows it whenever its link reopens: changing it on the box restarts the
++// session and rewrites receiver-access.json, while the page keeps running (2026-11-03: the music arrived here but the
++// page still dropped it as Tesla mode). Keeping these `let` lets syncBoxMode() move the page without a reload.
++let carMusic = boxFlags.playportCarMusic === true;
++let teslaMode = boxFlags.playportTeslaMode === true;
+ // Calls and Siri over the car's Bluetooth (box: car_voice): their sound is the car's, not this page's.
+-const carVoice = boxFlags.playportCarVoice === true;
++let carVoice = boxFlags.playportCarVoice === true;
+ const bootRoutes = initialRoutes(boxFlags.playportAudioRoutes, carMusic, carVoice);
+ let audioRoutes = { ...bootRoutes }, routesSupported = false, routesBusy = false, routesLoading = false;
+ let routeMessage: Key | null = null;
+-const promptGain = Number(new URLSearchParams(location.search).get('promptgain')) || (carMusic ? 3 : 1);
++const promptGainOverride = Number(new URLSearchParams(location.search).get('promptgain')) || 0;
++/** Prompt boost for this mode: an explicit ?promptgain wins, Tesla/Bluetooth music means 3. */
++const promptGain = () => promptGainOverride || (carMusic ? 3 : 1);
+ // Music the iPhone still sends here is played: it sends music to one place at a time, and after Siri from the
+ // CarPlay screen it sent it here for ~27 s before going back to the car's Bluetooth, silent while it was dropped.
+ // Tesla mode drops it instead (2026-11-01): a moving Tesla answers a page playing music with "video is audio-only"
+ // and the banner's resize renegotiated CarPlay every ~10 s. The owner is told once per page.
+ let droppedMusicShown = false;
+-const audio = new AudioEngine(error, { promptBoost: promptGain, idleClose: carMusic, dropMusic: teslaMode,
++const audio = new AudioEngine(error, { promptBoost: promptGain(), idleClose: carMusic, dropMusic: teslaMode,
+   onDroppedMusic: () => { if (!droppedMusicShown) { droppedMusicShown = true; toast(t('teslaMusicDropped')); } } });
+ // Tesla mode's sound panel names the one choice it offers: where navigation plays (audio-routes.categoryDestination).
+-if (teslaMode) for (const [from, to] of [['audioOutput', 'teslaNavOutput'], ['audioOutputHint', 'teslaNavOutputHint'],
+-  ['audioOffCarPlay', 'teslaNavBluetooth'], ['audioMixHint', 'teslaMixHint']] as const)
+-  document.querySelectorAll<HTMLElement>(`#audio-mix [data-i18n="${from}"], #audio-mix ~ [data-i18n="${from}"]`).forEach(e => { e.dataset.i18n = to; });
++const TESLA_SOUND_LABELS = [['audioOutput', 'teslaNavOutput'], ['audioOutputHint', 'teslaNavOutputHint'],
++  ['audioOffCarPlay', 'teslaNavBluetooth'], ['audioMixHint', 'teslaMixHint']] as const;
++function labelTeslaSound() {
++  for (const [normal, tesla] of TESLA_SOUND_LABELS) {
++    const from = teslaMode ? normal : tesla, to = teslaMode ? tesla : normal;
++    document.querySelectorAll<HTMLElement>(`#audio-mix [data-i18n="${from}"], #audio-mix ~ [data-i18n="${from}"]`).forEach(e => { e.dataset.i18n = to; });
++  }
++}
++labelTeslaSound();
++/** A settings change on the box restarts the session and rewrites receiver-access.json while this page keeps its
++ *  loaded state. Re-read the mode as soon as the link is back, so the page never plays by a mode the box no longer
++ *  has (2026-11-03: the iPhone sent music here and the page still dropped it as Tesla mode). Self-contained on
++ *  purpose: boot.ts already fetched these once, and this second read is what keeps an open page honest. */
++let modeRequest = 0;
++async function syncBoxMode(): Promise<void> {
++  const request = ++modeRequest;
++  let value: { carMusic?: boolean; carVoice?: boolean; tesla?: boolean };
++  try {
++    const response = await fetch('./receiver-access.json', { cache: 'no-store', credentials: 'same-origin' });
++    if (!response.ok) return;
++    value = await response.json() as typeof value;
++  } catch { return; }
++  if (request !== modeRequest || !value || typeof value.tesla !== 'boolean') return;
++  const nextTesla = value.tesla === true;
++  const nextMusic = value.carMusic === true || (value.carMusic === undefined && value.tesla === true);
++  const nextVoice = value.carVoice === true;
++  if (nextTesla === teslaMode && nextMusic === carMusic && nextVoice === carVoice) return;
++  teslaMode = nextTesla; carMusic = nextMusic; carVoice = nextVoice;
++  boxFlags.playportTeslaMode = teslaMode;
++  boxFlags.playportCarMusic = carMusic;
++  boxFlags.playportCarVoice = carVoice;
++  audio.updateMode({ dropMusic: teslaMode, idleClose: carMusic, promptBoost: promptGain() });
++  media.setPassive(carMusic);
++  voices.clear();
++  labelTeslaSound();
++  renderAudioMix();
++  void loadAudioRoutes();
++  render();
++}
+ // Every visible slider uses 0–100. Keep the existing gain/storage values underneath, so opening an
+ // upgraded page never changes the sound. Navigation's existing baseline still includes its prompt boost.
+ const AUDIO_LABELS: Record<AudioCategory, Key> = {
+@@ -482,9 +529,9 @@ const connection = new Connection(token, {
+   onBytes(count) { reportBytes += count; hudBytes += count; lastHeard = performance.now(); },
+   onState(value) {
+     if (value === 'open' && closedAt) { lifeEvent(11, { downMs: Math.round(performance.now() - closedAt), failures: connection.failures }); closedAt = 0; }
+-    if (value === 'closed') { if (!closedAt) closedAt = performance.now(); if (!wokeAt) wokeAt = closedAt; reset(shownOnce); state = 'reconnecting'; }
++    if (value === 'closed') { ++modeRequest; if (!closedAt) closedAt = performance.now(); if (!wokeAt) wokeAt = closedAt; reset(shownOnce); state = 'reconnecting'; }
+     else if (value === 'connecting') state = 'connecting';
+-    else { state = 'waiting'; void loadDisplay(); void unlock(); }
++    else { state = 'waiting'; void loadDisplay(); void unlock(); void syncBoxMode(); }
+     render();
+   },
+ });
+@@ -535,7 +582,7 @@ function server(message: ServerMessage) {
+   }
+   else { endExpectRestart(); void loadDisplay(); active = true; canvas.inert = false; state = 'starting'; media.setActive(true); syncNight(); if(message.nowPlaying) media.setMetadata(message.nowPlaying); if(message.artwork) media.setArtwork(message.revision ?? 0,message.artwork); }
+   // The phone using CarPlay may have changed (a switch from this or another page): refresh the list once.
+-  if (message.sessionActive && panel.open) window.setTimeout(() => { if (!devicesBlock.hidden) void loadDevices(); }, 2000);
++  if (panel.open) void loadDevices();
+   render();
+ }
+ async function unlock() {
+@@ -767,7 +814,7 @@ function pageEvent(ev: number) {
+   connection.send({type:'stats',stats:{ev,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,width:screen.clientWidth,height:screen.clientHeight,want:wantFullscreen?1:0,...viewport()}});
+ }
+ /** Which page build runs (raised with each build tried in the car). */
+-const BUILD = 2026110205;
++const BUILD = 2026110301;
+ /** What the browser says of the space it gives the page, to find the car's bar over a fullscreen page (2026-10-13):
+  *  window, visual viewport (and its offset), screen, available screen, outer window, pixel ratio. */
+ function viewport(): Record<string, number> {
+@@ -856,7 +903,7 @@ window.setInterval(()=>{
+   send({type:'stats',stats:{fps:reportFrames/seconds,decodeMs:video.decodeLatencyMs,queue:video.decodeQueueSize,
+     kbps:reportBytes*8/1000/seconds,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,
+     width:canvas.width,height:canvas.height,...(touchCount?{touchMs:touchSum/touchCount,touches:touchCount}:{}),...(musicBytes?{musicKbps:musicBytes*8/1000/seconds}:{}),
+-    ...startupStats(),simpleSettings:simpleMenu?.enabled?1:0,chrome:chromeMajor,compat:compatDisplay?1:0,build:BUILD,webView,carMusic:carMusic?1:0,teslaMode:teslaMode?1:0,promptGain,...(revived?{revived}:{}),fastDecoder:fastDecoder()?1:0,hevcDecodes:hevcDecodes?1:0,hevc:display?.hevc?1:0,...microphone.report(),...audio.farReport(),...media.report(),...musicTimeline(),...audio.musicReport(),...stalls,...lag.take(performance.now())}});
++    ...startupStats(),simpleSettings:simpleMenu?.enabled?1:0,chrome:chromeMajor,compat:compatDisplay?1:0,build:BUILD,webView,carMusic:carMusic?1:0,teslaMode:teslaMode?1:0,promptGain:promptGain(),...(revived?{revived}:{}),fastDecoder:fastDecoder()?1:0,hevcDecodes:hevcDecodes?1:0,hevc:display?.hevc?1:0,...microphone.report(),...audio.farReport(),...media.report(),...musicTimeline(),...audio.musicReport(),...stalls,...lag.take(performance.now())}});
+   judgeDecoder(video.decodeLatencyMs, reportFrames/seconds);
+   if (active) judgeFrameRate(stalls.caughtUp);
+   reportFrames=0;reportBytes=0;reportStart=now;touchSum=0;touchCount=0;musicBytes=0;
+diff --git a/web/src/media-session.ts b/web/src/media-session.ts
+index bbe0893..ec616a1 100644
+--- a/web/src/media-session.ts
++++ b/web/src/media-session.ts
+@@ -50,7 +50,8 @@ export class SystemMedia {
+    *  iPhone, paused one for the other (its pause reached the page and went on to the iPhone) and the two kept
+    *  fighting (2026-10-14).
+    *  There the music is the car's own; the page names no song and passes on no media key. */
+-  readonly supported: boolean;
++  supported = false;
++  private readonly handlers: Partial<Record<MediaSessionAction, () => void>>;
+   /** Whether the iPhone says it plays; undefined while it has not said. */
+   get phoneState() { return this.phonePlaying; }
+   /** For the box's viewer log: can the OS media card take our song position at all, and which one we give it. */
+@@ -61,8 +62,6 @@ export class SystemMedia {
+     return this.duration > 0 ? { positionState, songPos: Math.round(this.positionNow()), songDur: Math.round(this.duration), art, ...actions } : { positionState, ...actions };
+   }
+   constructor(private readonly send: (message: ClientMessage) => void, unlock: () => void, pause: () => void = () => {}, passive = false) {
+-    this.supported = !passive && 'mediaSession' in navigator;
+-    if (!this.supported) return;
+     const handlers: Partial<Record<MediaSessionAction, () => void>> = {
+       play: () => { unlock(); this.command(1); },
+       // The car turns its play/pause key into pause while the page plays, also when the car itself paused the
+@@ -73,11 +72,29 @@ export class SystemMedia {
+       previoustrack: () => this.command(5),
+       nexttrack: () => this.command(4),
+     };
++    this.handlers = handlers;
++    this.setPassive(passive);
++  }
++  setPassive(passive: boolean) {
++    const supported = !passive && 'mediaSession' in navigator;
++    if (supported === this.supported) return;
++    this.supported = supported;
++    if (!('mediaSession' in navigator)) return;
++    if (!supported) {
++      for (const name of Object.keys(this.handlers)) {
++        try { navigator.mediaSession.setActionHandler(name as MediaSessionAction, null); } catch { }
++      }
++      navigator.mediaSession.metadata = null;
++      navigator.mediaSession.playbackState = 'none';
++      try { navigator.mediaSession.setPositionState?.(); } catch { }
++      return;
++    }
+     const counted: Record<string, string> = { play: 'keyPlay', pause: 'keyPause', previoustrack: 'keyPrev', nexttrack: 'keyNext' };
+-    for (const [name, handler] of Object.entries(handlers)) {
++    for (const [name, handler] of Object.entries(this.handlers)) {
+       const count = () => { this.actions[counted[name]] = (this.actions[counted[name]] ?? 0) + 1; handler(); };
+       try { navigator.mediaSession.setActionHandler(name as MediaSessionAction, count); } catch { /* Partial browser support. */ }
+     }
++    this.refreshMetadata(); this.update(); this.updatePosition();
+   }
+   private command(index: number) { if (this.active) this.send({ type: 'media', media: index }); }
+   /** While Siri, a call or a prompt sounds from this page and no music does (music over the car's Bluetooth): what

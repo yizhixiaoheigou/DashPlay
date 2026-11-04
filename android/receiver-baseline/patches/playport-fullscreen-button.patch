@@ -1,0 +1,90 @@
+diff --git a/web/index.html b/web/index.html
+index f29cfc6..55c235a 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -4,6 +4,7 @@
+   <div id="screen-container"><div id="surface"><canvas id="screen" width="1280" height="720" tabindex="0" aria-label="CarPlay" inert></canvas></div></div>
+   <div id="overlay" role="status"><h1>CarPlay</h1><p id="connection-text"></p><p id="connection-hint"></p></div>
+   <button id="btn-settings" aria-haspopup="dialog" aria-controls="settings"><span aria-hidden="true">⚙</span><span data-i18n="settings">设置</span></button>
++  <button id="btn-fullscreen" aria-label="全屏" title="全屏"><svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path class="expand" d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><path class="collapse" d="M3 8h5V3m8 0v5h5M8 21v-5H3m13 5v-5h5"/></svg><span id="fullscreen-label">全屏</span></button>
+   <button id="audio-unlock" data-i18n="sound" hidden>轻点启用声音</button>
+   <div id="error-banner" role="alert" hidden><span data-i18n="error"></span><details><summary data-i18n="technical"></summary><p id="error-text"></p></details><button id="dismiss-error" data-i18n="close"></button></div>
+ </main>
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+index ca86fdd..544bcf7 100644
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -5,7 +5,7 @@ const messages = {
+   starting: ['已连接，正在等待画面…', 'Connected. Waiting for video…'], live: ['已连接', 'Connected'],
+   access: ['需要首次登录链接', 'First-time access link required'], accessHint: ['请使用私有访问资料中的完整链接打开一次，此浏览器会记住登录。', 'Open the complete link from your private access file once. This browser will remember it.'],
+   sound: ['轻点启用声音', 'Tap to enable sound'], volume: ['音量', 'Volume'],
+-  display: ['画面', 'Display'], fullscreen: ['全屏', 'Fullscreen'], fullscreenFail: ['此浏览器不允许全屏，画面仍会自动适配窗口。', 'Fullscreen unavailable. The picture still fits this window.'],
++  display: ['画面', 'Display'], fullscreen: ['全屏', 'Fullscreen'], exitFullscreen: ['退出全屏', 'Exit fullscreen'], fullscreenFail: ['此浏览器不允许全屏，画面仍会自动适配窗口。', 'Fullscreen unavailable. The picture still fits this window.'],
+   auto: ['自动匹配屏幕比例', 'Match screen aspect ratio automatically'], autoHint: ['仅此显示端启用。比例变化时重新协商画面，最多 1920 像素长边；可能短暂重连。', 'Enable on one display only. Aspect changes renegotiate video, up to 1920 pixels on the long edge, and may briefly reconnect.'],
+   width: ['宽度', 'Width'], height: ['高度', 'Height'], apply: ['应用并重连', 'Apply and reconnect'],
+   ui: ['界面大小', 'UI size'], fps: ['帧率', 'Frame rate'], standard: ['标准', 'Standard'], large: ['大', 'Large'], small: ['小', 'Small'],
+diff --git a/web/src/main.ts b/web/src/main.ts
+index 2697f00..21468fa 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -30,6 +30,7 @@ volume.value = String(Math.min(100, Math.max(0, Number(localStorage.getItem('pla
+
+ function render() {
+   setLanguage(language);
++  updateFullscreen();
+   el<HTMLSelectElement>('language').value = language;
+   el('btn-settings').setAttribute('aria-label', t('settings'));
+   volume.setAttribute('aria-label', t('volume'));
+@@ -112,10 +113,26 @@ el('btn-close').onclick = () => panel.close();
+ el('dismiss-error').onclick = () => error('');
+ el<HTMLSelectElement>('language').onchange = event => { setLanguage((event.target as HTMLSelectElement).value); render(); };
+ panel.addEventListener('click', event => { if (event.target !== panel) return; const r=panel.getBoundingClientRect(); if(event.clientX<r.left || event.clientX>r.right) panel.close(); });
+-el('fullscreen').onclick = async () => {
+-  try { if (document.fullscreenElement) await document.exitFullscreen(); else await document.documentElement.requestFullscreen(); }
+-  catch { error(t('fullscreenFail')); }
+-};
++function updateFullscreen() {
++  const full = !!document.fullscreenElement;
++  const label = t(full ? 'exitFullscreen' : 'fullscreen');
++  el('fullscreen-label').textContent = label;
++  el('fullscreen').textContent = label;
++  el('btn-fullscreen').setAttribute('aria-label', label);
++  el('btn-fullscreen').setAttribute('title', label);
++  el('btn-fullscreen').dataset.fullscreen = String(full);
++}
++async function toggleFullscreen() {
++  try {
++    if (document.fullscreenElement) await document.exitFullscreen();
++    else await document.documentElement.requestFullscreen();
++    if (panel.open) panel.close();
++  } catch { error(t('fullscreenFail')); }
++  updateFullscreen();
++}
++el('fullscreen').onclick = toggleFullscreen;
++el('btn-fullscreen').onclick = toggleFullscreen;
++document.addEventListener('fullscreenchange', () => { updateFullscreen(); fit(); });
+ document.querySelectorAll<HTMLButtonElement>('[data-command]').forEach(button => button.onclick = () => {
+   const cmd = button.dataset.command;
+   if (cmd === 'home' || cmd === 'back') send({ type:'knob', knob:{ select:false, home:cmd==='home', back:cmd==='back', x:0,y:0,wheel:0 } });
+diff --git a/web/src/style.css b/web/src/style.css
+index 0e7353c..f68d955 100644
+--- a/web/src/style.css
++++ b/web/src/style.css
+@@ -14,7 +14,7 @@ button:hover { background:#414955; } button:disabled { opacity:.45; cursor:defau
+ #overlay { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:28px; text-align:center; background:#000; pointer-events:none; }
+ h1 { font-size:clamp(30px,5vw,56px); margin:0 0 18px; font-weight:600; letter-spacing:-.025em; }
+ #connection-text { font-size:22px; margin:8px 0; } #connection-hint { max-width:36em; color:#b9c0cb; line-height:1.65; }
+-#btn-settings { position:absolute; top:max(12px,env(safe-area-inset-top)); right:max(12px,env(safe-area-inset-right)); min-width:48px; padding:10px 12px; background:#252b33d9; border-color:#5a616b; display:flex; align-items:center; gap:8px; }
++#btn-settings { position:absolute; top:max(12px,env(safe-area-inset-top)); left:max(12px,env(safe-area-inset-left)); min-width:48px; padding:10px 12px; background:#252b33d9; border-color:#5a616b; display:flex; align-items:center; gap:8px; }
+ #btn-settings span[aria-hidden] { font-size:24px; line-height:1; }
+ #app[data-live=true] #btn-settings { display:none; }
+ #audio-unlock { position:absolute; bottom:max(16px,env(safe-area-inset-bottom)); left:50%; transform:translateX(-50%); background:#2256a4; white-space:nowrap; }
+@@ -35,3 +35,8 @@ fieldset { border:0; padding:0; margin:0; min-width:0; } .pair { display:grid; g
+ .primary { width:100%; background:var(--blue); border:0; } #fallback-controls { display:flex; flex-wrap:wrap; gap:10px; }
+ @media (max-width:480px) { header { padding:14px 18px; } .settings-body { padding:8px 18px 20px; } }
+ @media (prefers-reduced-motion:reduce) { * { scroll-behavior:auto !important; } }
++
++#btn-fullscreen { position:absolute; top:max(12px,env(safe-area-inset-top)); right:max(12px,env(safe-area-inset-right)); display:flex; align-items:center; gap:8px; min-width:48px; min-height:48px; padding:10px 12px; background:#252b33c9; border-color:#77818e; }
++#btn-fullscreen:hover, #btn-fullscreen:focus-visible { background:#303945; }
++#btn-fullscreen .collapse, #btn-fullscreen[data-fullscreen=true] .expand { display:none; }
++#btn-fullscreen[data-fullscreen=true] .collapse { display:block; }

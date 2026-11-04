@@ -1,0 +1,455 @@
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -65,8 +65,43 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+     @Volatile private var serverSocket: ServerSocket? = null
+     @Volatile private var advertiser: ServiceAdvertiser? = null
+     @Volatile private var wireless: WirelessBootstrap? = null
+-    @Volatile private var lastBootstrapAt = System.currentTimeMillis()
++    @Volatile private var lastBootstrapAt = System.nanoTime() / 1_000_000
+     private val closed = AtomicBoolean(false)
++    private var wirelessGeneration = 0L
++    private val presenceHelper = System.getenv("CARPLAY_PRESENCE_HELPER")
++    @Volatile private var sessionEnded = false
++    @Volatile private var bootInvite = false
++    private var bootDeadline = 0L
++    @Volatile private var presenceLearned = false
++    @Volatile private var lastPeer: String? = null
++
++    @Volatile private var selectedPhone: String? = null
++    @Volatile private var invitedPhone: String? = null
++    @Volatile private var invitedAt = 0L
++    @Volatile private var handoffAcceptedAt = Long.MIN_VALUE / 2
++
++    /** The invited iPhone accepted the Bluetooth bootstrap and is about to join the Wi-Fi. */
++    fun handoffAccepted() {
++        handoffAcceptedAt = System.nanoTime() / 1_000_000
++    }
++    fun wirelessPhone(): String? = if (presenceHelper == null) config.bluetoothDeviceAddress else selectedPhone
++
++    private fun presenceResult(command: String, vararg args: String): String? {
++        val helper = presenceHelper ?: return null
++        return runCatching {
++            val process = ProcessBuilder(listOf("/usr/bin/python3", helper, command) + args)
++                .redirectError(ProcessBuilder.Redirect.DISCARD).start()
++            // BlueZ lookups slow down while a phone is being bootstrapped; give the helper room.
++            if (!process.waitFor(6, java.util.concurrent.TimeUnit.SECONDS)) {
++                process.destroyForcibly()
++                null
++            } else if (process.exitValue() == 0) process.inputStream.bufferedReader().readText().trim() else null
++        }.getOrNull()
++    }
++
++    private fun presence(command: String, vararg args: String): Boolean = presenceResult(command, *args) != null
++    private fun selectedPresent(): Boolean = selectedPhone?.let { presence("present", it) } == true
++    private fun selectPhone(): String? = presenceResult("select")?.takeIf { it.matches(Regex("(?:[0-9A-F]{2}:){5}[0-9A-F]{2}")) }
+ 
+     val airPlayConfig: AirPlayConfig
+         get() = AirPlayConfig(
+@@ -97,6 +132,11 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+         override fun onSessionActive(session: AirPlaySession) {
+             log.info("CarPlay session active peer={}", session.host)
+             activeSession = session
++            bootInvite = false
++            invitedPhone = null
++            handoffAcceptedAt = Long.MIN_VALUE / 2
++            lastPeer = session.host
++            presenceLearned = false
+             hub.setSessionState(true, null)
+         }
+ 
+@@ -104,6 +144,8 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+             log.info("CarPlay session ended peer={}", session.host)
+             if (activeSession !== session) return
+             activeSession = null
++            if (presenceHelper != null) presence("idle")
++            sessionEnded = true
+             bridge.endMicrophone()
+             hub.setSessionState(false, null)
+         }
+@@ -145,7 +187,10 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+         hub.inputHandler = ::routeInput
+         hub.onApplyDisplay = ::applyDisplay
+         hub.onMicrophoneData = { opus, payload -> bridge.sendMicrophonePayload(payload, opus) }
+-        startSupervisor()
++        selectedPhone = presenceResult("boot")?.takeIf { it.isNotBlank() }
++        bootInvite = selectedPhone != null
++        if (!bootInvite && presenceHelper != null) selectedPhone = selectPhone()
++        bootDeadline = System.nanoTime() / 1_000_000 + BOOTSTRAP_STALE_MS
+         hub.onViewerJoined = { streamType ->
+             if (bridge.hasRecoveryHandler) {
+                 log.info("requesting keyframe for stream {}", streamType)
+@@ -154,9 +199,10 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+         }
+         startAirPlayListener()
+         advertiser = Advertisers.create(config.mdns, airPlayConfig, identity, bindAddress).also { it.start() }
+-        if (config.wireless) {
++        if (config.wireless && (presenceHelper == null || bootInvite || selectedPresent())) {
+             wireless = WirelessBootstrap(this).also { it.start() }
+         }
++        startSupervisor()
+     }
+ 
+     private fun startAirPlayListener() {
+@@ -181,6 +227,33 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+                 continue
+             }
+             try {
++                if (presenceHelper != null) {
++                    val incomingPhone = presenceResult("admit", socket.inetAddress.hostAddress)
++                    val current = activeSession
++                    if (current != null) {
++                        // A second phone must never replace an active or negotiating session. The
++                        // owner returning after a Wi-Fi drop replaces its own stale session instead.
++                        if (incomingPhone == null || incomingPhone != selectedPhone) {
++                            log.info("receiver busy; rejecting additional AirPlay connection from {}", socket.remoteSocketAddress)
++                            socket.close()
++                            continue
++                        }
++                        log.info("current phone reconnected; replacing its stale session")
++                        runCatching { current.close() }
++                    }
++                    val handoff = System.nanoTime() / 1_000_000 - handoffAcceptedAt < HANDOFF_ADMIT_MS
++                    if (incomingPhone != null) selectedPhone = incomingPhone
++                    else if (handoff) {
++                        // A phone that just joined may not answer ARP yet (2026-10-11: rejected twice ~2 s
++                        // after accepting the handoff). The phone we invited is the one arriving now;
++                        // AirPlay pair-verify still authenticates it and "remember" binds its identity.
++                        log.info("admitting {} as the invited phone after its accepted handoff", socket.remoteSocketAddress)
++                    } else if (!bootInvite) {
++                        log.info("unknown network peer outside first-pairing window; rejecting AirPlay connection from {}", socket.remoteSocketAddress)
++                        socket.close()
++                        continue
++                    }
++                }
+                 socket.tcpNoDelay = true
+                 socket.keepAlive = true
+                 socket.setSoLinger(true, 0)
+@@ -302,41 +375,75 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+         return true
+     }
+ 
+-    /**
+-     * Watches the wireless link: if no CarPlay session is active and no bootstrap attempt is
+-     * running, re-invites the phone (covers the phone leaving and re-entering Wi-Fi, failed
+-     * handshakes and stale sessions).
+-     */
++    /** Only a fresh Wi-Fi presence proof permits re-invitation after the boot attempt. */
+     private fun startSupervisor() {
+         if (!config.wireless) return
+-        Thread(
+-            {
+-                while (!closed.get()) {
+-                    try {
+-                        Thread.sleep(SUPERVISOR_INTERVAL_MS)
+-                        if (closed.get() || !config.wireless) return@Thread
+-                        if (activeSession != null) {
+-                            lastBootstrapAt = System.currentTimeMillis()
+-                            continue
++        Thread({
++            var absentChecks = 0
++            while (!closed.get()) {
++                try {
++                    Thread.sleep(SUPERVISOR_INTERVAL_MS)
++                    if (closed.get()) return@Thread
++                    val now = System.nanoTime() / 1_000_000
++                    if (activeSession != null) {
++                        lastBootstrapAt = now
++                        absentChecks = 0
++                        if (!presenceLearned) lastPeer?.let { peer ->
++                            selectedPhone?.let { phone ->
++                                presenceLearned = presence("remember", peer, phone, activeSession?.controllerId.orEmpty())
++                            }
++                        }
++                        continue
++                    }
++                    if (presenceHelper == null) {
++                        // Preserve the legacy policy on receivers that did not opt in.
++                        if (wireless?.running != true && now - lastBootstrapAt >= 20_000) restartWireless()
++                        continue
++                    }
++                    if (bootInvite && now < bootDeadline) {
++                        if (wireless?.running != true && now - lastBootstrapAt >= 5_000) restartWireless()
++                        continue
++                    }
++                    bootInvite = false
++                    invitedPhone?.takeIf { now - invitedAt >= DECLINE_AFTER_MS }?.let { phone ->
++                        // An online phone that ignores invitations must not block the next person.
++                        invitedPhone = null
++                        presence("decline", phone)
++                        log.info("invited phone did not start CarPlay; backing off before inviting it again")
++                    }
++                    val candidate = selectPhone()
++                    val present = candidate != null
++                    if (!present) {
++                        absentChecks++
++                        // A single missed ARP must not cancel an in-flight Bluetooth handshake.
++                        if (absentChecks < 3 || now - lastBootstrapAt < 15_000) continue
++                        synchronized(this@CarPlayServer) {
++                            if (activeSession == null && wireless != null) {
++                                ++wirelessGeneration
++                                val previous = wireless
++                                wireless = null
++                                previous?.close()
++                                log.info("phone absent from receiver Wi-Fi; waiting without invitations")
++                            }
+                         }
+-                        if (wireless?.running == true) continue
+-                        val now = System.currentTimeMillis()
+-                        if (now - lastBootstrapAt < BOOTSTRAP_COOLDOWN_MS) continue
+-                        log.info("no CarPlay session; re-inviting the iPhone over Bluetooth/Wi-Fi")
+-                        restartWireless()
+-                    } catch (interrupted: InterruptedException) {
+-                        Thread.currentThread().interrupt()
+-                        return@Thread
+-                    } catch (error: Exception) {
+-                        log.warn("connection supervisor error: {}", error.message)
++                        continue
+                     }
++                    absentChecks = 0
++                    val changed = candidate != selectedPhone
++                    if (!changed && !shouldRestartWireless(activeSession != null, wireless?.running == true,
++                            now - lastBootstrapAt, present, sessionEnded)) continue
++                    if (activeSession != null) continue
++                    selectedPhone = candidate
++                    log.info("eligible paired phone selected; restoring CarPlay")
++                    restartWireless()
++                } catch (interrupted: InterruptedException) {
++                    Thread.currentThread().interrupt()
++                    return@Thread
++                } catch (error: Exception) {
++                    log.warn("connection supervisor error: {}", error.message)
+                 }
+-            },
+-            "carplay-supervisor",
+-        ).apply {
+-            isDaemon = true
+-            start()
+-        }
++            }
++        }, "carplay-supervisor").apply { isDaemon = true; start() }
+     }
+ 
+     /**
+@@ -356,17 +463,27 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+         return null
+     }
+ 
++    @Synchronized
+     private fun restartWireless() {
+-        if (!config.wireless) return
+-        lastBootstrapAt = System.currentTimeMillis()
++        if (!config.wireless || closed.get()) return
++        val generation = ++wirelessGeneration
++        sessionEnded = false
++        lastBootstrapAt = System.nanoTime() / 1_000_000
++        if (presenceHelper != null && selectedPhone != invitedPhone) {
++            invitedPhone = selectedPhone
++            invitedAt = lastBootstrapAt
++        }
+         val current = wireless
+         wireless = null
+         current?.close()
+         Thread(
+             {
+                 Thread.sleep(750)
+-                if (closed.get()) return@Thread
+-                wireless = WirelessBootstrap(this).also { it.start() }
++                synchronized(this@CarPlayServer) {
++                    if (closed.get() || generation != wirelessGeneration || activeSession != null) return@Thread
++                    if (presenceHelper != null && !bootInvite && !selectedPresent()) return@Thread
++                    wireless = WirelessBootstrap(this).also { it.start() }
++                }
+             },
+             "wireless-restart",
+         ).apply {
+@@ -422,9 +539,15 @@ class CarPlayServer(val config: ServerConfig, private val configStore: ConfigSto
+     }
+ 
+     companion object {
++        internal fun shouldRestartWireless(active: Boolean, running: Boolean, elapsedMs: Long, present: Boolean, justEnded: Boolean = false): Boolean =
++            !active && present && (justEnded || elapsedMs >= (if (running) 15_000L else 5_000L))
++
+         /** AirPlay pair-setup PIN advertised for first-time connections. */
+         const val PAIRING_PIN = "3939"
+-        private const val SUPERVISOR_INTERVAL_MS = 5_000L
++        private const val SUPERVISOR_INTERVAL_MS = 2_000L
+         private const val BOOTSTRAP_COOLDOWN_MS = 20_000L
++        private const val BOOTSTRAP_STALE_MS = 60_000L
++        private const val DECLINE_AFTER_MS = 45_000L
++        private const val HANDOFF_ADMIT_MS = 30_000L
+     }
+ }
+--- a/server/src/main/kotlin/com/playport/server/ProcessByteStream.kt
++++ b/server/src/main/kotlin/com/playport/server/ProcessByteStream.kt
+@@ -6,6 +6,7 @@ import java.io.InputStream
+ import java.io.OutputStream
+ import java.util.concurrent.LinkedBlockingQueue
+ import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicBoolean
+ 
+ /**
+  * A [BlockingDuplexByteStream] over a child process' standard input/output.
+@@ -21,6 +22,7 @@ class ProcessByteStream(
+     private val input: InputStream = process.inputStream
+     private val output: OutputStream = process.outputStream
+     private val writeLock = Any()
++    private val closing = AtomicBoolean(false)
+     @Volatile private var ended = false
+     private var remainder = ByteArray(0)
+     private var remainderOffset = 0
+@@ -92,8 +94,25 @@ class ProcessByteStream(
+     }
+ 
+     override fun close() {
++        if (!closing.compareAndSet(false, true)) return
++        // EOF lets the Linux bridge release its RFCOMM fd and unregister its BlueZ profile.
++        // Do not start a replacement while the old helper is still cleaning up.
+         runCatching { output.close() }
+-        runCatching { input.close() }
+-        process.destroy()
++        try {
++            if (!process.waitFor(5, TimeUnit.SECONDS)) {
++                process.destroy()
++                if (!process.waitFor(2, TimeUnit.SECONDS)) {
++                    process.destroyForcibly()
++                    process.waitFor(2, TimeUnit.SECONDS)
++                }
++            }
++        } catch (_: InterruptedException) {
++            process.destroyForcibly()
++            Thread.currentThread().interrupt()
++        } finally {
++            ended = true
++            inbound.offer(ByteArray(0))
++            runCatching { input.close() }
++        }
+     }
+ }
+--- a/server/src/main/kotlin/com/playport/server/WirelessBootstrap.kt
++++ b/server/src/main/kotlin/com/playport/server/WirelessBootstrap.kt
+@@ -26,7 +26,10 @@ class WirelessBootstrap(private val server: CarPlayServer) : Closeable {
+     @Volatile var running = false
+         private set
+ 
++    @Synchronized
+     fun start() {
++        if (stopped || running) return
++        running = true
+         Thread(::run, "wireless-bootstrap").apply {
+             isDaemon = true
+             start()
+@@ -34,7 +37,6 @@ class WirelessBootstrap(private val server: CarPlayServer) : Closeable {
+     }
+ 
+     private fun run() {
+-        running = true
+         try {
+             val config = server.config
+             val wifi = WifiInfo.detect(config)
+@@ -58,8 +60,8 @@ class WirelessBootstrap(private val server: CarPlayServer) : Closeable {
+                 )
+                 return
+             }
+-            val deviceAddress = config.bluetoothDeviceAddress?.takeIf { it.isNotBlank() }
+-                ?: BluetoothBridge.findPairedIphone(bridgePath)
++            val deviceAddress = server.wirelessPhone()?.takeIf { it.isNotBlank() }
++                ?: if (System.getenv("CARPLAY_PRESENCE_HELPER") == null) BluetoothBridge.findPairedIphone(bridgePath) else null
+             if (deviceAddress == null) {
+                 log.warn("wireless bootstrap skipped: no paired iPhone found; pass --bt-address AA:BB:CC:DD:EE:FF")
+                 return
+@@ -67,7 +69,10 @@ class WirelessBootstrap(private val server: CarPlayServer) : Closeable {
+             val hostBluetoothMac = server.hostBluetoothMac
+             log.info("wireless bootstrap: iPhone={} hostBt={} wifi={} ch={}", deviceAddress, hostBluetoothMac, wifi.ssid, wifi.channel)
+ 
+-            val stream = BluetoothBridge.open(bridgePath, deviceAddress).also { bridgeProcess = it }
++            val stream = synchronized(this) {
++                if (stopped) return
++                BluetoothBridge.open(bridgePath, deviceAddress).also { bridgeProcess = it }
++            }
+             val channel = Iap2Session.openWireless(stream, traceContext = "wireless-rfcomm", onTrace = { log.debug(it) })
+             log.info("wireless iAP2 CSM channel opened over RFCOMM")
+ 
+@@ -101,7 +106,10 @@ class WirelessBootstrap(private val server: CarPlayServer) : Closeable {
+                 identification = identification,
+                 endpoint = endpoint,
+                 timeoutMillis = Iap2WirelessControlClient.NO_TIMEOUT_MILLIS,
+-                onReady = { log.info("wireless bootstrap accepted by the iPhone; waiting for the Wi-Fi handoff") },
++                onReady = {
++                    log.info("wireless bootstrap accepted by the iPhone; waiting for the Wi-Fi handoff")
++                    server.handoffAccepted()
++                },
+                 onProgress = { log.debug("wireless $it") },
+             )
+             if (!stopped) {
+@@ -118,15 +126,15 @@ class WirelessBootstrap(private val server: CarPlayServer) : Closeable {
+         } catch (error: Exception) {
+             if (!stopped) log.warn("wireless bootstrap failed: {}", error.message)
+         } finally {
+-            running = false
++            close()
+         }
+     }
+ 
++    @Synchronized
+     override fun close() {
+         stopped = true
+-        running = false
+-        bridgeProcess?.close()
+-        bridgeProcess = null
++        try { bridgeProcess?.close() }
++        finally { bridgeProcess = null; running = false }
+     }
+ }
+ 
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/WirelessReconnectTest.kt
+@@ -0,0 +1,49 @@
++package com.playport.server
++
++import org.junit.Assert.*
++import org.junit.Test
++
++class WirelessReconnectTest {
++    @Test fun absentPhoneNeverInvitedRegardlessOfBluetoothOrTime() {
++        for (running in listOf(true, false)) {
++            assertFalse(CarPlayServer.shouldRestartWireless(false, running, 3600_000, false))
++        }
++    }
++    @Test fun manualReturnStartsPromptlyAndActiveSessionWins() {
++        assertTrue(CarPlayServer.shouldRestartWireless(false, false, 5_000, true))
++        assertFalse(CarPlayServer.shouldRestartWireless(false, false, 4_999, true))
++        assertFalse(CarPlayServer.shouldRestartWireless(true, false, 90_000, true))
++    }
++    @Test fun presentPhoneWithStaleBootstrapRetriesAfterBoundedHandshakeGrace() {
++        assertFalse(CarPlayServer.shouldRestartWireless(false, true, 14_999, true))
++        assertTrue(CarPlayServer.shouldRestartWireless(false, true, 15_000, true))
++    }
++    @Test fun knownEndedSessionRecoversWithoutCooldownButNeverWithoutPresence() {
++        assertTrue(CarPlayServer.shouldRestartWireless(false, true, 0, true, true))
++        assertFalse(CarPlayServer.shouldRestartWireless(false, true, 90_000, false, true))
++        assertFalse(CarPlayServer.shouldRestartWireless(true, true, 90_000, true, true))
++    }
++    @Test fun bridgeCloseAllowsProfileCleanupBeforeDestroy() {
++        val child = object : Process() {
++            var stdinClosed = false
++            var cleaned = false
++            var destroyed = false
++            override fun getOutputStream() = object : java.io.ByteArrayOutputStream() {
++                override fun close() { stdinClosed = true }
++            }
++            override fun getInputStream() = java.io.ByteArrayInputStream(byteArrayOf())
++            override fun getErrorStream() = java.io.ByteArrayInputStream(byteArrayOf())
++            override fun waitFor(): Int { cleaned = true; return 0 }
++            override fun waitFor(timeout: Long, unit: java.util.concurrent.TimeUnit): Boolean {
++                assertTrue("EOF requests graceful bridge cleanup", stdinClosed)
++                cleaned = true
++                return true
++            }
++            override fun exitValue() = if (cleaned) 0 else throw IllegalThreadStateException()
++            override fun destroy() { destroyed = true }
++        }
++        ProcessByteStream(child, "cleanup-test").close()
++        assertTrue("close must wait for DisconnectProfile/UnregisterProfile", child.cleaned)
++        assertFalse("a clean exit must not be killed", child.destroyed)
++    }
++}

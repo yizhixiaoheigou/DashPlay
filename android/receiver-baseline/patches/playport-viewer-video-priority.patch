@@ -1,0 +1,101 @@
+diff --git a/server/src/main/kotlin/com/playport/server/Main.kt b/server/src/main/kotlin/com/playport/server/Main.kt
+--- a/server/src/main/kotlin/com/playport/server/Main.kt
++++ b/server/src/main/kotlin/com/playport/server/Main.kt
+@@ -1,9 +1,12 @@
+ package com.playport.server
+ 
+ import io.ktor.server.engine.applicationEnvironment
++import io.ktor.server.engine.connector
+ import io.ktor.server.engine.embeddedServer
+ import io.ktor.server.engine.sslConnector
+ import io.ktor.server.netty.Netty
++import io.netty.bootstrap.ServerBootstrap
++import io.netty.channel.ChannelOption
+ import java.nio.file.Path
+ import kotlin.system.exitProcess
+ import org.slf4j.LoggerFactory
+@@ -43,7 +46,10 @@
+     // address (the head unit comes through the car hotspot); AirPlay stays on bindAddress.
+     val webHost = System.getenv("CARPLAY_WEB_HOST")?.takeIf { it.isNotBlank() } ?: server.bindAddress.hostAddress
+     val http = if (config.insecureHttp) {
+-        embeddedServer(Netty, port = config.httpPort, host = webHost) {
++        embeddedServer(Netty, environment = applicationEnvironment { }, configure = {
++            connector { host = webHost; port = config.httpPort }
++            configureBootstrap = { configureViewerSocket(this) }
++        }) {
+             server.hub.install(this, webRoot)
+         }
+     } else {
+@@ -55,9 +61,7 @@
+                     host = webHost
+                     port = config.httpPort
+                 }
+-                // The kernel grows a socket's send buffer to megabytes, seconds of picture on a slow car Wi-Fi
+-                // that WebHub's age check cannot see; a fixed 128 KiB (Linux doubles it) keeps that part short.
+-                configureBootstrap = { childOption(io.netty.channel.ChannelOption.SO_SNDBUF, 128 * 1024) }
++                configureBootstrap = { configureViewerSocket(this) }
+             },
+         ) {
+             server.hub.install(this, webRoot)
+@@ -102,3 +106,12 @@
+ 
+ private fun projectVersion(): String =
+     CarPlayServer::class.java.`package`?.implementationVersion ?: "0.1.0"
++
++/** Viewer connections share the radio with the car's other downloads. AF41 lets supporting Wi-Fi stacks map them
++ *  to WMM video priority; it does not guarantee priority on every driver or AP. Applies to HTTP and HTTPS alike.
++ *  Inspired by the N1/Tesla community fork's IP_TOS change (2026-10-26 review). */
++internal fun configureViewerSocket(bootstrap: ServerBootstrap) {
++    // Keep the existing send-buffer bound: otherwise kernel queues can hide seconds of old picture from LagGate.
++    bootstrap.childOption(ChannelOption.SO_SNDBUF, 128 * 1024)
++    bootstrap.childOption(ChannelOption.IP_TOS, 0x88)   // DSCP AF41 (34), ECN unchanged
++}
+diff --git a/server/src/test/kotlin/com/playport/server/ViewerSocketTest.kt b/server/src/test/kotlin/com/playport/server/ViewerSocketTest.kt
+new file mode 100644
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/ViewerSocketTest.kt
+@@ -0,0 +1,44 @@
++package com.playport.server
++
++import io.netty.bootstrap.ServerBootstrap
++import io.netty.channel.ChannelInitializer
++import io.netty.channel.nio.NioEventLoopGroup
++import io.netty.channel.socket.SocketChannel
++import io.netty.channel.socket.nio.NioServerSocketChannel
++import java.net.InetSocketAddress
++import java.net.Socket
++import java.util.concurrent.CompletableFuture
++import java.util.concurrent.TimeUnit
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class ViewerSocketTest {
++    @Test fun acceptedViewerSocketHasVideoMarkAndBoundedSendBuffer() {
++        val group = NioEventLoopGroup(1)
++        try {
++            val observed = CompletableFuture<Pair<Int, Int>>()
++            val bootstrap = ServerBootstrap().group(group).channel(NioServerSocketChannel::class.java)
++                .childHandler(object : ChannelInitializer<SocketChannel>() {
++                    override fun initChannel(channel: SocketChannel) {
++                        observed.complete(channel.config().trafficClass to channel.config().sendBufferSize)
++                    }
++                })
++            configureViewerSocket(bootstrap)
++            val listener = bootstrap.bind("127.0.0.1", 0).sync().channel()
++            try {
++                Socket().use { client ->
++                    client.connect(listener.localAddress() as InetSocketAddress, 5000)
++                    val (tos, sendBuffer) = observed.get(5, TimeUnit.SECONDS)
++                    assertEquals(0x88, tos)
++                    // Linux doubles SO_SNDBUF; macOS reports the requested size.
++                    assertTrue("send buffer: $sendBuffer", sendBuffer in 128 * 1024..256 * 1024)
++                }
++            } finally {
++                listener.close().sync()
++            }
++        } finally {
++            group.shutdownGracefully(0, 5, TimeUnit.SECONDS).sync()
++        }
++    }
++}

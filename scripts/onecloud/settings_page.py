@@ -80,6 +80,29 @@ def _car_credentials(form, old):
     return ssid, password
 
 
+def uplink_credentials(form, old, optional=False):
+    """A blank optional hotspot disables fallback; passwords only carry over for the same SSID."""
+    ssid = (form.get('ssid') or '').strip()
+    if optional and not ssid and not form.get('password'):
+        return {}
+    security = form.get('security', 'open' if old.get('ssid') == ssid and old.get('security') == 'open' else 'wpa')
+    if security not in ('wpa', 'open'):
+        raise ValueError('请选择加密网络或开放网络。')
+    if security == 'open':
+        if not 1 <= len(ssid.encode()) <= 32 or any(ord(c) < 32 or ord(c) == 127 for c in ssid):
+            raise ValueError('请输入有效的热点名称（1–32 字节）。')
+        return {'ssid': ssid, 'passphrase': '', 'security': 'open'}
+    ssid, password = _hotspot_credentials(form, old if old.get('ssid') == ssid else {})
+    return {'ssid': ssid, 'passphrase': password}
+
+
+def uplink_security_field(saved):
+    opened = saved.get('security') == 'open'
+    return ('<label class=cell><span class=main><b>热点类型</b></span><select name=security aria-label=热点类型>'
+            f'<option value=wpa{"" if opened else " selected"}>加密网络（需要密码）</option>'
+            f'<option value=open{" selected" if opened else ""}>开放网络（无密码）</option></select></label>')
+
+
 MODE_TITLES = {"car_hotspot": "方式一：车机热点", "mifi": "方式二：随身 WiFi", "box_hotspot": "方式三：车机连盒子热点"}
 
 
@@ -99,6 +122,8 @@ def read_wired(path):
 def internet_label(chosen, saved, current, tesla_lan_stable=False):
     """The 车机上网 banner: what the car is getting right now, in the owner's words."""
     phase, reason = current.get('phase'), current.get('reason')
+    if chosen['car_internet'] == 'usb_tether' and not saved.get('ssid') and phase not in ('online', 'wired'):
+        return 'USB 网络尚未就绪；未设置备用 WiFi，局域网保持可用'
     if tesla_lan_stable and reason:
         return reason
     if phase == 'online':
@@ -107,9 +132,11 @@ def internet_label(chosen, saved, current, tesla_lan_stable=False):
         return ('已接 USB 共享网络，车机可上网' if chosen['car_internet'] == 'usb_tether'
                 else '已接有线网络，车机可上网')
     if chosen['car_internet'] == 'usb_tether':
+        if not saved.get('ssid'):
+            return 'USB 网络尚未就绪；未设置备用 WiFi，局域网保持可用'
         if phase in ('connecting', 'recovering'):
-            return '已找到 ' + saved.get('ssid', '手机热点') + '，正在连接'
-        return '没插 USB 共享网络，也没找到之前的热点，车机暂时没网'
+            return reason or ('正在连接备用热点 ' + saved['ssid'])
+        return reason or ('USB 网络尚未就绪；正在寻找备用热点 ' + saved['ssid'])
     if chosen['car_internet'] == 'phone_hotspot':
         # 2026-10-31: the owner asked for one short line here, not a list of causes.
         return ('没找到或无法连接 ' + saved.get('ssid', '手机热点') + '，已退回不上网。'
@@ -430,10 +457,20 @@ class SettingsPage:
             raise ValueError("未知操作。")
         if path == "/setup-flow":
             self.check_nonce(form)
-            return FirstSetup(self).apply(form)
+            try:
+                return FirstSetup(self).apply(form)
+            except OSError as error:
+                print('settings: setup save failed: ' + type(error).__name__, flush=True)
+                raise ValueError('保存失败：无法写入或核对配置，请检查盒子存储后重试。') from None
         if path in ("/internet", "/iphone"):
             self.check_nonce(form)
-            return self.save_connection(path, form)
+            try:
+                return self.save_connection(path, form)
+            except (ValueError, OSError) as error:
+                print('settings: connection save failed: ' + type(error).__name__, flush=True)
+                if isinstance(error, OSError):
+                    raise ValueError('保存失败：无法写入或核对配置，请检查盒子存储后重试。') from None
+                raise
         if path == "/direct":
             self.check_nonce(form)
             if self.setup().get('mode') not in setup_wizard.JOINS or not self.direct_capable():
@@ -511,8 +548,12 @@ class SettingsPage:
         action = form.get("action")
         saved = debug_uplink.hotspot(self.state) or debug_uplink.hotspot(self.state, filename="uplink-hotspot.json")
         if action == "save":
-            ssid, password = _car_credentials(form, saved or {})
-            _save(self.state / debug_uplink.HOTSPOT, {"ssid": ssid, "passphrase": password})
+            fields = dict(form)
+            if not fields.get("ssid") or fields["ssid"] == "__manual__":
+                fields["ssid"] = fields.get("ssid_manual", "")
+            credentials = uplink_credentials(fields, saved or {})
+            ssid = credentials["ssid"]
+            _save(self.state / debug_uplink.HOTSPOT, credentials)
             return f"已保存手机热点「{ssid}」。要远程调试时再点「连手机热点调试」。"
         if action == "forget":
             (self.state / debug_uplink.HOTSPOT).unlink(missing_ok=True)
@@ -654,6 +695,7 @@ class SettingsPage:
                 '<label class=cell><span class=main><b>手机热点名称</b></span><input type=text name=ssid_manual '
                 f'value="{escape(saved["ssid"] if saved else "")}" required maxlength=32 autocapitalize=off '
                 'style="text-align:right"></label>'
+                + uplink_security_field(saved or {}) +
                 '<label class=cell><span class=main><b>密码</b></span><input type=password name=password '
                 f'placeholder="{"留空表示不修改" if saved else "8–63 个字符"}" autocomplete=off style="text-align:right"></label>'
                 '</div><button class="btn plain" name=action value=save>保存</button></form>')
@@ -914,16 +956,17 @@ class SettingsPage:
             if width not in ('auto', '20', '40'):
                 raise ValueError('请选择热点带宽：自动、20 MHz 或 40 MHz。')
             chosen['usb_hotspot_width'] = width
-            if value == 'phone_hotspot':
+            updates = {}
+            if value == 'phone_hotspot' or value == 'usb_tether' and ('ssid' in form or 'password' in form):
                 old = _load(self.state / 'uplink-hotspot.json') or {}
-                # A new SSID must not silently reuse another hotspot's password.
-                if old.get('ssid') != form.get('ssid', '').strip():
-                    old = {}
-                ssid, password = _hotspot_credentials(form, old)
-                _save(self.state / 'uplink-hotspot.json', {'ssid': ssid, 'passphrase': password})
-                setup_wizard.save(self.state, setup)
-            _save(self.options_file, chosen)
+                updates[self.state / 'uplink-hotspot.json'] = uplink_credentials(form, old, value == 'usb_tether')
+            updates[self.options_file] = chosen
+            setup_wizard.save_json_many(updates)
+            saved = debug_uplink.hotspot(self.state, filename='uplink-hotspot.json')
+            print(f'settings: internet saved mode={value} fallback={bool(saved)}', flush=True)
         self.apply_later('connection preference changed')
+        if path == '/internet' and value == 'usb_tether':
+            return ('USB 上网方式和备用热点已保存。' if saved else 'USB 上网方式已保存，未设置备用 WiFi。') + '约 1 分钟后生效，期间 CarPlay 会断一下。'
         return '已保存，约 1 分钟后生效，期间 CarPlay 会断一下。'
 
     def internet_block(self, nonce):
@@ -949,13 +992,15 @@ class SettingsPage:
             actual = self.status().get('hotspot_width')
             if actual in (20, 40, 80):
                 rows += f'<p class=note>当前热点带宽：{actual} MHz</p>'
+        rows += '<div class=cell><span class=main><b>WiFi 热点 / USB 的备用 WiFi</b><span>选 USB 时可选填；名称和密码都留空则只用 USB，并清除旧备用热点。选连接 WiFi 热点时必须填写。</span></span></div>'
+        rows += uplink_security_field(saved)
         rows += (f'<label class=cell><span class=main><b>热点名称</b></span><input type=text name=ssid value="{escape(saved.get("ssid", ""))}" '
                  'maxlength=32 placeholder=手机热点名称 autocapitalize=off style="text-align:right" aria-label=手机热点名称></label>'
                  '<label class=cell><span class=main><b>热点密码</b></span><input type=password name=password minlength=8 maxlength=63 '
                  f'placeholder="{"留空沿用已保存的密码" if saved.get("passphrase") else "至少 8 位"}" autocomplete=new-password '
                  'style="text-align:right" aria-label=手机热点密码></label>')
         rows += '<button class="cell action">保存</button></form>'
-        return ui.group('车机上网', rows, '密码只写不读，留空沿用同名热点密码。热点可以是手机（跑 CarPlay 的同一部 iPhone 或另一部手机），也可以是随身 WiFi，要一直开着。'
+        return ui.group('车机上网', rows, '开放网络无需密码；加密网络密码只写不读，留空沿用同名热点密码，改名需填写密码。热点可以是手机（跑 CarPlay 的同一部 iPhone 或另一部手机），也可以是随身 WiFi，要一直开着。'
                        'iPhone 开热点时把「最大兼容性」关掉（热点走 5 GHz，画面才不卡）；'
                        '只有盒子网卡只支持 2.4 GHz 时才需要打开它。'
                        '特斯拉在 5 GHz 只认 149–165 信道：手机热点在 5 GHz 别的信道上时盒子不去连它（否则特斯拉找不到盒子、'
@@ -963,7 +1008,7 @@ class SettingsPage:
                        + setup_flow.DATA_USE + '找不到或掉线时退回不上网；特斯拉自带音乐、地图将不能联网，CarPlay 正常。'
                        '「USB 共享网络」：手机或随身 WiFi 用数据线插到盒子的 USB 口。iPhone 打开「个人热点」'
                        '（可以就是做有线 CarPlay 的那根线）；安卓手机打开「USB 网络共享」；随身 WiFi 一般插上即用。'
-                       '联网顺序是：先用 USB；USB 没插或连不上时，自动改连上面填过的热点；热点也连不上时保持无外网'
+                       '联网顺序是：先用 USB；USB 没插或连不上时，自动改连已保存的备用热点；未设置备用热点或热点也连不上时保持无外网'
                        '（盒子热点和 CarPlay 不受影响）。插回数据线再切回 USB。'
                        '和 CarPlay 走有线还是无线无关，有线、无线在 CarPlay 画面的「盒子设置」里随时切换。')
 

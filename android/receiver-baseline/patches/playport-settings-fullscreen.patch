@@ -1,0 +1,53 @@
+diff --git a/web/index.html b/web/index.html
+index 00bc881..ca07724 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -10,10 +10,11 @@
+   <div id="error-banner" role="alert" hidden><span data-i18n="error"></span><details><summary data-i18n="technical"></summary><p id="error-text"></p></details><button id="dismiss-error" data-i18n="close"></button></div>
+ </main>
+ <dialog id="settings" aria-labelledby="settings-title"><header><h2 id="settings-title" data-i18n="settings"></h2><button id="btn-close" data-i18n="close"></button></header><div class="settings-body">
++  <button id="fullscreen" class="primary fullscreen-action" type="button"><svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path class="expand" d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><path class="collapse" d="M3 8h5V3m8 0v5h5M8 21v-5H3m13 5v-5h5"/></svg><span id="fullscreen-text">全屏</span></button>
+   <label class="row"><span data-i18n="language"></span><select id="language"><option value="zh">简体中文</option><option value="en">English</option></select></label>
+   <label class="volume"><span data-i18n="volume"></span><output id="volume-value">100%</output><input id="volume" type="range" min="0" max="100" value="100"/></label>
+   <p id="audio-status" class="hint"></p>
+-  <section><div class="section-title"><h3 data-i18n="display"></h3><button id="fullscreen" data-i18n="fullscreen"></button></div>
++  <section><div class="section-title"><h3 data-i18n="display"></h3></div>
+   <label class="check"><input id="auto-fit" type="checkbox"/><span data-i18n="auto"></span></label><p class="hint" data-i18n="autoHint"></p>
+   <form id="display-form"><fieldset id="display-fields"><div class="pair"><label><span data-i18n="width"></span><input id="width" type="number" min="480" max="3840" step="2" required/></label><label><span data-i18n="height"></span><input id="height" type="number" min="480" max="3840" step="2" required/></label></div><div class="pair"><label><span data-i18n="ui"></span><select id="ui-scale"><option value="85" data-i18n="small"></option><option value="100" data-i18n="standard"></option><option value="115" data-i18n="large"></option></select></label><label><span data-i18n="fps"></span><select id="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label></div></fieldset><button id="apply" class="primary" data-i18n="apply"></button><p id="display-status" class="hint" role="status"></p></form></section>
+   <details><summary data-i18n="diagnostics"></summary><button id="browser-check-show" type="button">浏览器兼容性检测 / Browser check</button><p id="capabilities"></p><p id="media-support"></p><p id="stats"></p><p data-i18n="micHint"></p><p id="mic-status"></p><p class="hint" data-i18n="privacy"></p></details>
+diff --git a/web/src/main.ts b/web/src/main.ts
+index 157354d..44d4ded 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -117,10 +117,12 @@ function updateFullscreen() {
+   const full = !!document.fullscreenElement;
+   const label = t(full ? 'exitFullscreen' : 'fullscreen');
+   el('fullscreen-label').textContent = label;
+-  el('fullscreen').textContent = label;
+-  el('btn-fullscreen').setAttribute('aria-label', label);
+-  el('btn-fullscreen').setAttribute('title', label);
+-  el('btn-fullscreen').dataset.fullscreen = String(full);
++  el('fullscreen-text').textContent = label;
++  for (const id of ['btn-fullscreen', 'fullscreen']) {
++    el(id).setAttribute('aria-label', label);
++    el(id).setAttribute('title', label);
++    el(id).dataset.fullscreen = String(full);
++  }
+ }
+ async function toggleFullscreen() {
+   try {
+diff --git a/web/src/style.css b/web/src/style.css
+index d2a1b51..5a23bd6 100644
+--- a/web/src/style.css
++++ b/web/src/style.css
+@@ -38,5 +38,8 @@ fieldset { border:0; padding:0; margin:0; min-width:0; } .pair { display:grid; g
+ 
+ #btn-fullscreen { position:absolute; top:12px;top:max(12px,env(safe-area-inset-top)); right:12px;right:max(12px,env(safe-area-inset-right)); display:flex; align-items:center; gap:8px; min-width:48px; min-height:48px; padding:10px 12px; background:#252b33c9; border-color:#77818e; }
+ #btn-fullscreen:hover, #btn-fullscreen:focus-visible { background:#303945; }
+-#btn-fullscreen .collapse, #btn-fullscreen[data-fullscreen=true] .expand { display:none; }
+-#btn-fullscreen[data-fullscreen=true] .collapse { display:block; }
++/* Live CarPlay keeps the whole picture clear; fullscreen then lives in Settings (opened from the CarPlay gear icon). */
++#app[data-live=true] #btn-fullscreen { display:none; }
++.fullscreen-action { display:flex; align-items:center; justify-content:center; gap:10px; min-height:56px; margin:18px 0 8px; font-size:19px; }
++#btn-fullscreen .collapse, #btn-fullscreen[data-fullscreen=true] .expand, #fullscreen .collapse, #fullscreen[data-fullscreen=true] .expand { display:none; }
++#btn-fullscreen[data-fullscreen=true] .collapse, #fullscreen[data-fullscreen=true] .collapse { display:block; }

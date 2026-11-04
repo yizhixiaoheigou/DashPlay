@@ -1,0 +1,269 @@
+# Choose a supported codec before subscribing and reject stale startup video.
+# Shared by Linux/OpenWrt and Android; speed history only influences resolution.
+diff --git a/web/src/main.ts b/web/src/main.ts
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -9,13 +9,13 @@
+ import { Connection } from './ws';
+ import { SystemMedia } from './media-session';
+ import { LagProbe } from './lag';
+-import { suggestedResolution, windowResolution, areaSize, sameStream, frameRateCheck, type Area } from './display-fit';
++import { suggestedResolution, windowResolution, aspectChanged, areaSize, sameStream, frameRateCheck, type Area } from './display-fit';
+ import { t, language, setLanguage, type Key } from './i18n';
+ import { isNight, parseNightMode } from './night';
+ import { reachable, TESLA_HOPS } from './tesla-fullscreen';
+ import { hudLines } from './debug-hud';
+ import { compatDisplayOn } from './compat-display';
+-import type { ServerMessage, ClientMessage } from './protocol';
++import { VideoCodec, type ServerMessage, type ClientMessage, type VideoConfigMessage } from './protocol';
+ 
+ function el<T extends HTMLElement = HTMLElement>(id: string): T { return document.getElementById(id) as T; }
+ const canvas = el<HTMLCanvasElement>('screen');
+@@ -46,6 +46,27 @@
+ let expectRestart = false, expectTimer = 0;
+ interface Display { width: number; height: number; fps: number; uiScale: number; hevc: boolean; areas?: Area[]; area?: number; pending?: boolean; }
+ let display: Display | null = null;
++let initialVideoTarget: Pick<Display, 'width' | 'height' | 'hevc'> | null = null;
++let initialVideoAccepted = true, initialVideoTimer = 0;
++function clearInitialVideoWait(): void {
++  window.clearTimeout(initialVideoTimer); initialVideoTimer = 0;
++  initialVideoTarget = null; initialVideoAccepted = true;
++}
++function expectInitialVideo(target: Display): void {
++  clearInitialVideoWait();
++  initialVideoTarget = { width: target.width, height: target.height, hevc: target.hevc };
++  initialVideoAccepted = false;
++  // A failed phone renegotiation must not leave the viewer permanently suppressing video.
++  initialVideoTimer = window.setTimeout(() => { clearInitialVideoWait(); send({ type: 'keyframe' }); }, 20000);
++}
++function acceptInitialVideoConfig(config: VideoConfigMessage): boolean {
++  const target = initialVideoTarget;
++  if (target && (config.codec !== (target.hevc ? VideoCodec.H265 : VideoCodec.H264)
++      || config.width !== target.width || config.height !== target.height)) {
++    initialVideoAccepted = false; return false;
++  }
++  clearInitialVideoWait(); return true;
++}
+ const customSize = el<HTMLInputElement>('custom-size');
+ // Off (the default) follows the window; on keeps the typed width and height.
+ customSize.checked = localStorage.getItem('f50-auto-fit') === 'false';
+@@ -255,17 +276,29 @@
+ }
+ /** Auto quality (2026-10-14; a Tesla decodes a frame in ~1 ms, the XPeng in 60-100 ms): once this browser has
+  *  shown it decodes fast (f50-fast-decoder, from the 10 s reports), auto picks the resolution from the screen's real
+- *  pixels (CSS size x device pixel ratio, long side 1280-2560) and H.265 when the browser decodes it; a slow decoder
+- *  keeps the CSS-size choice and H.264. The codec list (auto / H.264 / H.265) overrides. */
++ *  pixels (CSS size x device pixel ratio, long side 1280-2560). Codec support is separate from this speed
++ *  history: automatic uses HEVC when supported, unless a real HEVC failure was remembered. */
+ function readFlag(key: string) { try { return localStorage.getItem(key) ?? ''; } catch { return ''; } }
+ function saveFlag(key: string, value: string) { try { localStorage.setItem(key, value); } catch { /* Then auto stays as it was. */ } }
+ let hevcDecodes = false;
+-if (typeof VideoDecoder !== 'undefined') void VideoDecoder.isConfigSupported({codec:'hvc1.1.6.L120.B0',codedWidth:1920,codedHeight:1080})
+-  .then(support => { hevcDecodes = support.supported === true; scheduleAuto(); }).catch(() => {});
++/** Resolve once before choosing the first stream; a late capability result must not restart playback. */
++async function probeHevc(): Promise<boolean> {
++  if (typeof VideoDecoder === 'undefined') return false;
++  let timer = 0;
++  try {
++    return await Promise.race([
++      VideoDecoder.isConfigSupported({codec:'hvc1.1.6.L120.B0',codedWidth:1920,codedHeight:1080})
++        .then(support => support.supported === true),
++      new Promise<boolean>(resolve => { timer = window.setTimeout(() => resolve(false), 1000); }),
++    ]);
++  } catch { return false; }
++  finally { window.clearTimeout(timer); }
++}
++const hevcSupport = probeHevc().then(supported => { hevcDecodes = supported; });
+ const fastDecoder = () => readFlag('f50-fast-decoder') === '1';
+ function wantHevc() {
+   const codec = el<HTMLSelectElement>('codec').value;
+-  return codec === 'h265' || (codec === 'auto' && fastDecoder() && hevcDecodes && readFlag('f50-hevc-failed') !== '1');
++  return codec === 'h265' || (codec === 'auto' && hevcDecodes && readFlag('f50-hevc-failed') !== '1');
+ }
+ let fastReports = 0, slowReports = 0;
+ /** Called with each 10 s report: three fast ones in a row mark this browser fast, three slow ones unmark it. */
+@@ -440,8 +473,8 @@
+   onTiming(stats) { connection.send({type:'stats', stats:{ev:16,...stats}}); },
+   onWire(message) {
+     switch (message.kind) {
+-      case 'video-config': video.configure(message); break;
+-      case 'video-frame': video.pushFrame(message); break;
++      case 'video-config': if (acceptInitialVideoConfig(message)) video.configure(message); break;
++      case 'video-frame': if (initialVideoAccepted) video.pushFrame(message); break;
+       case 'audio-config': audio.handleConfig(message); voiceStarted(message.streamType, message.name); break;
+       case 'audio-packet': if (message.streamType === 102) { musicBytes += message.data.length; hudMusicBytes += message.data.length; } audio.handlePacket(message); break;
+       case 'audio-stopped': audio.stopStream(message.streamType); voiceStopped(message.streamType); break;
+@@ -630,8 +663,10 @@
+ });
+ /** The box's display as it is now: another page may have changed it (it sent back that page's fps, 2026-10-16). */
+ async function fetchDisplay(): Promise<Display | null> {
+-  try { const r = await fetch('/api/display', { cache: 'no-store' }); return r.ok ? await r.json() as Display : null; }
++  const abort = new AbortController(), timer = window.setTimeout(() => abort.abort(), 2500);
++  try { const r = await fetch('/api/display', { cache: 'no-store', signal: abort.signal }); return r.ok ? await r.json() as Display : null; }
+   catch { return null; }
++  finally { window.clearTimeout(timer); }
+ }
+ async function loadDisplay() {
+   if (displayBusy || !token) return;
+@@ -657,14 +692,15 @@
+   // A renegotiation is coming: hold the layout from now, the session's end may arrive before this answer.
+   const restart = active && !how.defer && (!display || !sameStream(display, target));
+   if (restart) { expectRestart = true; window.clearTimeout(expectTimer); expectTimer = window.setTimeout(() => { endExpectRestart(); fit(); }, DISPLAY_HOLD_MS); }
++  const abort = new AbortController(), timer = window.setTimeout(() => abort.abort(), 5000);
+   try {
+-    const r = await fetch(`/api/display?token=${encodeURIComponent(token)}`, { method:'POST', headers:{'Content-Type':'application/json'},
++    const r = await fetch(`/api/display?token=${encodeURIComponent(token)}`, { method:'POST', headers:{'Content-Type':'application/json'}, signal: abort.signal,
+       body:JSON.stringify({ ...target, defer: how.defer === true, reason: how.reason }) });
+     const body = await r.json() as {ok?:boolean; deferred?:boolean}; if (!r.ok || !body.ok) throw new Error();
+     if (body.deferred) { if (display) display.pending = true; el('display-status').textContent = t('deferred'); return true; }
+     display = { ...target, pending: false }; el('display-status').textContent = t('applied'); return true;
+   } catch { if (restart) { endExpectRestart(); fit(); } el('display-status').textContent = t('applyFail'); return false; }
+-  finally { displayBusy=false; el<HTMLButtonElement>('apply').disabled=false; el<HTMLFieldSetElement>('display-fields').disabled=false; render(); }
++  finally { window.clearTimeout(timer); displayBusy=false; el<HTMLButtonElement>('apply').disabled=false; el<HTMLFieldSetElement>('display-fields').disabled=false; render(); }
+ }
+ function scheduleAuto() {
+   window.clearTimeout(autoTimer);
+@@ -733,7 +769,7 @@
+   connection.send({type:'stats',stats:{ev,hidden:document.hidden?1:0,fullscreen:document.fullscreenElement?1:0,width:screen.clientWidth,height:screen.clientHeight,want:wantFullscreen?1:0,...viewport()}});
+ }
+ /** Which page build runs (raised with each build tried in the car). */
+-const BUILD = 202610221200;
++const BUILD = 2026110205;
+ /** What the browser says of the space it gives the page, to find the car's bar over a fullscreen page (2026-10-13):
+  *  window, visual viewport (and its offset), screen, available screen, outer window, pixel ratio. */
+ function viewport(): Record<string, number> {
+@@ -844,7 +880,31 @@
+   hudFrames = 0; hudBytes = 0; hudMusicBytes = 0; hudStart = now;
+ }
+ window.setInterval(updateHud, 1000);
+-render();fit();if(token) connection.connect();
++/** Select the codec before subscribing to cached video, so entry cannot flash H264 then renegotiate.
++ * Keep an existing stream's resolution when its shape fits; speed learning must not lower or double it. */
++async function startViewer(): Promise<void> {
++  if (!token) return;
++  try {
++    await hevcSupport;
++    if (!document.hidden) {
++      const current = await fetchDisplay();
++      if (current) {
++        display = current;
++        const shape = autoTarget(), hevc = wantHevc();
++        const fitWindow = autoFitOn() && !(wantFullscreen && !document.fullscreenElement);
++        const next = fitWindow && ((current.areas?.length ?? 0) > 0 || aspectChanged(current, shape))
++          ? { ...current, ...shape, areas: [], area: 0, hevc } : { ...current, hevc };
++        // Do not undo the same-shape resolution we just retained on the first frame/resize callback.
++        if (fitWindow) lastAutoTarget = `${shape.width}x${shape.height}${hevc ? '-h265' : ''}`;
++        if (!sameStream(current, next)) {
++          expectInitialVideo(next);
++          if (!(await saveDisplay(next, { reason: 'initial' }))) clearInitialVideoWait();
++        }
++      }
++    }
++  } finally { connection.connect(); }
++}
++render();fit();void startViewer();
+ 
+ nightSelect.onchange = () => { localStorage.setItem('f50-night-mode', nightSelect.value); syncNight(); render(); };
+ darkQuery.addEventListener('change', () => { syncNight(); render(); });
+diff --git a/web/package.json b/web/package.json
+--- a/web/package.json
++++ b/web/package.json
+@@ -5,7 +5,7 @@
+   "type": "module",
+   "scripts": {
+     "dev": "vite",
+-    "test": "node check.mjs && node check-audio.mjs && node check-audio-mix.mjs && node check-car.mjs && node check-browser.mjs && node check-flac.mjs",
++    "test": "node check.mjs && node check-audio.mjs && node check-audio-mix.mjs && node check-car.mjs && node check-browser.mjs && node check-flac.mjs && node check-codec-startup.mjs",
+     "build": "tsc && vite build",
+     "preview": "vite preview"
+   },
+diff --git a/web/check-codec-startup.mjs b/web/check-codec-startup.mjs
+new file mode 100644
+--- /dev/null
++++ b/web/check-codec-startup.mjs
+@@ -0,0 +1,85 @@
++// Test the generated viewer's real startup ordering without a box, phone or browser preferences.
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import ts from 'typescript';
++const root = new URL('./', import.meta.url);
++const source = readFileSync(new URL('src/main.ts', root), 'utf8');
++const parsed = ts.createSourceFile('main.ts', source, ts.ScriptTarget.Latest, true);
++const functions = ['startViewer', 'probeHevc', 'wantHevc', 'autoTarget', 'clearInitialVideoWait', 'expectInitialVideo', 'acceptInitialVideoConfig'].map(name => {
++  const node = parsed.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name);
++  assert.ok(node, `missing ${name}`); return node.getText(parsed);
++}).join('\n');
++const transpile = text => ts.transpileModule(text, { compilerOptions: {
++  target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext,
++} }).outputText;
++const mathSource = transpile(readFileSync(new URL('src/display-fit.ts', root), 'utf8'));
++const math = await import(`data:text/javascript;base64,${Buffer.from(mathSource).toString('base64')}`);
++const fixture = `
++const {windowResolution,suggestedResolution,aspectChanged,sameStream}=math;
++let token='fixture',hevcDecodes=true,hevcSupport=Promise.resolve(),pageFastDecoder=false,codec='auto';
++let current,display,lastAutoTarget='',auto=true,wantFullscreen=false,events=[];
++let initialVideoTarget=null,initialVideoAccepted=true,initialVideoTimer=0;
++const VideoCodec={H264:1,H265:2},send=m=>events.push({kind:m.type});
++const fastDecoder=()=>pageFastDecoder;
++const flags=new Map(), readFlag=k=>flags.get(k)||'',el=()=>({value:codec});
++const screen={clientWidth:1300,clientHeight:850},document={hidden:false,fullscreenElement:null};
++const timers=new Map();let timerId=0;
++const window={devicePixelRatio:2,setTimeout:fn=>{timers.set(++timerId,fn);return timerId},clearTimeout:id=>timers.delete(id)};
++const autoFitOn=()=>auto,performanceOn=()=>false;
++const fetchDisplay=async()=>current;
++const saveDisplay=async(target,how)=>{events.push({kind:'save',target,reason:how.reason});current=display=target;return true};
++const connection={connect:()=>events.push({kind:'connect'})};
++let VideoDecoder={isConfigSupported:async()=>({supported:true})};
++${functions}
++function reset() {
++ clearInitialVideoWait();
++ current={width:1300,height:850,fps:60,uiScale:100,hevc:false,areas:[],area:0};
++ events=[];flags.clear();hevcDecodes=true;pageFastDecoder=false;codec='auto';auto=true;document.hidden=false;lastAutoTarget='';
++}
++reset(); await startViewer();
++assert.deepEqual(events.map(e=>e.kind),['save','connect'],'select supported HEVC before opening the viewer socket');
++assert.equal(events[0].target.hevc,true);assert.equal(events[0].reason,'initial');
++assert.equal(events[0].target.width,1300,'codec choice must not require a resolution change');
++assert.equal(acceptInitialVideoConfig({codec:1,width:1300,height:850}),false,'cached H264 config must not reach the decoder');
++assert.equal(initialVideoAccepted,false,'frames following rejected config must be ignored');
++assert.equal(acceptInitialVideoConfig({codec:2,width:1300,height:638}),false,'cached wrong-size HEVC must also be ignored');
++assert.equal(acceptInitialVideoConfig({codec:2,width:1300,height:850}),true);
++assert.equal(initialVideoAccepted,true);assert.equal(initialVideoTarget,null);
++assert.equal(timers.size,0,'matching config clears the startup timeout');
++// Reload on the resulting HEVC stream must not interrupt it again.
++events=[];await startViewer();assert.deepEqual(events,[{kind:'connect'}]);
++for(const reason of ['unsupported','failed','explicit-h264']) {
++ reset();if(reason==='unsupported')hevcDecodes=false;
++ if(reason==='failed')flags.set('f50-hevc-failed','1');
++ if(reason==='explicit-h264')codec='h264';
++ await startViewer();assert.deepEqual(events,[{kind:'connect'}],reason);
++}
++reset();current={...current,width:2560,height:1674,hevc:true};await startViewer();
++assert.deepEqual(events,[{kind:'connect'}],'a fresh browser must retain an already compatible high-resolution HEVC stream');
++assert.equal(current.width,2560);
++reset();current={...current,width:1300,height:638};await startViewer();
++assert.equal(events.filter(e=>e.kind==='save').length,1,'shape and codec must be one request');
++assert.equal(events[0].target.height,850);assert.equal(events[0].target.hevc,true);
++reset();auto=false;current={...current,width:1920,height:1080};await startViewer();
++assert.equal(events[0].target.width,1920,'custom dimensions remain authoritative');
++assert.equal(events[0].target.height,1080);assert.equal(events[0].target.hevc,true);
++reset();current=null;await startViewer();assert.deepEqual(events,[{kind:'connect'}],'unavailable display API must not prevent connection');
++reset();document.hidden=true;await startViewer();assert.deepEqual(events,[{kind:'connect'}],'hidden pages must not negotiate');
++reset();let finishProbe;hevcSupport=new Promise(resolve=>{finishProbe=resolve});
++const starting=startViewer();await Promise.resolve();assert.equal(events.length,0,'wait for codec capability before choosing a stream');
++finishProbe();await starting;assert.deepEqual(events.map(e=>e.kind),['save','connect']);
++clearInitialVideoWait();
++expectInitialVideo(current);for(const timer of [...timers.values()])timer();
++assert.equal(initialVideoAccepted,true);assert.equal(initialVideoTarget,null);assert.equal(events.at(-1).kind,'keyframe');
++assert.equal(await probeHevc(),true);assert.equal(timers.size,0);
++VideoDecoder={isConfigSupported:async()=>{throw new Error('probe rejected')}};
++assert.equal(await probeHevc(),false);assert.equal(timers.size,0);
++let finishLate;VideoDecoder={isConfigSupported:()=>new Promise(resolve=>{finishLate=resolve})};
++const timed=probeHevc();for(const timer of [...timers.values()])timer();
++assert.equal(await timed,false,'a hung capability probe has a bounded wait');
++finishLate({supported:true});await Promise.resolve();assert.equal(timers.size,0);
++VideoDecoder=undefined;assert.equal(await probeHevc(),false);
++console.log('CODEC_STARTUP_OK: fresh HEVC, explicit choice, failure fallback, retained resolution, single pre-connect request, timeout and reload');
++`;
++const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
++await new AsyncFunction('math','assert',transpile(fixture))(math,assert);

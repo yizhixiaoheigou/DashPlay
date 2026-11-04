@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build Android from the same pinned upstream and ordered patches as N1/OpenWrt.
+# Build Android from its frozen receiver baseline; the Linux root patch series has its own release cadence.
 # Never reads or changes the modified research/playport working tree.
 set -eu
 here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -22,11 +22,24 @@ git -C "$upstream" archive "$pinned" > "$stage/upstream.tar"
 mkdir "$stage/source"
 tar -xf "$stage/upstream.tar" -C "$stage/source"
 export GIT_CEILING_DIRECTORIES="$stage"
-sh "$repo/scripts/apply-playport-patches.sh" "$stage/source"
+sh "$here/receiver-baseline/scripts/apply-playport-patches.sh" "$stage/source"
 (cd "$stage/source" && git apply --unidiff-zero --whitespace=nowarn "$here/patches/playport-android.patch")
 (cd "$stage/source" && git apply --unidiff-zero --whitespace=nowarn "$here/patches/playport-management.patch")
 (cd "$stage/source" && git apply --unidiff-zero --whitespace=nowarn "$here/patches/playport-usb.patch")
 (cd "$stage/source" && git apply --unidiff-zero --whitespace=nowarn "$here/patches/playport-phones.patch")
+(cd "$stage/source" && git apply --unidiff-zero --whitespace=nowarn "$here/patches/playport-display-negotiation.patch")
+# The picture fallback for pages without WebCodecs: its server side comes after the Android platform patches.
+(cd "$stage/source" && git apply --unidiff-zero --whitespace=nowarn "$here/patches/playport-android-stills.patch")
+(cd "$stage/source" && git apply --unidiff-zero --whitespace=nowarn "$here/patches/playport-rootfree-fixes.patch")
+(cd "$stage/source" && git apply --unidiff-zero --whitespace=nowarn "$here/patches/playport-video-config-boundary.patch")
+(cd "$stage/source" && git apply --unidiff-zero --whitespace=nowarn "$here/patches/playport-http-codec-choice.patch")
+(cd "$stage/source" && git apply --unidiff-zero --whitespace=nowarn "$here/patches/playport-rtc-fault-probe.patch")
+(cd "$stage/source" && git apply --unidiff-zero --whitespace=nowarn "$here/patches/playport-http-auto-rtc.patch")
+(cd "$stage/source" && git apply --unidiff-zero --whitespace=nowarn "$here/patches/playport-wireless-progress.patch")
+(cd "$stage/source" && git apply --unidiff-zero --whitespace=nowarn "$here/patches/playport-audio-order.patch")
+(cd "$stage/source" && git apply --unidiff-zero --whitespace=nowarn "$here/patches/playport-wireless-audio-startup.patch")
+(cd "$stage/source" && git apply --unidiff-zero --whitespace=nowarn "$here/patches/playport-connection-state.patch")
+(cd "$stage/source" && git apply --unidiff-zero --whitespace=nowarn "$here/patches/playport-lockdown-cleanup.patch")
 printf '%s\n' "$pinned" > "$stage/source/android-upstream.txt"
 # Only this script's generated directory is replaced.
 if [ -e "$here/build/receiver" ]; then

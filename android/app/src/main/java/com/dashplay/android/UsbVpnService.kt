@@ -28,6 +28,13 @@ class UsbVpnService : VpnService() {
     private var nextId = 0L
     private var attaching = false
     private var destroyed = false
+    private var addressTun: ParcelFileDescriptor? = null
+    private var cableHasAddress = false
+    /** Who owns which resource: closing one must never close the other (2026-11-03). */
+    private val ownership = VpnResourceOwnership()
+    /** The Root-free address tunnel, when the compatibility route asked for one. */
+    internal var addressLease: AddressLease? = null
+        private set
 
     inner class Lease internal constructor(val id: Long, val address: Inet6Address, private val bridge: PacketBridge,
         internal val internetPlan: UsbInternetPlan?, internal val failed: () -> Unit) : Closeable {
@@ -76,7 +83,7 @@ class UsbVpnService : VpnService() {
         failed: () -> Unit): Lease {
         check(prepare(this) == null) { "请先允许数据线连接的 VPN 通道" }
         val id = synchronized(lock) {
-            check(!destroyed && !attaching && current == null) { "USB VPN 通道正在使用" }
+            check(!destroyed && !attaching && current == null && addressLease?.exclusive != true) { "USB VPN 通道正在使用" }
             attaching = true
             ++nextId
         }
@@ -100,7 +107,16 @@ class UsbVpnService : VpnService() {
                 for (route in plan.routes) builder.addRoute(route.text, route.prefix)
                 if (Build.VERSION.SDK_INT >= 29) builder.setMetered(true)
             }
-            tun = builder.establish() ?: throw IOException("系统未建立 USB VPN 通道")
+            synchronized(lock) {
+                check(!destroyed && nextId == id) { "USB VPN 已取消" }
+                // Reserve the compatibility /32 on the SAME active USB TUN. Enabling HTTP later needs no VPN swap.
+                cableHasAddress = !Settings(this).teslaRootAccess
+                if (cableHasAddress) builder.addAddress(TeslaRootPlan.ADDRESS, 32)
+                tun = builder.establish() ?: throw IOException("系统未建立 USB VPN 通道")
+                compatAddressAttached = cableHasAddress
+                addressTun?.close(); addressTun = null
+                addressLease?.changed()
+            }
             val deadline = System.nanoTime() + 10_000_000_000L
             var local: Inet6Address? = null
             val target = InetAddress.getByName(LINK_LOCAL).address
@@ -111,7 +127,7 @@ class UsbVpnService : VpnService() {
                 if (local == null) Thread.sleep(100)
             }
             val address = local ?: throw IOException("USB VPN 没有可监听的 IPv6 地址")
-            bridge = PacketBridge(ncm, tun, hostMac, plan, internet, { ready, message ->
+            bridge = PacketBridge(ncm, tun!!, hostMac, plan, internet, { ready, message ->
                 synchronized(lock) {
                     if (current?.id == id) { internetReady = ready; internetMessage = message }
                 }
@@ -122,22 +138,96 @@ class UsbVpnService : VpnService() {
             val lease = Lease(id, address, bridge, plan, failed)
             synchronized(lock) {
                 check(!destroyed && nextId == id && current == null) { "USB VPN 已取消" }
+                ownership.acquire(VpnResourceOwnership.Kind.CABLE, "lease-$id")
                 current = lease
                 internetLease = if (plan == null) null else lease
                 internetDns = plan?.let { InetAddress.getByName(UsbTetherProtocol.address(it.dns)) }
-                internetReady = false; internetMessage = if (plan == null) "USB 借网未启用" else "正在建立 USB 借网通道"
+                internetReady = false; internetMessage = if (plan == null) "尚未启用通过数据线使用 iPhone 网络" else "正在连接 iPhone 网络"
                 bridge.start()
             }
             return lease
-        } catch (error: Throwable) { bridge?.close() ?: tun?.close(); throw error }
+        } catch (error: Throwable) {
+            bridge?.close() ?: tun?.close()
+            synchronized(lock) {
+                if (nextId == id) {
+                    cableHasAddress = false; compatAddressAttached = false
+                    if (addressLease?.isOpen == true && !destroyed) restoreAddressLocked()
+                }
+            }
+            throw error
+        }
         finally { synchronized(lock) { if (nextId == id) attaching = false } }
     }
 
-    private fun detach(lease: Lease) {
-        val release = synchronized(lock) {
-            if (current !== lease) false else { current = null; if (internetLease === lease) internetLease = null; internetDns = null; internetReady = false; internetMessage = "USB 借网通道已关闭"; true }
+    /** A logical user of the shared address, never an independently active VPN. */
+    internal class AddressLease internal constructor(val address: String, val exclusive: Boolean, private val onClosed: () -> Unit) : Closeable {
+        private val open = AtomicBoolean(true)
+        private val listeners = CopyOnWriteArrayList<() -> Unit>()
+        private val changes = CopyOnWriteArrayList<() -> Unit>()
+        fun onChanged(action: () -> Unit) { changes += action }
+        fun changed() { changes.forEach { runCatching(it) } }
+        fun onClosed(action: () -> Unit) {
+            listeners += action
+            if (!isOpen && listeners.remove(action)) action()
         }
-        if (release) lease.release()
+        fun release() {
+            if (!open.compareAndSet(true, false)) return
+            onClosed()
+            listeners.forEach { runCatching(it) }; listeners.clear(); changes.clear()
+        }
+        override fun close() = release()
+        val isOpen get() = open.get()
+    }
+
+    private fun establishAddressLocked(): ParcelFileDescriptor? = Builder()
+        .setSession("DashPlay 免 Root 地址")
+        .addAddress(TeslaRootPlan.ADDRESS, 32)
+        // No default route and no IPv6 suppression. Local address traffic is delivered by the kernel.
+        .allowFamily(OsConstants.AF_INET).allowFamily(OsConstants.AF_INET6)
+        .addAllowedApplication(packageName).setMtu(1500).setBlocking(false).establish()
+
+    private fun restoreAddressLocked() {
+        addressTun = runCatching { establishAddressLocked() }.getOrNull()
+        compatAddressAttached = addressTun != null
+        if (addressTun == null) addressLease?.release() else addressLease?.changed()
+    }
+
+    internal fun attachAddress(address: TeslaVpnAddress, exclusive: Boolean = false): AddressLease? = synchronized(lock) {
+        if (prepare(this) != null || destroyed || attaching || Settings(this).teslaRootAccess) return null
+        if (address.address != TeslaRootPlan.ADDRESS || addressLease != null) return null
+        if (exclusive && current != null) return null // diagnostic probe must not touch a live USB session
+        if (current != null && !cableHasAddress) return null
+        if (current == null) {
+            addressTun = runCatching { establishAddressLocked() }.getOrNull() ?: return null
+            compatAddressAttached = true
+        }
+        val lease = AddressLease(address.address, exclusive) {
+            synchronized(lock) {
+                addressLease = null
+                addressTun?.close(); addressTun = null
+                compatAddressAttached = cableHasAddress
+            }
+        }
+        addressLease = lease
+        lease
+    }
+
+    internal fun detachAddress() { synchronized(lock) { addressLease?.release() } }
+
+    private fun detach(lease: Lease) {        val release = synchronized(lock) {
+            if (current !== lease) false else { attaching = true; current = null; if (internetLease === lease) internetLease = null; internetDns = null; internetReady = false; internetMessage = "已断开通过 USB 建立的 iPhone 网络连接"; true }
+        }
+        if (release) {
+            ownership.release(VpnResourceOwnership.Kind.CABLE, "lease-${lease.id}")
+            lease.release()
+            synchronized(lock) {
+                if (nextId == lease.id) {
+                    cableHasAddress = false; compatAddressAttached = false
+                    if (!destroyed && current == null && addressLease?.isOpen == true) restoreAddressLocked()
+                    attaching = false
+                }
+            }
+        }
     }
     private fun cancel(destroy: Boolean) {
         val lease = synchronized(lock) {
@@ -145,8 +235,16 @@ class UsbVpnService : VpnService() {
             nextId++; attaching = false
             if (internetLease === current) internetLease = null
             internetDns = null
-            internetReady = false; internetMessage = "USB 借网通道已关闭"
+            internetReady = false; internetMessage = "已断开通过 USB 建立的 iPhone 网络连接"
             current.also { current = null }
+        }
+        // Revocation is the system taking the whole VPN away: everything this app owns goes with it.
+        synchronized(lock) {
+            addressLease?.let { address -> runCatching { address.release() } }
+            addressLease = null
+            ownership.releaseAll()
+            addressTun?.close(); addressTun = null
+            cableHasAddress = false; compatAddressAttached = false
         }
         lease?.let { it.release(); Thread(it.failed, "usb-vpn-revoked").start() }
     }
@@ -154,12 +252,13 @@ class UsbVpnService : VpnService() {
     override fun onDestroy() { cancel(true); super.onDestroy() }
 
     companion object {
+        @Volatile internal var compatAddressAttached = false; private set
         const val LOCAL_BIND = "com.dashplay.android.USB_VPN_BIND"
         const val LINK_LOCAL = "fe80::2"
         @Volatile var internetReady = false; private set
         @Volatile internal var internetLease: Lease? = null; private set
         @Volatile internal var internetDns: InetAddress? = null; private set
-        @Volatile var internetMessage = "USB 借网未启用"; private set
+        @Volatile var internetMessage = "尚未启用通过数据线使用 iPhone 网络"; private set
     }
 }
 
@@ -236,7 +335,7 @@ internal class PacketBridge(private val ncm: UsbCarPlayWire, private val tun: Pa
                         if (open.get()) {
                             nat!!.configure(lease)
                             if (lease != null) acquiredLease.set(true)
-                            internetState(lease != null, if (lease != null) "USB 借网地址已就绪；外网取决于 iPhone 连接" else message)
+                            internetState(lease != null, if (lease != null) "USB 网络地址已就绪；能否访问互联网取决于 iPhone 的网络连接" else message)
                         }
                     }, { bytes -> nat!!.incoming(bytes, System.nanoTime() / 1_000_000)?.let { deliver(it) } })
                     synchronized(internetLock) {

@@ -1,0 +1,385 @@
+diff --git a/web/index.html b/web/index.html
+index 8256fe2..e79c5c2 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -1,27 +1,46 @@
+ <!doctype html>
+-<html lang="zh-CN"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/><meta name="color-scheme" content="dark"/><title>F50 CarPlay</title><link rel="stylesheet" href="/src/style.css"/><noscript><style>#browser-check{display:block!important}</style></noscript></head>
++<html lang="zh-CN"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/><meta name="color-scheme" content="dark"/><title>DashPlay</title><link rel="stylesheet" href="/src/style.css"/><noscript><style>#browser-check{display:block!important}</style></noscript></head>
+ <body><section id="browser-check" style="display:none;position:fixed;top:0;right:0;bottom:0;left:0;z-index:99999;background:#141920;color:#f4f6f8;overflow:auto;padding:24px;font:16px/1.6 sans-serif;box-sizing:border-box">
+ <h1 id="browser-check-title" style="font-size:24px">浏览器兼容性检测</h1><p id="browser-check-note">正在检测。如果此提示一直不变，请确认 JavaScript 已启用，或刷新页面重新加载检测脚本。</p><noscript>此浏览器禁用了 JavaScript，无法使用 CarPlay。</noscript><ul id="browser-check-list" style="padding-left:22px"></ul><button id="browser-check-continue" disabled style="padding:12px 20px;font-size:18px">正在检测…</button><p id="browser-check-agent" style="word-wrap:break-word;font-size:12px"></p></section><script src="./browser-check.js"></script><main id="app">
+   <div id="screen-container"><div id="surface"><canvas id="screen" width="1280" height="720" tabindex="0" aria-label="CarPlay" inert></canvas></div></div>
+-  <div id="overlay" role="status"><h1>CarPlay</h1><p id="connection-text"></p><p id="connection-hint"></p></div>
+-  <button id="btn-settings" aria-haspopup="dialog" aria-controls="settings"><span aria-hidden="true">⚙</span><span data-i18n="settings">盒子设置</span></button>
+-  <button id="btn-fullscreen" aria-label="全屏" title="全屏"><svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path class="expand" d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><path class="collapse" d="M3 8h5V3m8 0v5h5M8 21v-5H3m13 5v-5h5"/></svg><span id="fullscreen-label">全屏</span></button>
+-  <div id="toast" role="status" hidden></div>
+-  <button id="audio-unlock" data-i18n="sound" hidden>轻点启用声音</button>
+-  <div id="error-banner" role="alert" hidden><span data-i18n="error"></span><details><summary data-i18n="technical"></summary><p id="error-text"></p></details><button id="dismiss-error" data-i18n="close"></button></div>
++  <div id="overlay" role="status"><div class="welcome">
++    <h1>DashPlay</h1>
++    <p class="status"><span class="spinner" aria-hidden="true"></span><span id="connection-text"></span></p>
++    <p id="connection-hint"></p>
++    <div class="group actions">
++      <a id="box-link" class="cell" href="/" hidden><span class="tile green"><svg class="ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2.8" width="10" height="18.4" rx="2.6"/><path d="M10.8 5.2h2.4"/></svg></span><span class="main"><b data-i18n="boxLink"></b><span data-i18n="boxLinkHint"></span></span><span class="chev"></span></a>
++      <button id="welcome-fullscreen" class="cell" type="button"><span class="tile blue"><svg class="ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path class="expand" d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><path class="collapse" d="M3 8h5V3m8 0v5h5M8 21v-5H3m13 5v-5h5"/></svg></span><span class="main"><b id="welcome-fullscreen-text">全屏</b></span></button>
++      <button id="btn-settings" class="cell" type="button" aria-haspopup="dialog" aria-controls="settings"><span class="tile gray"><svg class="ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg></span><span class="main"><b data-i18n="playerSettings"></b></span><span class="chev"></span></button>
++    </div>
++  </div></div>
++  <button id="btn-fullscreen" class="glass" type="button" aria-label="全屏" title="全屏"><svg class="ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path class="expand" d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><path class="collapse" d="M3 8h5V3m8 0v5h5M8 21v-5H3m13 5v-5h5"/></svg><span id="fullscreen-label" class="sr">全屏</span></button>
++  <div id="toast" class="capsule" role="status" hidden></div>
++  <button id="audio-unlock" class="capsule" data-i18n="sound" hidden>轻点启用声音</button>
++  <div id="error-banner" role="alert" hidden><b data-i18n="error"></b><details><summary data-i18n="technical"></summary><p id="error-text"></p></details><button id="dismiss-error" class="text" data-i18n="close"></button></div>
+ </main>
+-<dialog id="settings" aria-labelledby="settings-title"><header><h2 id="settings-title" data-i18n="settings"></h2><button id="btn-close" data-i18n="close"></button></header><div class="settings-body">
+-  <button id="fullscreen" class="primary fullscreen-action" type="button"><svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path class="expand" d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><path class="collapse" d="M3 8h5V3m8 0v5h5M8 21v-5H3m13 5v-5h5"/></svg><span id="fullscreen-text">全屏</span></button>
+-  <label class="row"><span data-i18n="language"></span><select id="language"><option value="zh">简体中文</option><option value="en">English</option></select></label>
+-  <label class="volume"><span data-i18n="volume"></span><output id="volume-value">100%</output><input id="volume" type="range" min="0" max="100" value="100"/></label>
+-  <p id="audio-status" class="hint"></p>
+-  <section><div class="section-title"><h3 data-i18n="display"></h3></div>
+-  <label class="row"><span data-i18n="nightMode"></span><select id="night-mode"><option value="schedule" data-i18n="nightSchedule"></option><option value="system" data-i18n="nightSystem"></option><option value="day" data-i18n="nightDay"></option><option value="night" data-i18n="nightNight"></option></select></label><p id="night-status" class="hint" role="status"></p>
+-  <label class="check"><input id="auto-fit" type="checkbox"/><span data-i18n="auto"></span></label><p class="hint" data-i18n="autoHint"></p>
+-  <form id="display-form"><fieldset id="display-fields"><div class="pair"><label><span data-i18n="width"></span><input id="width" type="number" min="480" max="3840" step="2" required/></label><label><span data-i18n="height"></span><input id="height" type="number" min="480" max="3840" step="2" required/></label></div><div class="pair"><label><span data-i18n="ui"></span><select id="ui-scale"><option value="85" data-i18n="small"></option><option value="100" data-i18n="standard"></option><option value="115" data-i18n="large"></option></select></label><label><span data-i18n="fps"></span><select id="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label></div></fieldset><button id="apply" class="primary" data-i18n="apply"></button><p id="display-status" class="hint" role="status"></p></form></section>
+-  <details><summary data-i18n="diagnostics"></summary><button id="browser-check-show" type="button">浏览器兼容性检测 / Browser check</button><p id="capabilities"></p><p id="media-support"></p><p id="stats"></p><p data-i18n="micHint"></p><p id="mic-status"></p><p class="hint" data-i18n="privacy"></p></details>
+-  <details><summary data-i18n="advanced"></summary><div id="fallback-controls"><button data-command="home" data-i18n="home"></button><button data-command="back" data-i18n="back"></button><button data-command="previous" data-i18n="previous"></button><button data-command="play" data-i18n="play"></button><button data-command="next" data-i18n="next"></button><button data-command="refresh" data-i18n="refresh"></button></div></details>
+-  <p class="hint" data-i18n="savedHere"></p>
++<dialog id="settings" aria-labelledby="settings-title"><header><h2 id="settings-title" data-i18n="settings" tabindex="-1" autofocus></h2><button id="btn-close" class="text" data-i18n="done"></button></header><div class="settings-body">
++  <div class="group">
++    <button id="fullscreen" class="cell" type="button"><span class="tile blue"><svg class="ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path class="expand" d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><path class="collapse" d="M3 8h5V3m8 0v5h5M8 21v-5H3m13 5v-5h5"/></svg></span><span class="main"><b id="fullscreen-text">全屏</b></span></button>
++    <a id="box-link-panel" class="cell" href="/" hidden><span class="tile green"><svg class="ico" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2.8" width="10" height="18.4" rx="2.6"/><path d="M10.8 5.2h2.4"/></svg></span><span class="main"><b data-i18n="boxLink"></b><span data-i18n="boxLinkHintLive"></span></span><span class="chev"></span></a>
++  </div>
++  <p class="group-title" data-i18n="volume"></p>
++  <div class="group"><div class="cell volume"><svg class="ico dim" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><path d="M4 9h3l5-4v14l-5-4H4z"/></svg><input id="volume" type="range" min="0" max="100" value="100"/><svg class="ico dim" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 9h3l5-4v14l-5-4H4z" fill="currentColor" stroke="none"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></svg><output id="volume-value">100%</output></div></div>
++  <p id="audio-status" class="foot"></p>
++  <p class="group-title" data-i18n="display"></p>
++  <div class="group">
++    <label class="cell"><span class="main"><b data-i18n="nightMode"></b><span id="night-status"></span></span><select id="night-mode"><option value="schedule" data-i18n="nightSchedule"></option><option value="system" data-i18n="nightSystem"></option><option value="day" data-i18n="nightDay"></option><option value="night" data-i18n="nightNight"></option></select></label>
++    <label class="cell"><span class="main"><b data-i18n="auto"></b></span><input id="auto-fit" class="switch" type="checkbox"/></label>
++    <details><summary class="cell"><span class="main"><b data-i18n="custom"></b></span><span id="display-status" class="value" role="status"></span><span class="chev"></span></summary>
++      <form id="display-form" class="inner"><fieldset id="display-fields"><div class="pair"><label><span data-i18n="width"></span><input id="width" type="number" min="480" max="3840" step="2" required/></label><label><span data-i18n="height"></span><input id="height" type="number" min="480" max="3840" step="2" required/></label></div><div class="pair"><label><span data-i18n="ui"></span><select id="ui-scale"><option value="85" data-i18n="small"></option><option value="100" data-i18n="standard"></option><option value="115" data-i18n="large"></option></select></label><label><span data-i18n="fps"></span><select id="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label></div></fieldset><button id="apply" class="btn" data-i18n="apply"></button></form></details>
++  </div>
++  <p class="foot" data-i18n="autoHint"></p>
++  <div class="group"><label class="cell"><span class="main"><b data-i18n="language"></b></span><select id="language"><option value="zh">简体中文</option><option value="en">English</option></select></label></div>
++  <div class="gap"></div>
++  <div class="group">
++    <details><summary class="cell"><span class="main"><b data-i18n="diagnostics"></b></span><span class="chev"></span></summary><div class="inner text"><p id="capabilities"></p><p id="media-support"></p><p id="stats"></p><p data-i18n="micHint"></p><p id="mic-status"></p><p data-i18n="privacy"></p><button id="browser-check-show" class="btn plain" type="button">浏览器兼容性检测 / Browser check</button></div></details>
++    <details><summary class="cell"><span class="main"><b data-i18n="advanced"></b></span><span class="chev"></span></summary><div id="fallback-controls" class="inner"><button data-command="home" data-i18n="home"></button><button data-command="back" data-i18n="back"></button><button data-command="previous" data-i18n="previous"></button><button data-command="play" data-i18n="play"></button><button data-command="next" data-i18n="next"></button><button data-command="refresh" data-i18n="refresh"></button></div></details>
++  </div>
++  <p class="foot" data-i18n="savedHere"></p>
+ </div></dialog>
+ <script src="./receiver-access.js"></script>
+ <script type="module" src="/src/boot.ts"></script></body></html>
+diff --git a/web/src/i18n.ts b/web/src/i18n.ts
+index 81763f2..317251b 100644
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -1,12 +1,15 @@
+ const messages = {
+-  settings: ['盒子设置', 'Box settings'], close: ['关闭', 'Close'], language: ['语言', 'Language'],
+-  waiting: ['正在等待 iPhone', 'Waiting for iPhone'], waitingHint: ['手机开启蓝牙并连接盒子 Wi-Fi，已配对手机会自动重连。', 'Enable Bluetooth and join the receiver Wi-Fi. Paired phones reconnect automatically.'],
++  settings: ['盒子设置', 'Box settings'], close: ['关闭', 'Close'], done: ['完成', 'Done'],
++  boxLink: ['添加 iPhone · 网络设置', 'Add iPhone · Network'], boxLinkHint: ['配对新手机、选择热点', 'Pair a phone, choose the hotspot'],
++  boxLinkHintLive: ['离开画面，配对手机、更换热点', 'Leaves the picture to pair phones or change the hotspot'],
++  playerSettings: ['画面与声音', 'Display and sound'], custom: ['自定义分辨率', 'Custom resolution'], language: ['语言', 'Language'],
++  waiting: ['正在等待 iPhone', 'Waiting for iPhone'], waitingHint: ['已添加的 iPhone 打开蓝牙和 Wi-Fi 后会自动连接。第一次使用，请先添加 iPhone。', 'An added iPhone connects by itself with Bluetooth and Wi-Fi on. First time here? Add your iPhone.'],
+   connecting: ['正在连接盒子…', 'Connecting to receiver…'], reconnecting: ['连接中断，正在自动重连…', 'Disconnected. Reconnecting automatically…'],
+   starting: ['已连接，正在等待画面…', 'Connected. Waiting for video…'], live: ['已连接', 'Connected'],
+   access: ['需要首次登录链接', 'First-time access link required'], accessHint: ['请使用私有访问资料中的完整链接打开一次，此浏览器会记住登录。', 'Open the complete link from your private access file once. This browser will remember it.'],
+   sound: ['轻点启用声音', 'Tap to enable sound'], volume: ['音量', 'Volume'],
+   display: ['画面', 'Display'], fullscreen: ['全屏', 'Fullscreen'], exitFullscreen: ['退出全屏', 'Exit fullscreen'], fullscreenHint: ['已全屏。退出全屏：点 CarPlay 主屏幕上的「盒子设置」图标，再点「退出全屏」。', 'Fullscreen on. To exit, tap the Box settings icon on the CarPlay home screen, then Exit fullscreen.'], fullscreenFail: ['此浏览器不允许全屏，画面仍会自动适配窗口。', 'Fullscreen unavailable. The picture still fits this window.'],
+-  auto: ['自动匹配屏幕比例', 'Match screen aspect ratio automatically'], autoHint: ['仅此显示端启用。比例变化时重新协商画面，最多 1920 像素长边；可能短暂重连。', 'Enable on one display only. Aspect changes renegotiate video, up to 1920 pixels on the long edge, and may briefly reconnect.'],
++  auto: ['自动匹配屏幕', 'Match the screen'], autoHint: ['自动匹配让画面铺满当前窗口，进入或退出全屏时 CarPlay 会重连一次。只在一个显示端开启。', 'Matching fills the current window; entering or leaving fullscreen reconnects CarPlay once. Turn it on for one display only.'],
+   width: ['宽度', 'Width'], height: ['高度', 'Height'], apply: ['应用并重连', 'Apply and reconnect'],
+   nightMode: ['夜间模式', 'Night mode'], nightSchedule: ['自动（18:30–06:30 为夜间）', 'Auto (night 18:30–06:30)'], nightSystem: ['跟随车机浏览器深色模式', 'Follow car browser dark mode'], nightDay: ['始终白天', 'Always day'], nightNight: ['始终夜间', 'Always night'],
+   nightNow: ['当前请求：', 'Requested now: '], nightOn: ['夜间', 'night'], nightOff: ['白天', 'day'], browserDark: ['车机浏览器报告深色模式', 'Car browser reports dark mode'], browserLight: ['车机浏览器报告浅色模式', 'Car browser reports light mode'],
+diff --git a/web/src/main.ts b/web/src/main.ts
+index 774646e..540f7ce 100644
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -33,11 +33,18 @@ let sentNight: boolean | null = null;
+ const volume = el<HTMLInputElement>('volume');
+ volume.value = String(Math.min(100, Math.max(0, Number(localStorage.getItem('playport-master') ?? 100) || 0)));
+ 
++/** Box settings page (pairing, hotspot), when the device startup announced one: same host, plain HTTP. */
++const boxPort = Number((window as unknown as { playportBoxSettingsPort?: number }).playportBoxSettingsPort) || 0;
++if (boxPort) for (const id of ['box-link', 'box-link-panel']) {
++  const link = el<HTMLAnchorElement>(id);
++  link.href = `http://${location.hostname}${boxPort === 80 ? '' : `:${boxPort}`}/`;
++  link.hidden = false;
++}
+ function render() {
+   setLanguage(language);
+   updateFullscreen();
+   el<HTMLSelectElement>('language').value = language;
+-  el('btn-settings').setAttribute('aria-label', t('settings'));
++  el('app').dataset.state = state;
+   volume.setAttribute('aria-label', t('volume'));
+   el('connection-text').textContent = t(state);
+   el('connection-hint').textContent = t(hint);
+@@ -49,7 +56,8 @@ function render() {
+   el<HTMLInputElement>('height').disabled = autoFit.checked;
+   document.querySelectorAll<HTMLButtonElement>('[data-command]').forEach(b => { b.disabled = !active; });
+   const night = isNight(parseNightMode(nightSelect.value), new Date(), darkQuery.matches);
+-  el('night-status').textContent = `${t('nightNow')}${t(night ? 'nightOn' : 'nightOff')}；${t(darkQuery.matches ? 'browserDark' : 'browserLight')}`;
++  el('night-status').textContent = `${t('nightNow')}${t(night ? 'nightOn' : 'nightOff')}`;
++  el('night-status').title = t(darkQuery.matches ? 'browserDark' : 'browserLight');
+ }
+ function fit() {
+   const size = fittedSize(canvas.width, canvas.height, screen.clientWidth, screen.clientHeight);
+@@ -102,7 +110,7 @@ function server(message: ServerMessage) {
+   if(message.type === 'artwork' && message.artwork) { media.setArtwork(message.revision ?? 0,message.artwork); return; }
+   if (message.type === 'now-playing' && message.nowPlaying) { media.setMetadata(message.nowPlaying); return; }
+   if (message.type === 'host-ui' && active) {
+-    panel.showModal(); void loadDisplay(); return;
++    openPanel(); return;
+   }
+   if (message.type === 'mic') {
+     if (message.micActive) void microphone.start({ sampleRate:message.micRate ?? 16000, channels:message.micChannels ?? 1, codec:message.micCodec ?? 'lpcm', samplesPerPacket:message.micSamplesPerPacket ?? 320, bitrate:message.micBitrate ?? null });
+@@ -123,17 +131,30 @@ window.addEventListener('keydown', () => { void unlock(); });
+ el('audio-unlock').onclick = () => { void unlock(); };
+ function setVolume() { audio.setVolume(Number(volume.value) / 100); el('volume-value').textContent = `${volume.value}%`; localStorage.setItem('playport-master',volume.value); }
+ volume.oninput = setVolume; setVolume();
+-el('btn-settings').onclick = () => { panel.showModal(); void loadDisplay(); };
+-el('btn-close').onclick = () => panel.close();
++function openPanel() {
++  if (!panel.open) { panel.classList.remove('closing'); panel.showModal(); }
++  void loadDisplay();
++}
++/** Leave along the path it came in (to the right), unless motion is reduced. */
++function closePanel() {
++  if (!panel.open || panel.classList.contains('closing')) return;
++  if (matchMedia('(prefers-reduced-motion: reduce)').matches) { panel.close(); return; }
++  panel.classList.add('closing');
++  window.setTimeout(() => { panel.classList.remove('closing'); panel.close(); }, 200);
++}
++el('btn-settings').onclick = openPanel;
++el('btn-close').onclick = closePanel;
++panel.addEventListener('cancel', event => { event.preventDefault(); closePanel(); });
+ el('dismiss-error').onclick = () => error('');
+ el<HTMLSelectElement>('language').onchange = event => { setLanguage((event.target as HTMLSelectElement).value); render(); };
+-panel.addEventListener('click', event => { if (event.target !== panel) return; const r=panel.getBoundingClientRect(); if(event.clientX<r.left || event.clientX>r.right) panel.close(); });
++panel.addEventListener('click', event => { if (event.target !== panel) return; const r=panel.getBoundingClientRect(); if(event.clientX<r.left || event.clientX>r.right) closePanel(); });
+ function updateFullscreen() {
+   const full = !!document.fullscreenElement;
+   const label = t(full ? 'exitFullscreen' : 'fullscreen');
+   el('fullscreen-label').textContent = label;
+   el('fullscreen-text').textContent = label;
+-  for (const id of ['btn-fullscreen', 'fullscreen']) {
++  el('welcome-fullscreen-text').textContent = label;
++  for (const id of ['btn-fullscreen', 'fullscreen', 'welcome-fullscreen']) {
+     el(id).setAttribute('aria-label', label);
+     el(id).setAttribute('title', label);
+     el(id).dataset.fullscreen = String(full);
+@@ -149,6 +170,7 @@ async function toggleFullscreen() {
+ }
+ el('fullscreen').onclick = toggleFullscreen;
+ el('btn-fullscreen').onclick = toggleFullscreen;
++el('welcome-fullscreen').onclick = toggleFullscreen;
+ let toastTimer = 0;
+ function toast(message: string) {
+   el('toast').textContent = message; el('toast').hidden = false;
+@@ -194,17 +216,22 @@ function scheduleAuto() {
+ }
+ async function adapt() {
+   if (!display || !autoFit.checked || displayBusy) return;
+-  const target=suggestedResolution(screen.clientWidth,screen.clientHeight);
++  const target=autoTarget();
+   const key=`${target.width}x${target.height}`;
+   if (!aspectChanged(display,target) || key===lastAutoTarget) return;
+   // Avoid a reconnect loop even when another viewer has a different screen shape.
+   lastAutoTarget=key;
+   if (!(await saveDisplay({...display,...target,hevc:false}))) error(t('autoFail'));
+ }
++/** The current window sets the resolution, so neither fullscreen nor the normal window shows black bars;
++ *  switching between them renegotiates CarPlay once (user's choice 2026-10-11 over bars without a reconnect). */
++function autoTarget() {
++  return suggestedResolution(screen.clientWidth,screen.clientHeight);
++}
+ autoFit.onchange=() => { localStorage.setItem('f50-auto-fit',String(autoFit.checked)); lastAutoTarget=''; render(); scheduleAuto(); };
+ el<HTMLFormElement>('display-form').onsubmit=event => {
+   event.preventDefault();
+-  const size=autoFit.checked?suggestedResolution(screen.clientWidth,screen.clientHeight):{width:Number(el<HTMLInputElement>('width').value),height:Number(el<HTMLInputElement>('height').value)};
++  const size=autoFit.checked?autoTarget():{width:Number(el<HTMLInputElement>('width').value),height:Number(el<HTMLInputElement>('height').value)};
+   if (![size.width,size.height].every(v=>Number.isInteger(v)&&v>=480&&v<=3840&&v%2===0)) { error(t('range')); return; }
+   void saveDisplay({...size,fps:Number(el<HTMLSelectElement>('fps').value),uiScale:Number(el<HTMLSelectElement>('ui-scale').value),hevc:false});
+ };
+diff --git a/web/src/style.css b/web/src/style.css
+index 5a34a66..1950e8a 100644
+--- a/web/src/style.css
++++ b/web/src/style.css
+@@ -1,46 +1,135 @@
+-:root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; color: #f4f6f8; background: #000; --panel:#191c22; --line:#424750; --blue:#327cf6; }
+-* { box-sizing: border-box; }
+-body { margin:0; overflow:hidden; }
+-button, input, select { font:inherit; }
+-button, select, input[type=number] { color:inherit; background:#30353d; border:1px solid var(--line); border-radius:10px; min-height:48px; padding:10px 16px; }
++/* iOS dark Settings language, shared with the box settings page (scripts/onecloud/settings_ui.py).
++   The player stays dark in both day and night: it sits next to CarPlay on a car screen. */
++:root { color-scheme: dark; --bg:#000; --cell:#1C1C1E; --cell-hi:#2C2C2E; --press:#3A3A3C; --sep:rgba(84,84,88,.6);
++  --label:#FFF; --secondary:rgba(235,235,245,.6); --tint:#0A84FF; --green:#30D158; --red:#FF453A; --gray:#8E8E93;
++  --fill:rgba(120,120,128,.24); --glass:rgba(30,30,32,.62);
++  font:17px/1.35 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", system-ui, sans-serif;
++  color:var(--label); background:var(--bg); -webkit-text-size-adjust:100%; }
++* { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
++body { margin:0; overflow:hidden; background:var(--bg); }
++button, input, select { font:inherit; color:inherit; }
+ button { cursor:pointer; touch-action:manipulation; }
+-button:hover { background:#414955; } button:disabled { opacity:.45; cursor:default; }
+-:focus-visible { outline:3px solid #91b8ff; outline-offset:3px; }
++button:disabled { opacity:.4; cursor:default; }
++:focus-visible { outline:3px solid var(--tint); outline-offset:2px; }
+ [hidden] { display:none !important; }
++.sr { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
++.ico { width:22px; height:22px; flex:none; display:block; }
++.ico.dim { color:var(--secondary); }
++
+ #app { width:100vw; height:100vh; height:100dvh; position:relative; background:#000; }
+-#screen-container { position:absolute; top:0;right:0;bottom:0;left:0; inset:0; display:flex; justify-content:center; align-items:center; }
++#screen-container { position:absolute; top:0; right:0; bottom:0; left:0; inset:0; display:flex; justify-content:center; align-items:center; }
+ #surface { flex:none; }
+ #screen { display:block; width:100%; height:100%; touch-action:none; user-select:none; -webkit-user-select:none; }
+-#overlay { position:absolute; top:0;right:0;bottom:0;left:0; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:28px; text-align:center; background:#000; pointer-events:none; }
+-h1 { font-size:clamp(30px,5vw,56px); margin:0 0 18px; font-weight:600; letter-spacing:-.025em; }
+-#connection-text { font-size:22px; margin:8px 0; } #connection-hint { max-width:36em; color:#b9c0cb; line-height:1.65; }
+-#btn-settings { position:absolute; top:12px;top:max(12px,env(safe-area-inset-top)); left:12px;left:max(12px,env(safe-area-inset-left)); min-width:48px; padding:10px 12px; background:#252b33d9; border-color:#5a616b; display:flex; align-items:center; gap:8px; }
+-#btn-settings span[aria-hidden] { font-size:24px; line-height:1; }
+-#app[data-live=true] #btn-settings { display:none; }
+-#audio-unlock { position:absolute; bottom:max(16px,env(safe-area-inset-bottom)); left:50%; transform:translateX(-50%); background:#2256a4; white-space:nowrap; }
+-#error-banner { position:absolute; bottom:12px; left:12px; right:12px; max-width:650px; margin:auto; padding:14px; background:#542a28; border-radius:12px; max-height:40vh; overflow:auto; }
+-#error-text { overflow-wrap:anywhere; } #error-banner button { float:right; }
+-dialog { margin:0 0 0 auto; height:100%; max-height:100%; width:min(560px,100vw); max-width:100%; border:0; padding:0; background:var(--panel); color:inherit; }
+-dialog::backdrop { background:#0009; }
+-header { position:sticky; top:0; z-index:1; display:flex; align-items:center; justify-content:space-between; gap:20px; padding:18px 24px; background:var(--panel); border-bottom:1px solid var(--line); }
+-h2 { font-size:25px; margin:0; } h3 { font-size:19px; margin:0; }
+-.settings-body { padding:8px 24px 24px; }
+-.row,.section-title { display:flex; align-items:center; justify-content:space-between; gap:16px; margin:16px 0; }
+-.volume { display:grid; grid-template-columns:1fr auto; gap:12px; margin:24px 0 8px; } input[type=range] { width:100%; grid-column:1/-1; min-height:40px; accent-color:var(--blue); }
+-section,details { border-top:1px solid var(--line); padding:18px 0; }
+-summary { min-height:44px; cursor:pointer; padding:10px 0; font-size:18px; }
+-.hint { color:#b9c0cb; font-size:14px; line-height:1.65; }
+-.check { display:flex; align-items:center; gap:12px; min-height:48px; } input[type=checkbox] { width:24px; height:24px; accent-color:var(--blue); }
+-fieldset { border:0; padding:0; margin:0; min-width:0; } .pair { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:16px 0; } .pair label { display:flex; flex-direction:column; gap:8px; } .pair input,.pair select { min-width:0; width:100%; }
+-.primary { width:100%; background:var(--blue); border:0; } #fallback-controls { display:flex; flex-wrap:wrap; gap:10px; }
+-@media (max-width:480px) { header { padding:14px 18px; } .settings-body { padding:8px 18px 20px; } }
+-@media (prefers-reduced-motion:reduce) { * { scroll-behavior:auto !important; } }
+-
+-#btn-fullscreen { position:absolute; top:12px;top:max(12px,env(safe-area-inset-top)); right:12px;right:max(12px,env(safe-area-inset-right)); display:flex; align-items:center; gap:8px; min-width:48px; min-height:48px; padding:10px 12px; background:#252b33c9; border-color:#77818e; }
+-#btn-fullscreen:hover, #btn-fullscreen:focus-visible { background:#303945; }
+-/* Top-right button only enters fullscreen; once fullscreen it hides and exit lives in Settings (CarPlay gear icon). */
+-#btn-fullscreen[data-fullscreen=true] { display:none; }
+-#toast { position:absolute; top:max(16px,env(safe-area-inset-top)); left:50%; transform:translateX(-50%); max-width:calc(100vw - 32px); padding:12px 18px; border-radius:12px; background:#252b33f2; border:1px solid #77818e; font-size:17px; line-height:1.5; text-align:center; pointer-events:none; }
+-.fullscreen-action { display:flex; align-items:center; justify-content:center; gap:10px; min-height:56px; margin:18px 0 8px; font-size:19px; }
+-#btn-fullscreen .collapse, #btn-fullscreen[data-fullscreen=true] .expand, #fullscreen .collapse, #fullscreen[data-fullscreen=true] .expand { display:none; }
+-#btn-fullscreen[data-fullscreen=true] .collapse, #fullscreen[data-fullscreen=true] .collapse { display:block; }
++
++/* Waiting screen: what is happening, then the three things a driver can do here. */
++#overlay { position:absolute; top:0; right:0; bottom:0; left:0; inset:0; display:flex; align-items:center; justify-content:center;
++  padding:max(24px,env(safe-area-inset-top)) 16px max(24px,env(safe-area-inset-bottom)); background:#000; overflow:auto; pointer-events:none; }
++.welcome { width:min(440px,100%); text-align:center; animation:rise .45s cubic-bezier(.2,.8,.2,1) both; }
++.welcome h1 { font-size:clamp(34px,6vw,48px); line-height:1.05; letter-spacing:-.025em; font-weight:700; margin:0 0 14px; }
++.status { display:flex; align-items:center; justify-content:center; gap:10px; font-size:20px; font-weight:600; margin:0; }
++#connection-hint { color:var(--secondary); font-size:15px; line-height:1.45; margin:8px auto 28px; max-width:30em; }
++.spinner { width:18px; height:18px; flex:none; border-radius:50%; border:2.5px solid var(--fill); border-top-color:var(--secondary); animation:spin .9s linear infinite; }
++#app[data-state=waiting] .spinner, #app[data-state=access] .spinner { display:none; }
++.actions { text-align:left; pointer-events:auto; }
++@keyframes rise { from { opacity:0; transform:translateY(8px); } }
++@keyframes spin { to { transform:rotate(1turn); } }
++
++/* Inset grouped list */
++.group { background:var(--cell); border-radius:12px; overflow:hidden; }
++.cell { display:flex; align-items:center; gap:12px; width:100%; min-height:52px; padding:10px 16px; position:relative;
++  background:none; border:0; border-radius:0; color:inherit; text-align:left; text-decoration:none; font:inherit; }
++.group > :not([hidden]) ~ :not([hidden]), .group details > .inner { border-top:.5px solid var(--sep); }
++a.cell, button.cell, summary.cell, label.cell { cursor:pointer; transition:background-color .12s ease-out; }
++a.cell:active, button.cell:active, summary.cell:active, label.cell:active { background:var(--press); transition:none; }
++.cell .main { flex:1; min-width:0; }
++.cell .main b { display:block; font-weight:400; }
++.cell .main span { display:block; color:var(--secondary); font-size:13px; line-height:1.35; margin-top:1px; }
++.cell .value { color:var(--secondary); font-size:15px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; max-width:55%; }
++.tile { width:30px; height:30px; flex:none; border-radius:7px; display:grid; place-items:center; color:#fff; }
++.tile .ico { width:19px; height:19px; }
++.tile.blue { background:var(--tint); } .tile.green { background:var(--green); } .tile.gray { background:var(--gray); }
++.chev { flex:none; display:block; }
++.chev::after { content:""; display:block; width:8px; height:8px; margin-right:4px; border:solid rgba(235,235,245,.3); border-width:0 2px 2px 0; transform:rotate(-45deg); }
++details[open] > summary .chev::after { transform:rotate(45deg); }
++summary { list-style:none; } summary::-webkit-details-marker { display:none; }
++.group-title { color:var(--secondary); font-size:13px; margin:26px 16px 7px; }
++.foot { color:var(--secondary); font-size:13px; line-height:1.45; margin:7px 16px 0; }
++.gap { height:26px; }
++.foot + .group { margin-top:22px; }
++.inner { padding:12px 16px 16px; }
++.inner.text p { color:var(--secondary); font-size:14px; line-height:1.5; margin:0 0 8px; overflow-wrap:anywhere; }
++select { background:none; border:0; color:var(--secondary); font-size:17px; text-align:right; min-width:0; max-width:55%; padding:6px 0; cursor:pointer; text-overflow:ellipsis; }
++select option { color:#000; }
++.cell select { margin-left:auto; }
++
++/* iOS switch */
++.switch { appearance:none; -webkit-appearance:none; flex:none; width:51px; height:31px; margin:0; border-radius:16px; background:var(--fill);
++  position:relative; cursor:pointer; transition:background-color .2s ease-out; }
++.switch::after { content:""; position:absolute; top:2px; left:2px; width:27px; height:27px; border-radius:50%; background:#fff;
++  box-shadow:0 3px 8px rgba(0,0,0,.15), 0 3px 1px rgba(0,0,0,.06); transition:transform .25s cubic-bezier(.3,.7,.4,1); }
++.switch:checked { background:var(--green); }
++.switch:checked::after { transform:translateX(20px); }
++
++.volume { gap:14px; }
++.volume input[type=range] { flex:1; min-width:0; height:32px; margin:0; accent-color:#fff; }
++.volume output { min-width:3.2em; text-align:right; color:var(--secondary); font-variant-numeric:tabular-nums; }
++
++.btn { display:block; width:100%; min-height:50px; margin:14px 0 0; padding:13px 16px; border:0; border-radius:12px; background:var(--tint);
++  color:#fff; font-weight:600; text-align:center; transition:transform .1s ease-out; }
++.btn:active { transform:scale(.97); }
++.btn.plain { background:var(--fill); color:var(--tint); font-weight:400; }
++button.text { background:none; border:0; color:var(--tint); font-size:17px; font-weight:600; padding:10px 4px; min-height:44px; }
++button.text:active { opacity:.5; }
++fieldset { border:0; padding:0; margin:0; min-width:0; }
++.pair { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:0 0 12px; }
++.pair label { display:flex; flex-direction:column; gap:6px; color:var(--secondary); font-size:13px; }
++.pair input, .pair select { width:100%; min-width:0; max-width:none; min-height:44px; padding:8px 12px; border:0; border-radius:10px;
++  background:var(--cell-hi); color:var(--label); font-size:17px; text-align:left; }
++#fallback-controls { display:flex; flex-wrap:wrap; gap:10px; }
++#fallback-controls button { min-height:44px; padding:10px 16px; border:0; border-radius:10px; background:var(--cell-hi); }
++#fallback-controls button:active { background:var(--press); }
++
++/* Floating chrome over the live picture: translucent material, never an opaque bar. */
++.glass { background:var(--glass); -webkit-backdrop-filter:blur(20px) saturate(180%); backdrop-filter:blur(20px) saturate(180%);
++  border:.5px solid rgba(255,255,255,.18); color:#fff; }
++#btn-fullscreen { position:absolute; top:max(12px,env(safe-area-inset-top)); right:max(12px,env(safe-area-inset-right));
++  width:48px; height:48px; padding:0; border-radius:50%; display:grid; place-items:center; transition:transform .1s ease-out; }
++#btn-fullscreen:active { transform:scale(.92); }
++#app:not([data-live=true]) #btn-fullscreen, #btn-fullscreen[data-fullscreen=true] { display:none; }
++.capsule { position:absolute; left:50%; transform:translateX(-50%); max-width:calc(100vw - 32px); padding:12px 20px; border-radius:22px;
++  background:rgba(44,44,46,.92); -webkit-backdrop-filter:blur(20px); backdrop-filter:blur(20px); border:.5px solid rgba(255,255,255,.14);
++  color:#fff; font-size:16px; line-height:1.45; text-align:center; box-shadow:0 8px 30px rgba(0,0,0,.4); }
++#toast { top:max(16px,env(safe-area-inset-top)); pointer-events:none; animation:drop .3s cubic-bezier(.2,.8,.2,1); }
++#audio-unlock { bottom:max(20px,env(safe-area-inset-bottom)); white-space:nowrap; font-weight:600; min-height:48px; }
++@keyframes drop { from { opacity:0; transform:translate(-50%,-10px); } }
++#error-banner { position:absolute; bottom:max(16px,env(safe-area-inset-bottom)); left:16px; right:16px; max-width:560px; max-height:40vh; margin:auto;
++  overflow:auto; padding:14px 16px; border-radius:14px; background:var(--cell); box-shadow:inset 4px 0 var(--red), 0 8px 30px rgba(0,0,0,.4); }
++#error-banner summary { color:var(--secondary); font-size:15px; padding:6px 0; cursor:pointer; }
++#error-text { overflow-wrap:anywhere; color:var(--secondary); font-size:14px; }
++#error-banner button { float:right; margin-top:-36px; }
++.ico .collapse, [data-fullscreen=true] .ico .expand { display:none; }
++[data-fullscreen=true] .ico .collapse { display:block; }
++
++/* Settings sheet: slides in from the right edge and leaves the same way. */
++dialog { margin:0 0 0 auto; height:100%; max-height:100%; width:min(480px,100vw); max-width:100%; padding:0; border:0;
++  background:#000; color:inherit; overflow:auto; overscroll-behavior:contain; }
++dialog[open] { animation:sheet-in .32s cubic-bezier(.2,.8,.2,1); }
++dialog.closing { animation:sheet-out .2s cubic-bezier(.4,0,1,1) forwards; }
++dialog::backdrop { background:rgba(0,0,0,.45); }
++@keyframes sheet-in { from { transform:translateX(100%); } }
++@keyframes sheet-out { to { transform:translateX(100%); } }
++header { position:sticky; top:0; z-index:1; display:flex; align-items:center; justify-content:space-between; gap:16px;
++  padding:max(10px,env(safe-area-inset-top)) 16px 8px 20px; background:rgba(0,0,0,.72);
++  -webkit-backdrop-filter:blur(20px) saturate(180%); backdrop-filter:blur(20px) saturate(180%); }
++h2:focus { outline:none; }
++h2 { font-size:28px; line-height:1.15; font-weight:700; letter-spacing:-.02em; margin:6px 0; }
++.settings-body { padding:4px 16px max(32px,env(safe-area-inset-bottom)); }
++.settings-body > .group:first-child { margin-top:8px; }
++
++@media (max-width:480px) { dialog { width:100vw; } }
++@media (prefers-reduced-motion:reduce) {
++  *, *::before, *::after { animation:none !important; transition:none !important; scroll-behavior:auto !important; }
++}
++@media (prefers-reduced-transparency:reduce) {
++  .glass, .capsule, header { -webkit-backdrop-filter:none; backdrop-filter:none; background:#2C2C2E; }
++}

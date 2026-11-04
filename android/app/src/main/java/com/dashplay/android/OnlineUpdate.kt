@@ -203,13 +203,14 @@ object OnlineUpdate {
     private fun fetchBytes(url: String, mirrorSetting: String, limit: Int): ByteArray {
         val errors = mutableListOf<String>()
         for (candidate in candidateUrls(url, mirrorSetting)) {
-            val conn = (URL(candidate).openConnection() as HttpURLConnection).apply {
-                connectTimeout = 15_000
-                readTimeout = 20_000
-                instanceFollowRedirects = true
-                setRequestProperty("User-Agent", "DashPlay-Android-Update")
-            }
+            var conn: HttpURLConnection? = null
             try {
+                conn = (URL(candidate).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 15_000
+                    readTimeout = 20_000
+                    instanceFollowRedirects = true
+                    setRequestProperty("User-Agent", "DashPlay-Android-Update")
+                }
                 val code = conn.responseCode
                 if (code != 200) throw IllegalStateException("HTTP $code")
                 val out = ByteArrayOutputStream()
@@ -227,7 +228,7 @@ object OnlineUpdate {
                 val host = runCatching { URL(candidate).host }.getOrDefault(candidate)
                 errors += "$host: ${e.message ?: e.javaClass.simpleName}"
             } finally {
-                conn.disconnect()
+                conn?.disconnect()
             }
         }
         throw IllegalStateException("下载失败（${errors.joinToString("；").takeLast(240)}）。网络恢复后再试，或在下方填写可用的镜像加速地址。")
@@ -394,15 +395,24 @@ object OnlineUpdate {
         require(state.available) { "当前已是最新版本（${state.current}）。" }
         val dir = File(app.cacheDir, "apk-updates").apply { mkdirs() }
         val target = File.createTempFile("update-", ".apk", dir)
+        val verified = downloadFile(state, settings.updateMirror, target) { ApkUpdates.inspect(app, it) }
+        saveState(app, state.copy(downloadedFile = target.name, downloadedVersion = verified.version, error = ""))
+        return verified
+    }
+
+    /** Download/verification boundary, shared by the app and loopback HTTP regression tests. */
+    internal fun downloadFile(state: State, mirrorSetting: String, target: File,
+        inspect: (File) -> ApkUpdates.Candidate): ApkUpdates.Candidate {
         val errors = mutableListOf<String>()
-        for (candidate in candidateUrls(state.apkUrl, settings.updateMirror)) {
-            val conn = (URL(candidate).openConnection() as HttpURLConnection).apply {
-                connectTimeout = 15_000
-                readTimeout = 60_000
-                instanceFollowRedirects = true
-                setRequestProperty("User-Agent", "DashPlay-Android-Update")
-            }
+        for (candidate in candidateUrls(state.apkUrl, mirrorSetting)) {
+            var conn: HttpURLConnection? = null
             try {
+                conn = (URL(candidate).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 15_000
+                    readTimeout = 60_000
+                    instanceFollowRedirects = true
+                    setRequestProperty("User-Agent", "DashPlay-Android-Update")
+                }
                 val code = conn.responseCode
                 if (code != 200) throw IllegalStateException("HTTP $code")
                 val digest = MessageDigest.getInstance("SHA-256")
@@ -429,9 +439,7 @@ object OnlineUpdate {
                 if (state.apkSha256.isNotEmpty() && !hex.equals(state.apkSha256, ignoreCase = true)) {
                     throw IllegalArgumentException("下载的文件 SHA-256 校验与签名清单不符，已拒绝安装。")
                 }
-                val verified = ApkUpdates.inspect(app, target)
-                saveState(app, state.copy(downloadedFile = target.name, downloadedVersion = verified.version, error = ""))
-                return verified
+                return inspect(target)
             } catch (e: Exception) {
                 target.delete()
                 if (e is IllegalArgumentException && (e.message?.contains("签名") == true || e.message?.contains("SHA-256") == true)) {
@@ -440,7 +448,7 @@ object OnlineUpdate {
                 val host = runCatching { URL(candidate).host }.getOrDefault(candidate)
                 errors += "$host: ${e.message ?: e.javaClass.simpleName}"
             } finally {
-                conn.disconnect()
+                conn?.disconnect()
             }
         }
         throw IllegalArgumentException("下载更新包失败（${errors.joinToString("；").takeLast(220)}）。可在下方更换镜像加速地址后重试。")

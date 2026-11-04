@@ -1,0 +1,168 @@
+Viewer: the resolution follows the window; one switch picks custom or automatic (2026-10-23).
+
+Automatic forced every window shape up to 1280 on the long side. A 2/3 window was therefore 1280x848 (three
+rows) until the full screen (1372x686) was used for the first time; then the whole set was scaled to 1372,
+the 2/3 area shrank to 876x580 (two rows), and returning to it looked like a resolution change even though
+the window had not changed. Automatic now keeps each window's true size (only the 480 short-side floor and
+the 1920/2560 cap), so the same 2/3 window stays 876x580 whether or not the full screen has been used.
+The display settings have one switch, custom resolution (off: follow the window), instead of an automatic
+switch plus width/height fields; the UI size (icon count) stays. Tests: a small page keeps its size, and a
+2/3 window does not shrink when the full shape joins.
+
+--- a/web/src/display-fit.ts
++++ b/web/src/display-fit.ts
+@@ -43,11 +43,12 @@
+ export function windowShape(cssWidth: number, cssHeight: number, pixels: number): Area {
+   return { width: Math.max(2, Math.round(cssWidth * pixels / 2) * 2), height: Math.max(2, Math.round(cssHeight * pixels / 2) * 2) };
+ }
+-/** The factor that brings a stream of `width` x `height` (the envelope of the shapes) within suggestedResolution's
+- *  limits: the long side 1280 to `max`, the short side at least 480. */
++/** The factor that brings a stream of `width` x `height` (the envelope of the shapes) within the auto limits:
++ *  the long side at most `max`, the short side at least 480. A window smaller than 1280 keeps its true size: forcing
++ *  1280 made a 2/3 window as wide as the full one, and it then changed size when the full shape joined (2026-10-23). */
+ function fitFactor(width: number, height: number, max: number) {
+   const long = Math.max(width, height), short = Math.min(width, height);
+-  const factor = long > max ? max / long : long < 1280 ? 1280 / long : 1;
++  const factor = long > max ? max / long : 1;
+   return Math.max(factor, 480 / Math.max(1, short));
+ }
+ /** View areas (2026-10-14): each window shape the browser has shown (normal, fullscreen, the car's dock shown or not)
+--- a/web/src/main.ts
++++ b/web/src/main.ts
+@@ -44,8 +44,10 @@
+ let expectRestart = false, expectTimer = 0;
+ interface Display { width: number; height: number; fps: number; uiScale: number; hevc: boolean; areas?: Area[]; area?: number; pending?: boolean; }
+ let display: Display | null = null;
+-const autoFit = el<HTMLInputElement>('auto-fit');
+-autoFit.checked = localStorage.getItem('f50-auto-fit') !== 'false';
++const customSize = el<HTMLInputElement>('custom-size');
++// Off (the default) follows the window; on keeps the typed width and height.
++customSize.checked = localStorage.getItem('f50-auto-fit') === 'false';
++const autoFitOn = () => !customSize.checked;
+ const nightSelect = el<HTMLSelectElement>('night-mode');
+ nightSelect.value = parseNightMode(localStorage.getItem('f50-night-mode'));
+ const darkQuery = matchMedia('(prefers-color-scheme: dark)');
+@@ -72,8 +74,9 @@
+   el('app').dataset.live = String(painted || holding);
+   el('capabilities').textContent = !isSecureContext ? t('insecure') : typeof VideoDecoder === 'undefined' || typeof AudioDecoder === 'undefined' ? t('unsupported') : t('compatible');
+   el('media-support').textContent = t(media.supported ? 'mediaYes' : 'mediaNo');
+-  el<HTMLInputElement>('width').disabled = autoFit.checked;
+-  el<HTMLInputElement>('height').disabled = autoFit.checked;
++  el<HTMLInputElement>('width').disabled = !customSize.checked;
++  el<HTMLInputElement>('height').disabled = !customSize.checked;
++  el('size-row').hidden = !customSize.checked;
+   document.querySelectorAll<HTMLButtonElement>('[data-command]').forEach(b => { b.disabled = !active; });
+   const night = isNight(parseNightMode(nightSelect.value), new Date(), darkQuery.matches);
+   el('night-status').textContent = `${t('nightNow')}${t(night ? 'nightOn' : 'nightOff')}`;
+@@ -124,7 +127,7 @@
+ let behindRun = 0;
+ function judgeFrameRate(caughtUp: number) {
+   const check = frameRateCheck(behindRun, caughtUp, display?.fps ?? 0); behindRun = check.run;
+-  if (!check.lower || !display || !autoFit.checked || displayBusy || readFlag('f50-fps-lowered') === '1') return;
++  if (!check.lower || !display || !autoFitOn() || displayBusy || readFlag('f50-fps-lowered') === '1') return;
+   saveFlag('f50-fps-lowered', '1'); toast(t('fpsLowered'));
+   void saveDisplay({ ...display, fps: 30 }, { reason: 'decoder' });
+ }
+@@ -404,13 +407,13 @@
+ }
+ function scheduleAuto() {
+   window.clearTimeout(autoTimer);
+-  if (!autoFit.checked || !display || displayBusy || document.hidden || typeof VideoDecoder === 'undefined') return;
++  if (!autoFitOn() || !display || displayBusy || document.hidden || typeof VideoDecoder === 'undefined') return;
+   autoTimer=window.setTimeout(() => { void adapt(); },1500);
+ }
+ async function adapt() {
+   // Not for a hidden page (a covered page reports a small window) nor while fullscreen waits for its tap; a timer
+   // set just before the car covered the page fired anyway and renegotiated to 800x400 (Chrome, 2026-10-12).
+-  const busy = () => !display || !autoFit.checked || displayBusy || document.hidden || (wantFullscreen && !document.fullscreenElement);
++  const busy = () => !display || !autoFitOn() || displayBusy || document.hidden || (wantFullscreen && !document.fullscreenElement);
+   if (busy()) return;
+   // From the box's own, not what this page last saw: fps and size set by another page are kept, not sent back.
+   const current = await fetchDisplay();
+@@ -451,12 +454,12 @@
+ }
+ el<HTMLSelectElement>('codec').value = readFlag('f50-codec') || 'auto';
+ el<HTMLSelectElement>('codec').onchange=() => { saveFlag('f50-codec', el<HTMLSelectElement>('codec').value); lastAutoTarget=''; urgentChange='manual'; scheduleAuto(); };
+-autoFit.onchange=() => { localStorage.setItem('f50-auto-fit',String(autoFit.checked)); lastAutoTarget=''; urgentChange='manual'; render(); scheduleAuto(); };
++customSize.onchange=() => { localStorage.setItem('f50-auto-fit',String(!customSize.checked)); lastAutoTarget=''; urgentChange='manual'; render(); scheduleAuto(); };
+ el<HTMLFormElement>('display-form').onsubmit=event => {
+   event.preventDefault();
+   // Automatic display keeps the box's stream and its areas, changing only frame rate, size or codec: sent without the
+   // areas, the largest window then showed less (2026-10-22).
+-  const size:Pick<Display,'width'|'height'|'areas'|'area'>=autoFit.checked?(display?{width:display.width,height:display.height,areas:display.areas,area:display.area}:suggestedResolution(autoTarget().width,autoTarget().height,fastDecoder()?2560:1920))
++  const size:Pick<Display,'width'|'height'|'areas'|'area'>=autoFitOn()?(display?{width:display.width,height:display.height,areas:display.areas,area:display.area}:suggestedResolution(autoTarget().width,autoTarget().height,fastDecoder()?2560:1920))
+     :{width:Number(el<HTMLInputElement>('width').value),height:Number(el<HTMLInputElement>('height').value)};
+   if (![size.width,size.height].every(v=>Number.isInteger(v)&&v>=480&&v<=3840&&v%2===0)) { error(t('range')); return; }
+   void saveDisplay({...size,fps:Number(el<HTMLSelectElement>('fps').value),uiScale:Number(el<HTMLSelectElement>('ui-scale').value),hevc:wantHevc()},{reason:'manual'});
+--- a/web/index.html
++++ b/web/index.html
+@@ -31,11 +31,11 @@
+   <div class="group">
+     <label class="cell"><span class="main"><b data-i18n="nightMode"></b><span id="night-status"></span></span><select id="night-mode"><option value="schedule" data-i18n="nightSchedule"></option><option value="system" data-i18n="nightSystem"></option><option value="day" data-i18n="nightDay"></option><option value="night" data-i18n="nightNight"></option></select></label>
+     <label class="cell"><span class="main"><b data-i18n="fullscreenButton"></b><span data-i18n="fullscreenButtonHint"></span></span><select id="fullscreen-button"><option value="top" data-i18n="cornerTop"></option><option value="bottom" data-i18n="cornerBottom"></option><option value="off" data-i18n="cornerOff"></option></select></label>
+-    <label class="cell"><span class="main"><b data-i18n="auto"></b></span><input id="auto-fit" class="switch" type="checkbox"/></label>
++    <label class="cell"><span class="main"><b data-i18n="customSize"></b><span data-i18n="customSizeHint"></span></span><input id="custom-size" class="switch" type="checkbox"/></label>
+     <label class="cell"><span class="main"><b data-i18n="debugHud"></b><span data-i18n="debugHudHint"></span></span><input id="debug-hud-on" class="switch" type="checkbox"/></label>
+     <label class="cell"><span class="main"><b data-i18n="compatDisplay"></b><span data-i18n="compatDisplayHint"></span></span><input id="compat-display-on" class="switch" type="checkbox"/></label>
+-    <details><summary class="cell"><span class="main"><b data-i18n="custom"></b></span><span id="display-status" class="value" role="status"></span><span class="chev"></span></summary>
+-      <form id="display-form" class="inner"><fieldset id="display-fields"><div class="pair"><label><span data-i18n="width"></span><input id="width" type="number" min="480" max="3840" step="2" required/></label><label><span data-i18n="height"></span><input id="height" type="number" min="480" max="3840" step="2" required/></label></div><div class="pair"><label><span data-i18n="ui"></span><select id="ui-scale"><option value="75" data-i18n="smaller"></option><option value="85" data-i18n="small"></option><option value="100" data-i18n="standard"></option><option value="115" data-i18n="large"></option></select></label><label><span data-i18n="fps"></span><select id="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label></div><div class="pair"><label><span data-i18n="codec"></span><select id="codec"><option value="auto" data-i18n="codecAuto"></option><option value="h264">H.264</option><option value="h265">H.265</option></select></label></div></fieldset><button id="apply" class="btn" data-i18n="apply"></button></form></details>
++    <details><summary class="cell"><span class="main"><b data-i18n="displaySettings"></b></span><span id="display-status" class="value" role="status"></span><span class="chev"></span></summary>
++      <form id="display-form" class="inner"><fieldset id="display-fields"><div class="pair" id="size-row"><label><span data-i18n="width"></span><input id="width" type="number" min="480" max="3840" step="2" required/></label><label><span data-i18n="height"></span><input id="height" type="number" min="480" max="3840" step="2" required/></label></div><div class="pair"><label><span data-i18n="ui"></span><select id="ui-scale"><option value="75" data-i18n="smaller"></option><option value="85" data-i18n="small"></option><option value="100" data-i18n="standard"></option><option value="115" data-i18n="large"></option></select></label><label><span data-i18n="fps"></span><select id="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label></div><div class="pair"><label><span data-i18n="codec"></span><select id="codec"><option value="auto" data-i18n="codecAuto"></option><option value="h264">H.264</option><option value="h265">H.265</option></select></label></div></fieldset><button id="apply" class="btn" data-i18n="apply"></button></form></details>
+   </div>
+   <p class="foot" data-i18n="autoHint"></p>
+   <div class="group"><label class="cell"><span class="main"><b data-i18n="language"></b></span><select id="language"><option value="zh">简体中文</option><option value="en">English</option></select></label></div>
+--- a/web/src/i18n.ts
++++ b/web/src/i18n.ts
+@@ -2,7 +2,7 @@
+   settings: ['盒子设置', 'Box settings'], close: ['关闭', 'Close'], done: ['完成', 'Done'],
+   boxLink: ['添加 iPhone · 网络设置', 'Add iPhone · Network'], boxLinkHint: ['配对新手机、选择热点', 'Pair a phone, choose the hotspot'],
+   boxLinkHintLive: ['离开画面，配对手机、更换热点', 'Leaves the picture to pair phones or change the hotspot'],
+-  playerSettings: ['画面与声音', 'Display and sound'], custom: ['自定义分辨率', 'Custom resolution'], language: ['语言', 'Language'],
++  playerSettings: ['画面与声音', 'Display and sound'], displaySettings: ['画面参数', 'Display settings'], customSize: ['自定义分辨率', 'Custom resolution'], customSizeHint: ['关闭时跟随窗口', 'Off: follow the window'], language: ['语言', 'Language'],
+   waiting: ['正在等待 iPhone', 'Waiting for iPhone'], waitingHint: ['已添加的 iPhone 打开蓝牙和 Wi-Fi 后会自动连接。第一次使用，请先添加 iPhone。', 'An added iPhone connects by itself with Bluetooth and Wi-Fi on. First time here? Add your iPhone.'],
+   connecting: ['正在连接盒子…', 'Connecting to receiver…'], reconnecting: ['连接中断，正在自动重连…', 'Disconnected. Reconnecting automatically…'],
+   starting: ['已连接，正在等待画面…', 'Connected. Waiting for video…'], live: ['已连接', 'Connected'],
+@@ -10,7 +10,7 @@
+   sound: ['轻点启用声音', 'Tap to enable sound'], volume: ['音量', 'Volume'],
+   display: ['画面', 'Display'], fullscreen: ['全屏', 'Fullscreen'], exitFullscreen: ['退出全屏', 'Exit fullscreen'], fullscreenHint: ['已全屏。退出全屏：点 CarPlay 主屏幕上的「盒子设置」图标，再点「退出全屏」。', 'Fullscreen on. To exit, tap the Box settings icon on the CarPlay home screen, then Exit fullscreen.'], fullscreenFail: ['此浏览器不允许全屏，画面仍会自动适配窗口。', 'Fullscreen unavailable. The picture still fits this window.'], tapFullscreen: ['轻点画面恢复全屏', 'Tap the picture to go back to fullscreen'],
+   teslaFullscreenOffline: ['全屏要经腾讯视频跳转，特斯拉现在上不了网。画面照常可用。', 'Fullscreen goes through a video site and the car is offline. The picture keeps working.'],
+-  auto: ['自动匹配屏幕', 'Match the screen'], autoHint: ['自动匹配让画面铺满当前窗口，进入或退出全屏时 CarPlay 会重连一次。只在一个显示端开启。', 'Matching fills the current window; entering or leaving fullscreen reconnects CarPlay once. Turn it on for one display only.'],
++  autoHint: ['关闭时跟随窗口：窗口多大就用多大，切到没见过的窗口会重连一次；打开后可自己填宽度、高度。只在一个显示端开启。', 'Off: follow the window; a new window size reconnects CarPlay once. On: set the width and height yourself. Turn it on for one display only.'],
+   width: ['宽度', 'Width'], height: ['高度', 'Height'], apply: ['应用并重连', 'Apply and reconnect'],
+   nightMode: ['夜间模式', 'Night mode'], nightSchedule: ['自动（18:30–06:30 为夜间）', 'Auto (night 18:30–06:30)'], nightSystem: ['跟随车机浏览器深色模式', 'Follow car browser dark mode'], nightDay: ['始终白天', 'Always day'], nightNight: ['始终夜间', 'Always night'],
+   nightNow: ['当前请求：', 'Requested now: '], nightOn: ['夜间', 'night'], nightOff: ['白天', 'day'], browserDark: ['车机浏览器报告深色模式', 'Car browser reports dark mode'], browserLight: ['车机浏览器报告浅色模式', 'Car browser reports light mode'],
+@@ -38,7 +38,7 @@
+   mediaNo: ['浏览器不提供系统媒体控制接口。', 'This browser does not expose system media controls.'],
+   noStream: ['尚无音视频流', 'No media stream yet'], playing: ['音频正在播放', 'Audio playing'], paused: ['等待音频', 'Waiting for audio'],
+   error: ['播放遇到问题', 'Playback problem'], technical: ['详细信息', 'Details'],
+-  savedHere: ['语言、音量与自动匹配偏好保存在此浏览器。CarPlay 内部语言跟随 iPhone。', 'Language, volume and auto-fit preferences are saved in this browser. CarPlay itself follows the iPhone language.'],
++  savedHere: ['语言、音量与分辨率偏好保存在此浏览器。CarPlay 内部语言跟随 iPhone。', 'Language, volume and display preferences are saved in this browser. CarPlay itself follows the iPhone language.'],
+   privacy: ['首次登录后无需再次进入设置；自动播放被浏览器拦截时，只需轻点画面一次。', 'No need to reopen settings after setup. If autoplay is blocked, tap the screen once.'],
+   follow: ['关注作者 · 一只小黑狗', 'Follow the author'],
+   followDouyin: ['抖音扫一扫', 'Scan in Douyin'], followXiaohongshu: ['小红书扫一扫', 'Scan in Xiaohongshu'],
+--- a/web/check-car.mjs
++++ b/web/check-car.mjs
+@@ -324,9 +324,21 @@
+   const m=areaPlan({width:1280,height:720,hevc:true},big,true,[half],2560);
+   assert.deepEqual([m.display.width,m.display.height,m.display.areas],[2560,1482,[{width:1280,height:1482},{width:2560,height:1482}]]);
+   assert.equal(m.display.area,1,'the large window in use');
+-  // A small car page alone still gets at least 1280 on the long side, as suggestedResolution gave it.
++  // A small car page alone keeps its true size (2026-10-23): forcing 1280 made a 2/3 window as wide as the full one.
+   assert.deepEqual(areaPlan({width:1280,height:720,hevc:false},windowShape(876,518,1),false,[]).display,
+-    {width:1280,height:756,hevc:false,areas:[],area:0}); }
++    {width:876,height:518,hevc:false,areas:[],area:0});
++  // A 2/3 window keeps its size before and after the full screen joins: 876x580 stays 876x580, so returning to it is
++  // the same area of the same stream, not a resolution change (2026-10-22/23).
++  {
++    const two=windowShape(876,580,1), whole=windowShape(1372,686,1);
++    let p=areaPlan({width:1280,height:720,hevc:false},two,false,[]);
++    assert.deepEqual([p.display.width,p.display.height,p.display.areas],[876,580,[]],'the 2/3 window keeps its size');
++    p=areaPlan(p.display,whole,false,p.shapes);
++    assert.deepEqual([p.display.width,p.display.height,p.display.areas],[1372,686,[two,whole]],'the full shape joins');
++    const back=areaPlan(p.display,two,false,p.shapes);
++    assert.deepEqual([back.display.width,back.display.height,back.display.area],[1372,686,0],'back to its area, same stream');
++    assert.deepEqual(back.display.areas,[two,whole],'the 2/3 area does not shrink'); }
++}
+ console.log('View areas: shapes learned once, switched without reconnecting.');
+ { // Tesla fullscreen leaves the page only when its video sites answer (offline Tesla, simulated 2026-10-14).
+   const {reachable,TESLA_HOPS}=await load('tesla-fullscreen');

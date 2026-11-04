@@ -48,6 +48,12 @@ class WindowTests(unittest.TestCase):
             tool.write_text('#!/bin/sh\n'); tool.chmod(0o755)
             self.assertTrue(debug_uplink.reachable(directory))
 
+    def test_explicit_open_hotspot_copy_remains_valid_for_debug_window(self):
+        value = {'ssid': 'Public', 'passphrase': '', 'security': 'open'}
+        setup_wizard.save_json(self.state / debug_uplink.HOTSPOT, value)
+        debug_uplink.start(self.run, now=100)
+        self.assertEqual(debug_uplink.active(self.state, self.run, now=200), value)
+
 
 class ReceiverInputTests(unittest.TestCase):
     def test_debugging_from_box_hotspot_mode_reads_a_file_that_exists(self):

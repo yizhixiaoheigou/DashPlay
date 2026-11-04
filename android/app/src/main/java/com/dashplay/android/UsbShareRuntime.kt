@@ -27,7 +27,7 @@ internal data class UsbShareRootResult(val success: Boolean, val finished: Boole
 
 internal object UsbShareRoot {
     fun run(script: String, marker: String, timeout: () -> Unit = {}): UsbShareRootResult {
-        val process = try { ProcessBuilder("su", "-c", script).redirectErrorStream(true).start() }
+        val process = try { RootShell.open(script) }
         catch (_: Exception) { return UsbShareRootResult(false, true, false) }
         val task = FutureTask {
             val output = mutableListOf<String>()

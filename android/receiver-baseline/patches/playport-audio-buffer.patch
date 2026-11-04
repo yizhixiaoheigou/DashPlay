@@ -1,0 +1,81 @@
+--- a/web/src/audio.ts
++++ b/web/src/audio.ts
+@@ -1,3 +1,4 @@
++import { audioStartTime } from './audio-timing';
+ import { AudioCodec, type AudioConfigMessage, type AudioPacketMessage } from './protocol';
+
+ interface StreamState {
+@@ -10,8 +11,6 @@
+   gain: GainNode;
+ }
+
+-const MIN_LATENCY_SECONDS = 0.12;
+-const MAX_LATENCY_SECONDS = 0.35;
+
+ /** Decodes and plays CarPlay audio streams (AAC-LC, Opus, LPCM) via Web Audio. */
+ export class AudioEngine {
+@@ -185,12 +184,13 @@
+
+   private schedule(state: StreamState, buffer: AudioBuffer): void {
+     const now = this.context.currentTime;
+-    if (state.nextPlayTime < now + MIN_LATENCY_SECONDS || state.nextPlayTime > now + MAX_LATENCY_SECONDS) {
+-      state.nextPlayTime = now + MIN_LATENCY_SECONDS;
+-    }
++    const start = audioStartTime(now, state.nextPlayTime, state.name === 'media');
++    if (start === null) return;
++    state.nextPlayTime = start;
+     const source = this.context.createBufferSource();
+     source.buffer = buffer;
+     source.connect(state.gain);
++    source.onended = () => source.disconnect();
+     source.start(state.nextPlayTime);
+     state.nextPlayTime += buffer.duration;
+   }
+--- /dev/null
++++ b/web/src/audio-timing.ts
+@@ -0,0 +1,7 @@
++/** Preserve queued samples across packet bursts; never rewind scheduled audio. */
++export function audioStartTime(now: number, next: number, media: boolean): number | null {
++  const target = media ? 0.6 : 0.12;
++  // Bound backlog without overlapping buffers already submitted to Web Audio.
++  if (next > now + 2) return null;
++  return next <= now + 0.005 ? now + target : next;
++}
+--- /dev/null
++++ b/web/check-audio.mjs
+@@ -0,0 +1,24 @@
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import ts from 'typescript';
++const source = readFileSync(new URL('./src/audio-timing.ts', import.meta.url), 'utf8');
++const { outputText } = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } });
++const { audioStartTime } = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
++// Observed NAS delivery: ~400 ms bursts carrying 1024-sample / 48 kHz frames.
++const duration = 1024 / 48000;
++let next = 0, lastEnd = null;
++for (let burst = 0; burst < 100; burst++) {
++  const arrival = burst * duration * 19 + (burst % 3) * 0.01;
++  for (let packet = 0; packet < 19; packet++) {
++    const start = audioStartTime(arrival, next, true);
++    assert.notEqual(start, null);
++    if (lastEnd !== null) assert.ok(Math.abs(start - lastEnd) < 1e-8, 'burst delivery must not overlap or gap queued frames');
++    next = start + duration;
++    lastEnd = next;
++  }
++}
++assert.equal(audioStartTime(10, 9, true), 10.6, 'underrun rebuilds music reserve');
++assert.equal(audioStartTime(10, 10.04, true), 10.04, 'small remaining reserve is not an underrun');
++assert.equal(audioStartTime(10, 0, false), 10.12, 'voice keeps lower initial latency');
++assert.equal(audioStartTime(10, 13, true), null, 'excess backlog is bounded without rewinding');
++console.log('Audio burst scheduling checks passed');
+--- a/web/package.json
++++ b/web/package.json
+@@ -5,7 +5,7 @@
+   "type": "module",
+   "scripts": {
+     "dev": "vite",
+-    "test": "node check.mjs",
++    "test": "node check.mjs && node check-audio.mjs",
+     "build": "tsc && vite build",
+     "preview": "vite preview"
+   },
