@@ -351,7 +351,15 @@ def relay_usbmux(fd, mux):
         if len(header) < 4:
             return 0
         (length,) = struct.unpack(">I", header)
+        if not 0 < length <= 1 << 20:
+            # A corrupted stream must not ask for gigabytes (an ARM box has one or two): leave and let the
+            # receiver restart the bridge rather than hang on a read that never completes.
+            log(f"USBMUX frame length {length} out of range")
+            return 1
         data = stdin.read(length)
+        if len(data) < length:
+            log("USBMUX stream ended mid-frame")
+            return 0
         try:
             bulk(fd, out_ep, data, timeout=2000)
         except OSError as error:
@@ -441,12 +449,22 @@ def main():
                 if len(frame) >= 12 and behind.get(frame[6:12]) != index:
                     behind[frame[6:12]] = index
                     log(f"NCM peer {frame[6:12].hex(':')} on function {functions[index][0]}")
-                os.write(tap, frame)
+                try:
+                    os.write(tap, frame)
+                except OSError as error:
+                    # A dead TAP must not leave a silent half-bridge (a frame larger than the MTU ends here too):
+                    # leave, so that the receiver restarts the whole bridge.
+                    log(f"TAP write ended: {error.strerror}")
+                    os._exit(0)
 
     def tap_to_ncm():
         sent, timed_out = [0] * len(functions), [0] * len(functions)
         while True:
-            frame = os.read(tap, 2048)
+            try:
+                frame = os.read(tap, 2048)
+            except OSError as error:
+                log(f"TAP read ended: {error.strerror}")
+                os._exit(0)
             target = behind.get(frame[:6]) if not frame[0] & 1 else None
             for index in ([target] if target is not None else range(len(functions))):
                 try:

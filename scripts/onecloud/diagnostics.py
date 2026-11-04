@@ -112,7 +112,10 @@ class LogMirror:
             data = data[:LOG_FILE_MAX - size] + b"\n[log mirror: size limit reached]\n"
         fd = handles.get(name)
         if fd is None:
-            fd = handles[name] = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            # O_CLOEXEC: the supervisor re-execs itself on network changes; the mirror's handles must not
+            # leak into every following process (they were inheritable os.open descriptors).
+            fd = handles[name] = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND |
+                                         getattr(os, "O_CLOEXEC", 0), 0o600)
         os.write(fd, data)
 
     def cycle(self, offsets, handles):
