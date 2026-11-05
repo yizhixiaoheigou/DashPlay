@@ -17,6 +17,7 @@ import fcntl
 import glob
 import os
 from pathlib import Path
+import select
 import struct
 import subprocess
 import sys
@@ -84,9 +85,21 @@ def control_in(fd, request_type, request, value, index, length):
     return buffer.raw
 
 
+_THREAD = threading.local()
+
+
 def bulk(fd, endpoint, data=None, length=READ_CHUNK, timeout=1000):
-    buffer = ctypes.create_string_buffer(data if data is not None else length, len(data) if data is not None else length)
-    request = struct.pack(BULK_STRUCT, endpoint, len(buffer), timeout, ctypes.addressof(buffer))
+    if data is None:
+        # Reuse one read buffer per thread: the from_phone and NCM threads call here for every
+        # USBMUX packet or 64 KB block, each with a fresh ctypes allocation and raw copy otherwise.
+        buffer = getattr(_THREAD, 'bulk_buffer', None)
+        if buffer is None or len(buffer) < length:
+            buffer = _THREAD.bulk_buffer = ctypes.create_string_buffer(length)
+        size = length
+    else:
+        buffer = ctypes.create_string_buffer(data, len(data))
+        size = len(buffer)
+    request = struct.pack(BULK_STRUCT, endpoint, size, timeout, ctypes.addressof(buffer))
     count = fcntl.ioctl(fd, USBDEVFS_BULK, bytearray(request))
     return buffer.raw[:count] if data is None else count
 
@@ -314,7 +327,13 @@ def prepare_carplay(serial, off, stream=None, environ=None):
     state = 'tether' if off else ('prepare' if needs_ack else 'iphone')
     log(f'usb {state} {serial}'.strip())
     if needs_ack:
-        reply = (sys.stdin.buffer if stream is None else stream).read(4)
+        source = sys.stdin.buffer if stream is None else stream
+        reply = b''
+        try:   # a stuck receiver must not hold the USB role for ever; BytesIO (tests) has no fileno
+            if select.select([source], [], [], 10)[0]:
+                reply = source.read(4)
+        except (OSError, ValueError, TypeError, AttributeError):
+            reply = source.read(4)
         if reply != b'RDY!':
             raise RuntimeError('receiver did not confirm USB CarPlay preparation')
         off = cable_carplay_off(environ)

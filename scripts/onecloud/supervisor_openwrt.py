@@ -709,12 +709,15 @@ def main():
         say(f"DashPlay services started on {network['ssid']} ({host}, channel {network['channel']})")
         plan = plan_of(network)
         next_check = time.monotonic() + RECHECK_EVERY
+        sound_retry_at = 0.0
         while not stopped.wait(2):
-            if receiver_refresh:
+            if receiver_refresh and time.monotonic() >= sound_retry_at:
                 receiver_refresh.clear()
                 try:
                     latest = audio_routes.read_uci()
                 except ValueError:
+                    # A broken uci otherwise answered with a fork and two log lines every 2 s.
+                    sound_retry_at = time.monotonic() + 30
                     say('Sound settings unavailable; keeping receiver running and retrying')
                     receiver_refresh.append('receiver options changed')
                 else:

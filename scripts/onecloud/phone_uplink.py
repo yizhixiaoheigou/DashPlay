@@ -615,11 +615,25 @@ class PhoneUplink:
                     return
                 link = p.phone_link()
                 self.status['uplink_link'] = link
-                address = p.phone_station_address() if link['connected'] else None
+                if link['connected']:
+                    # One address+gateway probe (`ip -j addr`, `ip -j route`) per 5 ticks once both are
+                    # up: a steady connection answers the same for 10 s while this tick runs every 2 s.
+                    # Transitions keep probing every tick: no address yet (DHCP pending), or an address
+                    # whose gateway has not appeared (route pending). No address still means no gateway.
+                    self._uplink_probe = (getattr(self, '_uplink_probe', 0) + 1) % 5
+                    if self._uplink_probe == 1 or getattr(self, '_address_cache', None) is None or (
+                            self._address_cache and getattr(self, '_gateway_cache', None) is None):
+                        self._address_cache = p.phone_station_address()
+                        self._gateway_cache = p.uplink_gateway() if self._address_cache else None
+                    address, gateway = self._address_cache, self._gateway_cache
+                    if not address:
+                        gateway = None
+                else:
+                    self._address_cache = self._gateway_cache = None
+                    address = gateway = None
                 if address and address.network.overlaps(self.address.network):
                     self.defer('手机热点网段与盒子冲突；保持局域网')
                     return
-                gateway = p.uplink_gateway() if address else None
                 if link['connected'] and link['frequency'] != self.frequency:
                     # freq_list should prevent this; never chase a driver's unexpected move in a loop.
                     self.defer('上游信道改变；重新扫描，保持局域网')

@@ -38,8 +38,9 @@ class DiagLog:
             self.current.replace(self.previous)
         fd = os.open(self.current, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
+            # No fsync per row: this fires every 10 s plus every Tesla check, and a row that reaches
+            # the disk on the kernel's writeback instead of immediately is diagnostics enough.
             os.write(fd, (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode())
-            os.fsync(fd)
         finally:
             os.close(fd)
 

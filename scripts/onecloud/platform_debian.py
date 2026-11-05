@@ -390,14 +390,34 @@ class DebianPlatform:
         # hostapd's own word only. Realtek's 8821cu driver (concurrent STA + AP build) reports no channel
         # for an AP while its station interface is idle (2026-10-11), and the N1's brcmfmac reports type
         # AP with a channel as soon as hostapd starts, before it fails on an 80 MHz channel (2026-10-12):
-        # iw cannot tell. The log is rewritten on every start.
+        # iw cannot tell. The log is rewritten on every start (a new inode), so the tail is read
+        # incrementally: the phone-uplink tick asks every 2 s and the file grows with every association.
         if any(name == 'hostapd' and child.poll() is not None for name, child in self.children):
             return False
+        path = self.run / "hostapd.log"
         try:
-            log = (self.run / "hostapd.log").read_text(errors="replace")
-            return log.rfind('AP-ENABLED') > log.rfind('AP-DISABLED')
+            stat = path.stat()
+        except OSError:
+            self._ap_log = None
+            return False
+        state = getattr(self, '_ap_log', None)
+        if state and state[0] == stat.st_ino and state[1] <= stat.st_size:
+            inode, offset, enabled = state
+        else:   # rewritten, rotated or truncated: start over
+            inode, offset, enabled = stat.st_ino, 0, False
+        try:
+            with path.open('rb') as log:
+                log.seek(offset)
+                for line in log:
+                    if b'AP-ENABLED' in line:
+                        enabled = True
+                    elif b'AP-DISABLED' in line:
+                        enabled = False
+                offset = log.tell()
         except OSError:
             return False
+        self._ap_log = (inode, offset, enabled)
+        return enabled
 
     def iw_list(self):
         """One `iw list` snapshot shared by concurrent_ap/five_ghz/ap_channel_problem: each used to spawn
