@@ -477,7 +477,7 @@ class PlatformTests(unittest.TestCase):
             self.assertTrue(predicate())
         with patch.object(self.platform, 'start') as start, patch.object(self.platform, 'ipv4_address', return_value='192.0.2.9'):
             self.assertTrue(self.platform.join_wifi(car, {'ssid': car['ssid'], 'address': '192.0.2.9'}, wait, 60))
-        self.assertEqual(waits, [(30, .25), (60, .25), (30, .2)])
+        self.assertEqual(waits, [(30, .5), (60, .5), (30, .5)])   # 0.5 s: DHCP needs no tighter polling
         self.assertIn('RequestAddress=192.0.2.9', self.platform.sta_network.read_text())
         self.assertEqual(self.platform.sta_network.stat().st_mode & 0o777, 0o644)
         # The name in hex and the password as written (wpa_supplicant has no escapes in quoted values).

@@ -693,12 +693,14 @@ class LegacyPhoneUplink:
         self.set_status('offline', '先提供盒子热点，再寻找手机热点')
 
     def set_status(self, phase, reason):
+        changed = self.status.get('uplink', {}).get('reason') != reason or self.phase != phase
         self.phase = phase
         self.status['uplink'] = {'phase': phase, 'ssid': self.saved['ssid'] if self.saved else '', 'reason': reason}
         # "wired" has the internet too, so the Tesla checks do not need to be answered locally.
         self.status['tesla_offline'] = bool(self.status.get('tesla') and phase in ('offline', 'connecting'))
         # No credentials in logs; diagnostics also records this dict.
-        self.say(f'phone uplink {phase}: {reason}')
+        if changed:
+            self.say(f'phone uplink {phase}: {reason}')
 
     def stop_network(self):
         for child in ('receiver', 'dnsmasq', 'hostapd'):

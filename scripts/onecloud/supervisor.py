@@ -659,6 +659,7 @@ def main():
             print("Bluetooth adapter did not power on; not needed without wireless CarPlay", flush=True)
         print(f"DashPlay services started ({status['mode']})", flush=True)
         lost_since = None
+        link_checked, link_ok = 0.0, True   # one `iw link` per 5 s; the 30 s grace needs no 2 s sampling
         next_scan = time.monotonic() + RESCAN_EVERY
         scan_supported = True
         def phone_live():
@@ -701,7 +702,10 @@ def main():
                 if child.poll() is not None:
                     raise RuntimeError(f"{name} exited with {child.returncode}")
             if status["mode"] == "sta":
-                if platform.connected():
+                now = time.monotonic()
+                if now - link_checked >= 5:
+                    link_checked, link_ok = now, platform.connected()
+                if link_ok:
                     lost_since = None
                 elif lost_since is None:
                     lost_since = time.monotonic()

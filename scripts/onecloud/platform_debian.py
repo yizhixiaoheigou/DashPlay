@@ -290,6 +290,8 @@ class DebianPlatform:
         # The box hotspot runs here: the Wi-Fi interface itself, or AP_VIF next to a car-hotspot client.
         self.ap_interface = interface
         self.children = []
+        self._iw_list, self._iw_list_at = None, 0.0   # shared `iw list` snapshot (iw_list)
+        self._usb_resets, self._usb_resets_at = 0, 0.0   # dmesg resampled at most every 60 s
         self.bluetooth_state = None
 
     ap_vif = AP_VIF
@@ -323,8 +325,12 @@ class DebianPlatform:
             data["mem_mb"] = _number(r"^MemAvailable:\s*(\d+)", meminfo, int) // 1024
         except (OSError, ValueError, TypeError):
             pass
-        kernel = subprocess.run(["dmesg"], capture_output=True, text=True, timeout=5).stdout
-        data["usb_resets"] = kernel.count("USB disconnect")
+        # dmesg holds hundreds of KB when a dongle misbehaves; a 10 s re-count of one substring is waste,
+        # the diagnostics row does not need that granularity. Exceptions here are caught by the caller.
+        if time.monotonic() - self._usb_resets_at > 60:
+            kernel = subprocess.run(["dmesg"], capture_output=True, text=True, timeout=5).stdout
+            self._usb_resets, self._usb_resets_at = kernel.count("USB disconnect"), time.monotonic()
+        data["usb_resets"] = self._usb_resets
         data["link"] = parse_link(self.link())
         data["peers"] = parse_stations(self.ap_iw("station", "dump"))
         if self.ap_interface != self.interface:   # the car hotspot as seen by the client side
@@ -393,10 +399,20 @@ class DebianPlatform:
         except OSError:
             return False
 
+    def iw_list(self):
+        """One `iw list` snapshot shared by concurrent_ap/five_ghz/ap_channel_problem: each used to spawn
+        its own (hundreds of KB parsed, 2-3 times per start or AP rebuild). A driver change shows up
+        within the TTL or after remove_ap_interface."""
+        now = time.monotonic()
+        if self._iw_list is None or now - self._iw_list_at > 300:
+            self._iw_list = subprocess.run(["iw", "list"], capture_output=True, text=True, timeout=10).stdout
+            self._iw_list_at = now
+        return self._iw_list
+
     def concurrent_ap(self):
         """Channels a station and an AP may use at once: 0 none, 1 the same (rtw88 built by
         build-rtw88-concurrent.sh), 2 different ones (MT7921AU)."""
-        return supports_sta_ap(subprocess.run(["iw", "list"], capture_output=True, text=True, timeout=10).stdout)
+        return supports_sta_ap(self.iw_list())
 
     def wired_capable(self, compatible=Path("/proc/device-tree/compatible")):
         """Whether the iPhone can be plugged in: not on a Snapdragon 410 stick, whose only USB port is its plug (device
@@ -407,10 +423,10 @@ class DebianPlatform:
             return True
 
     def five_ghz(self):
-        return five_ghz(subprocess.run(["iw", "list"], capture_output=True, text=True, timeout=10).stdout)
+        return five_ghz(self.iw_list())
 
     def ap_channel_problem(self, freq):
-        return ap_channel_problem(subprocess.run(["iw", "list"], capture_output=True, text=True, timeout=10).stdout, freq)
+        return ap_channel_problem(self.iw_list(), freq)
 
     def add_ap_interface(self):
         """Create AP_VIF beside the station; its MAC is the dongle's with the locally administered bit
@@ -432,6 +448,7 @@ class DebianPlatform:
         if Path("/sys/class/net", AP_VIF).exists():
             subprocess.run(["iw", "dev", AP_VIF, "del"], capture_output=True, timeout=10)
         self.ap_interface = self.interface
+        self._iw_list, self._iw_list_at = None, 0.0   # the radio was reconfigured; ask it again
 
     def iw(self, *args):
         return subprocess.run(["iw", "dev", self.interface, *args], capture_output=True, text=True, timeout=20).stdout
@@ -474,7 +491,7 @@ class DebianPlatform:
         self.start("wpa_supplicant", ["wpa_supplicant", "-D", "nl80211", "-i", self.interface, "-c", str(conf)])
         try:
             wait_for(lambda: subprocess.run(["networkctl", "reload"], capture_output=True,
-                                            timeout=20).returncode == 0, 30, interval=0.25)
+                                            timeout=20).returncode == 0, 30, interval=0.5)
             subprocess.run(["networkctl", "reconfigure", self.interface], capture_output=True, timeout=20)
             joined = lambda: "Connected to" in self.iw("link")
             if known:
@@ -496,13 +513,13 @@ class DebianPlatform:
                     write_conf(None)
                     subprocess.run(["wpa_cli", "-p", str(self.run / "wpa"), "-i", self.interface, "reconfigure"],
                                    capture_output=True, timeout=10)
-                    wait_for(joined, max(1, seconds - JOIN_KNOWN_FREQ_SECONDS), interval=0.25)
+                    wait_for(joined, max(1, seconds - JOIN_KNOWN_FREQ_SECONDS), interval=0.5)
             else:
-                wait_for(joined, seconds, interval=0.25)
+                wait_for(joined, seconds, interval=0.5)
             # rtw88 client power save buffered frames: RTT 6-214 ms, a third of 1400-byte packets
             # lost and browser TLS handshakes stalled (2026-10-10). Box-hotspot mode never enables it.
             self.iw("set", "power_save", "off")
-            wait_for(lambda: self.ipv4_address() is not None, 30, interval=0.2)
+            wait_for(lambda: self.ipv4_address() is not None, 30, interval=0.5)
         except TimeoutError:
             self.stop_child("wpa_supplicant")
             self.remove_sta_network()
@@ -522,7 +539,7 @@ class DebianPlatform:
         subprocess.run(["wpa_cli", "-p", str(self.run / "wpa"), "-i", self.interface, "reassociate"],
                        capture_output=True, timeout=10)
         try:
-            wait_for(lambda: "Connected to" in self.iw("link"), seconds, interval=0.25)
+            wait_for(lambda: "Connected to" in self.iw("link"), seconds, interval=0.5)
             return True
         except TimeoutError:
             return False

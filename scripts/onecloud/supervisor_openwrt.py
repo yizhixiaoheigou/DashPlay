@@ -282,8 +282,13 @@ def shared_lan_conflict(ip_addresses, lan_device, ruleset=None):
     return ""
 
 
+_NET_WARN_CACHE = {"key": None, "warning": ""}
+
+
 def refresh_network_warning(on, lan_device, status, base_warning="", path=None):
-    """Read live routes without changing them; publish only a warning for settings and LuCI."""
+    """Read live routes without changing them; publish only a warning for settings and LuCI. The full
+    `nft list ruleset` dump runs only when the addresses changed: on the 10 s loop it was the most
+    expensive call, and an unchanged warning rewrote its file every time."""
     warning = ""
     if on:
         try:
@@ -291,19 +296,29 @@ def refresh_network_warning(on, lan_device, status, base_warning="", path=None):
                                        capture_output=True, text=True, timeout=5)
             if addresses.returncode:
                 raise OSError("ip failed")
-            try:
-                nft = subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True, timeout=10)
-                ruleset = nft.stdout if nft.returncode == 0 else None
-            except (OSError, subprocess.SubprocessError):
-                ruleset = None
-            warning = shared_lan_conflict(addresses.stdout, lan_device, ruleset)
-            if warning:
-                warning += "。请检查运营商/上游网络；不要反复开关特斯拉模式，避免管理连接中断。"
+            key = (lan_device, addresses.stdout)
+            if key == _NET_WARN_CACHE["key"]:
+                warning = _NET_WARN_CACHE["warning"]
+            else:
+                try:
+                    nft = subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True, timeout=10)
+                    ruleset = nft.stdout if nft.returncode == 0 else None
+                except (OSError, subprocess.SubprocessError):
+                    ruleset = None
+                warning = shared_lan_conflict(addresses.stdout, lan_device, ruleset)
+                if warning:
+                    warning += "。请检查运营商/上游网络；不要反复开关特斯拉模式，避免管理连接中断。"
+                _NET_WARN_CACHE["key"], _NET_WARN_CACHE["warning"] = key, warning
         except (OSError, subprocess.SubprocessError):
             warning = "暂时无法检查特斯拉网段冲突，请检查系统网络状态。"
     status["warning"] = "；".join(x for x in (base_warning, warning) if x)
     path = path or RUN / "network-status.json"
-    setup_wizard.save_json(path, {"warning": status["warning"], "checked_at": int(time.time())})
+    try:
+        previous = json.loads(path.read_text()).get("warning", "")
+    except (OSError, ValueError):
+        previous = None
+    if previous != status["warning"]:
+        setup_wizard.save_json(path, {"warning": status["warning"], "checked_at": int(time.time())})
 
 
 def wait_for_confirm(stopped, seconds=120):

@@ -9,6 +9,7 @@ Markup lives in settings_ui.py; this module holds the behaviour.
 """
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import ipaddress
 import json
 import audio_routes
@@ -18,6 +19,7 @@ import secrets
 import threading
 import time
 import urllib.parse
+import zlib
 
 import debug_uplink
 import own_domain
@@ -75,8 +77,9 @@ def _car_credentials(form, old):
     password = form.get("password", "")
     if not password and old.get("ssid") == ssid:
         password = old.get("passphrase", "")
-    if not 8 <= len(password) <= 63:
-        raise ValueError("热点密码为 8–63 个字符。")
+    # Same WPA rule as the hotspot password: a newline would become its own wpa line.
+    if not (8 <= len(password) <= 63 and all(32 <= ord(c) <= 126 for c in password)):
+        raise ValueError("热点密码为 8–63 个英文字母、数字或符号（可含空格）。")
     return ssid, password
 
 
@@ -222,7 +225,9 @@ class SettingsPage:
             self.scanner.refresh(fresh=True) if hasattr(self.scanner, 'refresh') else self.scanner.results(fresh=True)
 
     def apply_later(self, reason):
-        threading.Timer(APPLY_DELAY, self.on_change, args=(reason,)).start()
+        timer = threading.Timer(APPLY_DELAY, self.on_change, args=(reason,))
+        timer.daemon = True   # a systemd stop within the delay must not wait for the pending apply
+        timer.start()
 
     def start(self, port=80):
         page = self
@@ -243,13 +248,20 @@ class SettingsPage:
                     Handler.allowed_nets, Handler.allowed_at = page.allowed(), time.monotonic()
                 return client.is_loopback or any(client in net for net in Handler.allowed_nets)
 
-            def _send(self, code, body, ctype="text/html; charset=utf-8", extra=None):
+            def _send(self, code, body, ctype="text/html; charset=utf-8", extra=None, cache="no-store"):
                 data = body if isinstance(body, bytes) else body.encode()
+                extra = dict(extra or {})
+                # The pages are large Chinese-text HTML, re-sent on the 3 s auto-refresh: gzip roughly
+                # halves them. Never compress binary bodies (a certificate would not shrink anyway).
+                if (isinstance(body, str) and len(data) > 512
+                        and "gzip" in self.headers.get("Accept-Encoding", "").lower()):
+                    data = zlib.compress(data, 6)
+                    extra["Content-Encoding"] = "gzip"
                 self.send_response(code)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(data)))
-                self.send_header("Cache-Control", "no-store")
-                for k, v in (extra or {}).items():
+                self.send_header("Cache-Control", cache)
+                for k, v in extra.items():
                     self.send_header(k, v)
                 self.end_headers()
                 self.wfile.write(data)
@@ -266,8 +278,12 @@ class SettingsPage:
                 if portal:
                     return self._send(portal[0], portal[1], portal[2], portal[3])
                 if self.path == "/ca.crt" and page.ca_file.exists():
-                    return self._send(200, page.ca_file.read_bytes(), "application/x-x509-ca-cert",
-                                      {"Content-Disposition": 'attachment; filename="dashplay-ca.crt"'})
+                    data = page.ca_file.read_bytes()
+                    etag = '"' + hashlib.sha256(data).hexdigest()[:32] + '"'
+                    extra = {"Content-Disposition": 'attachment; filename="dashplay-ca.crt"', "ETag": etag}
+                    if self.headers.get("If-None-Match") == etag:
+                        return self._send(304, b"", extra=extra, cache="no-cache")
+                    return self._send(200, data, "application/x-x509-ca-cert", extra, cache="no-cache")
                 if self.path == "/audio-routes":
                     try:
                         return self._send(200, json.dumps({'routes': page.sound_routes(), 'nonce': page.pairing.nonce}),
@@ -304,8 +320,19 @@ class SettingsPage:
                 except ValueError as error:
                     result = "错误：" + str(error)
                 if isinstance(result, tuple) and result[0] == 'versions':
-                    host = urllib.parse.urlsplit('http://' + self.headers.get('Host', '')).hostname
-                    if not host:
+                    # The fragment carries the version-manager token: hand it back only to the box itself
+                    # (its address, its mDNS name or its own domain), never wherever a crafted Host points.
+                    host = (urllib.parse.urlsplit('http://' + self.headers.get('Host', '')).hostname or '').lower()
+                    home = (urllib.parse.urlsplit(page.home()).hostname or '').lower()
+                    ddns = own_domain.load(page.state) or {}
+                    own = {home, setup_wizard.MDNS_NAME.lower(), 'dashplay.local',
+                           (own_domain.name_of(ddns) or '').lower()}
+                    try:
+                        ip = ipaddress.ip_address(host)
+                        own_host = ip.is_loopback or any(ip in net for net in page.allowed())
+                    except ValueError:
+                        own_host = host in own
+                    if not host or not own_host:
                         return self._send(400, '无法确定盒子地址')
                     if ':' in host:
                         host = '[' + host + ']'
@@ -353,6 +380,8 @@ class SettingsPage:
             return
         key, now = (name, path.split("?")[0][:100], reply), time.monotonic()
         with self.checks_lock:
+            if len(self.checks_seen) > 64:   # only check names should be here; a flood of crafted paths
+                self.checks_seen.clear()     # would otherwise grow it (and its eMMC log) without bound
             last, repeats = self.checks_seen.get(key, (None, 0))
             if last is not None and now - last < CHECK_LOG_EVERY:
                 self.checks_seen[key] = (last, repeats + 1)

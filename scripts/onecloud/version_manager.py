@@ -175,6 +175,7 @@ def make_server(root, token, address):
     operation = threading.Lock()
     current = [None, 0.0]   # installed version, checked when: /api/status is polled every 3 s and on
                             # OpenWrt each look listed every installed package (apk info, one fork per poll)
+    versions = [None, 0.0]  # release list, 10 min: one click fetched a ~2 MB GitHub listing per call
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -208,7 +209,9 @@ def make_server(root, token, address):
                         'busy': operation.locked() or update.running(root),
                         'progress': update.read(root / 'state/update-status.json')})
                 if self.path == '/api/history':
-                    return self.send(200, {'versions': update.history(root, update.is_openwrt())})
+                    if versions[0] is None or time.monotonic() - versions[1] > 600:
+                        versions[:] = [update.history(root, update.is_openwrt()), time.monotonic()]
+                    return self.send(200, {'versions': versions[0]})
                 self.send(404, {'error': '没有这个页面'})
             except Exception as error:
                 self.send(400, {'error': str(error)})
