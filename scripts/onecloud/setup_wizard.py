@@ -14,6 +14,7 @@ DNS answers every name with the box, so a phone joins without a password and ope
 itself (captive portal). The daily box hotspot is always WPA2 and never captive. Older files migrate:
 a box with a saved car hotspot becomes "car_hotspot".
 """
+import copy
 import ipaddress
 import json
 import os
@@ -53,10 +54,7 @@ CONNMAN_HEADERS = {"X-ConnMan-Status": "online", "X-Cache": "Hit from cloudfront
 
 
 def options(state):
-    try:
-        value = json.loads((Path(state) / "options.json").read_text())
-    except (OSError, ValueError):
-        value = {}
+    value = _read_json(Path(state) / "options.json")
     value = dict(value) if isinstance(value, dict) else {}
     # usb_tether (2026-10-30): the iPhone on the CarPlay cable shares its mobile data (platform_debian.enable_usb_tether).
     if value.get("car_internet") not in ("none", "phone_hotspot", "usb_tether"):
@@ -149,12 +147,33 @@ def tesla_reaches(address):
 MODES = ("car_hotspot", "mifi", "box_hotspot")
 JOINS = ("car_hotspot", "mifi")   # modes in which the box joins a hotspot (state/car-hotspot.json)
 
+_JSON_CACHE = {}   # (path, mtime_ns, size) -> parsed value. The page and the supervisors re-read the
+                   # same handful of small state files dozens of times per render (every 3 s while
+                   # pairing); every hit is one open+read+parse less. Callers get a private deepcopy,
+                   # so the shared cached object can never alias anyone's edits.
+
+
+def _read_json(path):
+    """json.loads with a stat-keyed cache; None when the file is missing or broken."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    hit = _JSON_CACHE.get(key)
+    if hit is None:
+        try:
+            hit = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
+        if len(_JSON_CACHE) > 32:
+            _JSON_CACHE.clear()
+        _JSON_CACHE[key] = hit
+    return copy.deepcopy(hit)
+
 
 def load(state: Path):
-    try:
-        value = json.loads((state / "setup.json").read_text())
-    except (OSError, ValueError):
-        value = None
+    value = _read_json(Path(state) / "setup.json")
     car_saved = (state / "car-hotspot.json").exists()
     if not isinstance(value, dict):
         # Installed before the wizard: set up exactly when a car hotspot is saved.

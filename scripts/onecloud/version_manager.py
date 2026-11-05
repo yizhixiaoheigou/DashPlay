@@ -6,6 +6,7 @@ The independent systemd/procd service survives restarting, downgrading and reboo
 """
 import argparse
 import fcntl
+import hashlib
 import hmac
 import json
 import os
@@ -177,17 +178,23 @@ def make_server(root, token, address):
                             # OpenWrt each look listed every installed package (apk info, one fork per poll)
     versions = [None, 0.0]  # release list, 10 min: one click fetched a ~2 MB GitHub listing per call
 
+    page_etag = '"' + hashlib.sha1(PAGE.encode()).hexdigest()[:16] + '"'
+
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"   # every response carries Content-Length; the page polls /api/status
+
         def log_message(self, *_):
             pass
 
-        def send(self, code, value, html=False):
+        def send(self, code, value, html=False, extra=None):
             data = value.encode() if html else json.dumps(value, ensure_ascii=False).encode()
             self.send_response(code)
             for name, value in {'Content-Type': 'text/html; charset=utf-8' if html else 'application/json',
                                 'Content-Length': str(len(data)), 'Cache-Control': 'no-store',
                                 'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY',
                                 'X-Content-Type-Options': 'nosniff'}.items():
+                self.send_header(name, value)
+            for name, value in (extra or {}).items():
                 self.send_header(name, value)
             self.end_headers()
             self.wfile.write(data)
@@ -197,7 +204,9 @@ def make_server(root, token, address):
 
         def do_GET(self):
             if self.path == '/':
-                return self.send(200, PAGE, True)
+                if self.headers.get('If-None-Match') == page_etag:
+                    return self.send(304, '', extra={'ETag': page_etag})
+                return self.send(200, PAGE, True, extra={'ETag': page_etag})
             if not self.allowed():
                 return self.send(403, {'error': '请从盒子设置重新打开版本选择，或使用之前收藏的完整链接。'})
             try:

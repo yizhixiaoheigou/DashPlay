@@ -220,7 +220,9 @@ class OpenWrtPlatform(DebianPlatform):
         return interface_address(_ubus(f"network.interface.{name}"))[1]
 
     @staticmethod
-    def zone_input(network):
+    def zone_policy(network):
+        """The module-level zone_input(): named apart so the one-argument method cannot be mistaken
+        for the two-argument function it delegates to."""
         out = subprocess.run(["uci", "-q", "show", "firewall"], capture_output=True, text=True, timeout=5).stdout
         return zone_input(out, network)
 

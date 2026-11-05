@@ -311,7 +311,9 @@ def open_tap(mac):
     fd = os.open("/dev/net/tun", os.O_RDWR)
     fcntl.ioctl(fd, TUNSETIFF, struct.pack("16sH", TAP_NAME.encode(), IFF_TAP | IFF_NO_PI))
     subprocess.run(["sysctl", "-qw", f"net.ipv6.conf.{TAP_NAME}.disable_ipv6=0"], capture_output=True)
-    subprocess.run(["ip", "link", "set", TAP_NAME, "address", mac, "up"], check=True)
+    # mtu 1500 keeps every frame within the tap_to_ncm read buffer (2048); a write past it would
+    # end that thread and leave a silent half-bridge.
+    subprocess.run(["ip", "link", "set", TAP_NAME, "address", mac, "mtu", "1500", "up"], check=True)
     subprocess.run(["ip", "-6", "addr", "replace", LINK_LOCAL, "dev", TAP_NAME, "nodad"], check=True)
     return fd
 

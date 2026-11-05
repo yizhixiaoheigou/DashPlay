@@ -662,13 +662,20 @@ def main():
         link_checked, link_ok = 0.0, True   # one `iw link` per 5 s; the 30 s grace needs no 2 s sampling
         next_scan = time.monotonic() + RESCAN_EVERY
         scan_supported = True
+        live_at, live_value = 0.0, False
         def phone_live():
-            presence = load_json("receiver/phone-presence.json") or {}
-            try:
-                wired_live = json.loads(WIRED_STATUS.read_text()).get("phase") == "live"
-            except (OSError, ValueError, AttributeError):
-                wired_live = False
-            return bool(presence.get("active")) or wired_live
+            # Two small file reads per loop tick; the LED and the fallback flag need no 2 s freshness.
+            nonlocal live_at, live_value
+            now = time.monotonic()
+            if now - live_at >= 5:
+                presence = load_json("receiver/phone-presence.json") or {}
+                try:
+                    wired_live = json.loads(WIRED_STATUS.read_text()).get("phase") == "live"
+                except (OSError, ValueError, AttributeError):
+                    wired_live = False
+                live_value = bool(presence.get("active")) or wired_live
+                live_at = now
+            return live_value
 
         # Joining box on its own hotspot = the hotspot was not found (first-run setup excluded).
         fallback = status["mode"] == "ap" and setup.get("done") and bool(car)

@@ -77,8 +77,9 @@ def unblock_rfkill(root=Path("/sys/class/rfkill")):
 
 
 def stop_children(children, timeout=6):
-    """Stop every child (each in its own process group) within one deadline: one after the other, 8 s each,
-    outlasted the supervisor's wait for this helper, which was then killed with the children left running."""
+    """Stop every child (each in its own process group) within one shared 6 s deadline: one after the
+    other. Waiting 8 s per child outlasted the supervisor's wait for this helper, which was then killed
+    with the children left running."""
     for _, child in children:
         if child.poll() is None:
             try:

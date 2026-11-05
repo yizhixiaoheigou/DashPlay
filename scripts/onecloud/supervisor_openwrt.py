@@ -672,7 +672,7 @@ def main():
         if ddns:
             maintainer.append(own_domain.Maintainer(root, ddns, host, stopped, say, tesla=config["tesla_mode"] == "1"))
             maintainer[0].start()
-        if network["mode"] != "ap" and platform.zone_input(network["network"]) not in ("ACCEPT", None):
+        if network["mode"] != "ap" and platform.zone_policy(network["network"]) not in ("ACCEPT", None):
             # A client network usually sits in the wan zone, which rejects the iPhone's AirPlay connections.
             status["warning"] = (f"「{network['ssid']}」所在的防火墙区域拒绝入站连接，iPhone 连不上 DashPlay。"
                                  f"请在 OpenWrt 后台把网络 {network['network']} 放进允许入站的区域，或改用路由器自己的 WiFi。")

@@ -641,5 +641,31 @@ class WpaSupplicantQuotingTests(unittest.TestCase):
             wpa_network_lines("Car\n", "abcdefgh")
 
 
+class ApReadyLogTailTests(unittest.TestCase):
+    """ap_ready() is asked every 2 s by the phone-uplink tick; the hostapd log grows with every
+    association, so it is read as a tail (inode plus offset) and reread from the top only when
+    hostapd rewrites it."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.platform = get_platform('wlan-test', run=self.root)
+
+    def test_ready_follows_the_tail_and_restarts_after_a_rewrite(self):
+        log = self.root / 'hostapd.log'
+        log.write_text('hostapd starting\nAP-ENABLED\n')
+        self.assertTrue(self.platform.ap_ready())
+        with log.open('a') as append:
+            append.write('a station associated\nAP-DISABLED\n')
+        self.assertFalse(self.platform.ap_ready())
+        with log.open('a') as append:
+            append.write('AP-ENABLED\n')
+        self.assertTrue(self.platform.ap_ready())
+        # The next hostapd start truncates and rewrites the same inode: the state must start over.
+        log.write_text('hostapd starting\n')
+        self.assertFalse(self.platform.ap_ready())
+
+
 if __name__ == '__main__':
     unittest.main()

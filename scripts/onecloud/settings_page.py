@@ -18,6 +18,7 @@ from pathlib import Path
 import secrets
 import threading
 import time
+import traceback
 import urllib.parse
 import zlib
 
@@ -238,6 +239,8 @@ class SettingsPage:
             allowed_nets = []
             allowed_at = 0.0
             timeout = 30   # a client that stops mid-request must not hold its thread and socket forever
+            protocol_version = "HTTP/1.1"   # every response carries Content-Length: keep-alive saves
+                                            # the TCP handshake on the 3 s auto-refresh
 
             def log_message(self, *_):   # keep tokens/passwords out of the journal
                 pass
@@ -295,7 +298,12 @@ class SettingsPage:
                                       {"Content-Disposition": 'attachment; filename="dashplay-diag.txt"'})
                 if self.path.split("?")[0] != "/":
                     return self._send(404, "not found")
-                self._send(200, page.render(self.path.partition("?")[2]))
+                try:
+                    html = page.render(self.path.partition("?")[2])
+                except Exception:
+                    traceback.print_exc()   # the journal keeps the cause; the car still gets a page
+                    return self._send(500, "页面渲染出错，详情见盒子日志。")
+                self._send(200, html)
 
             def do_POST(self):
                 if not self._allowed():
@@ -319,20 +327,12 @@ class SettingsPage:
                     result = page.apply(self.path, form)
                 except ValueError as error:
                     result = "错误：" + str(error)
+                except Exception:
+                    traceback.print_exc()
+                    return self._send(500, "操作处理出错，请重试；详情见盒子日志。")
                 if isinstance(result, tuple) and result[0] == 'versions':
-                    # The fragment carries the version-manager token: hand it back only to the box itself
-                    # (its address, its mDNS name or its own domain), never wherever a crafted Host points.
-                    host = (urllib.parse.urlsplit('http://' + self.headers.get('Host', '')).hostname or '').lower()
-                    home = (urllib.parse.urlsplit(page.home()).hostname or '').lower()
-                    ddns = own_domain.load(page.state) or {}
-                    own = {home, setup_wizard.MDNS_NAME.lower(), 'dashplay.local',
-                           (own_domain.name_of(ddns) or '').lower()}
-                    try:
-                        ip = ipaddress.ip_address(host)
-                        own_host = ip.is_loopback or any(ip in net for net in page.allowed())
-                    except ValueError:
-                        own_host = host in own
-                    if not host or not own_host:
+                    host = urllib.parse.urlsplit('http://' + self.headers.get('Host', '')).hostname
+                    if not page.versions_redirect_allowed(host):
                         return self._send(400, '无法确定盒子地址')
                     if ':' in host:
                         host = '[' + host + ']'
@@ -364,6 +364,20 @@ class SettingsPage:
 
     def home(self):
         return self.status().get("home", "/")
+
+    def versions_redirect_allowed(self, host):
+        """The version-manager token rides the redirect fragment: only this box (its address, its mDNS
+        name or its own domain) may receive it, never wherever a crafted Host header points."""
+        host = (host or '').lower()
+        home = (urllib.parse.urlsplit(self.home()).hostname or '').lower()
+        ddns = own_domain.load(self.state) or {}
+        own = {home, setup_wizard.MDNS_NAME.lower(), 'dashplay.local',
+               (own_domain.name_of(ddns) or '').lower()}
+        try:
+            ip = ipaddress.ip_address(host)
+            return bool(host) and (ip.is_loopback or any(ip in net for net in self.allowed()))
+        except ValueError:
+            return bool(host) and host in own
 
     def tesla_check(self, host, path="/"):
         status = self.status()

@@ -76,9 +76,13 @@ def note(state_path, text):
     """Private diagnostics next to the state: command outcome categories, no addresses."""
     try:
         log = state_path.parent / 'presence-errors.log'
-        lines = log.read_text().splitlines()[-19:] if log.exists() else []
-        lines.append(f'{time.monotonic():.1f} {text}')
-        log.write_text('\n'.join(lines) + '\n')
+        # The trim is a read-modify-write: presence runs as several processes, an unlocked run
+        # could lose the other's line (the .lock lives next to the log it guards).
+        with open(state_path.parent / 'presence-errors.lock', 'a+') as gate:
+            fcntl.flock(gate, fcntl.LOCK_EX)
+            lines = log.read_text().splitlines()[-19:] if log.exists() else []
+            lines.append(f'{time.monotonic():.1f} {text}')
+            log.write_text('\n'.join(lines) + '\n')
     except OSError:
         pass
 
