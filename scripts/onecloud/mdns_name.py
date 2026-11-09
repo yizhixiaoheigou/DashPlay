@@ -6,6 +6,7 @@ answers the host name itself, with the address of whichever local subnet the que
 import ipaddress
 import socket
 import struct
+import time
 from platform_api import get_platform
 import threading
 
@@ -74,8 +75,12 @@ class NameResponder:
         joined = set()
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
         sock.settimeout(2)
+        addresses, addresses_at = [], 0.0
         while not self.stopped.is_set():
-            addresses = local_addresses()
+            # The loop wakes every 2 s on the recv timeout; an `ip -4 -o addr` per wake was a fork
+            # twice a second for ever. Membership joins and answers do not need 2 s fresh addresses.
+            if time.monotonic() - addresses_at >= 30:
+                addresses, addresses_at = local_addresses(), time.monotonic()
             for local in addresses:
                 if local.ip not in joined:
                     try:

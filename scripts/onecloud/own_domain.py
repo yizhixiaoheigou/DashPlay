@@ -362,14 +362,28 @@ def _openssl(*args):
     return subprocess.run(["openssl", *args], capture_output=True, text=True, timeout=30)
 
 
+_CERT_CACHE = {}   # (chain, mtime_ns, name, days) -> (result, monotonic when): the settings page asks
+                   # certificate_for several times per render (every 3 s while pairing), each an openssl run
+
+
 def certificate_for(state, name, days=0):
     """The installed certificate is for name and stays valid `days` more."""
     chain = Path(state) / "tls" / "own" / "fullchain.pem"
-    if not chain.exists():
+    try:
+        mtime = chain.stat().st_mtime_ns
+    except OSError:
         return False
+    key = (str(chain), mtime, name, days)
+    hit = _CERT_CACHE.get(key)
+    if hit and time.monotonic() - hit[1] < 60:
+        return hit[0]
     host = _openssl("x509", "-noout", "-checkhost", name, "-in", str(chain))
-    return "does match" in host.stdout and _openssl(
-        "x509", "-noout", "-checkend", str(days * 86400), "-in", str(chain)).returncode == 0
+    result = ("does match" in host.stdout and _openssl(
+        "x509", "-noout", "-checkend", str(days * 86400), "-in", str(chain)).returncode == 0)
+    if len(_CERT_CACHE) > 16:   # a replaced certificate changes the mtime, and so the key
+        _CERT_CACHE.clear()
+    _CERT_CACHE[key] = (result, time.monotonic())
+    return result
 
 
 def end_date(state):
@@ -493,6 +507,7 @@ class Maintainer(threading.Thread):
         self.sent, self.sent_at = None, 0.0   # (address, ipv6) last accepted by DuckDNS, and when
         self.failures = 0                     # consecutive obtain() failures, for the retry ladder
         self.retry = threading.Event()        # "重新申请证书" from the settings page, or a new uplink
+        self.guarded, self.guarded_at = None, 0.0   # (address, prefix) the nft guard last accepted, and when
 
     def request_retry(self):
         """Ask for an attempt now: the waiting loop is cut short and the certificate is looked at again."""
@@ -505,7 +520,12 @@ class Maintainer(threading.Thread):
         found = public_ipv6(self.interface)
         if not found:
             return None, "none"
-        return (found[0], "ok") if guard(*found) else (None, "firewall")
+        if self.guarded == found and time.monotonic() - self.guarded_at < 600:
+            return found[0], "ok"   # the rule set tracks the address; re-assert it only now and then
+        ok = guard(*found)
+        if ok:
+            self.guarded, self.guarded_at = found, time.monotonic()
+        return (found[0], "ok") if ok else (None, "firewall")
 
     def run(self):
         next_record = next_cert = time.monotonic()
@@ -570,7 +590,12 @@ class Maintainer(threading.Thread):
 
     def check_certificate(self):
         """Seconds until the next look."""
-        if certificate_for(self.state, self.name, RENEW_DAYS):
+        try:
+            # As below with network_ready: openssl missing or stuck must not end the renewals for good.
+            ready = certificate_for(self.state, self.name, RENEW_DAYS)
+        except (OSError, subprocess.SubprocessError):
+            return CERT_CHECK
+        if ready:
             write_status(self.state, name=self.name, phase="ready", reason="")
             return CERT_CHECK
         try:
@@ -580,7 +605,10 @@ class Maintainer(threading.Thread):
         if missing:   # boot, access point rebuilding, uplink not up yet: not a failure, look again shortly
             write_status(self.state, name=self.name, phase="waiting", reason=missing)
             return READY_RETRY
-        renewing = certificate_for(self.state, self.name)
+        try:
+            renewing = certificate_for(self.state, self.name)
+        except (OSError, subprocess.SubprocessError):
+            return CERT_CHECK
         write_status(self.state, name=self.name, phase="renewing" if renewing else "issuing", reason="")
         log = self.state / "acme" / "acme.log"
         before = log.stat().st_mtime_ns if log.exists() else None

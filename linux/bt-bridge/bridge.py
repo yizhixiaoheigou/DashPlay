@@ -148,9 +148,10 @@ async def recover_stale_link(bus, adapter, target):
             try:
                 age = now - float(previous)
             except ValueError:
-                return False
-            if 0 <= age < 120:
-                return False
+                pass   # a half-written stamp must not block recovery for ever
+            else:
+                if 0 <= age < 120:
+                    return False
         objects = (await call(bus, '/', 'org.freedesktop.DBus.ObjectManager',
                               'GetManagedObjects', timeout=5))[0]
         props = properties(objects, target, DEVICE)

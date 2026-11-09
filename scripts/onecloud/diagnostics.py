@@ -38,8 +38,9 @@ class DiagLog:
             self.current.replace(self.previous)
         fd = os.open(self.current, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
+            # No fsync per row: this fires every 10 s plus every Tesla check, and a row that reaches
+            # the disk on the kernel's writeback instead of immediately is diagnostics enough.
             os.write(fd, (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode())
-            os.fsync(fd)
         finally:
             os.close(fd)
 
@@ -112,7 +113,10 @@ class LogMirror:
             data = data[:LOG_FILE_MAX - size] + b"\n[log mirror: size limit reached]\n"
         fd = handles.get(name)
         if fd is None:
-            fd = handles[name] = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            # O_CLOEXEC: the supervisor re-execs itself on network changes; the mirror's handles must not
+            # leak into every following process (they were inheritable os.open descriptors).
+            fd = handles[name] = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND |
+                                         getattr(os, "O_CLOEXEC", 0), 0o600)
         os.write(fd, data)
 
     def cycle(self, offsets, handles):

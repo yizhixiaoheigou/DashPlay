@@ -175,3 +175,24 @@ class SelectedReleaseTests(unittest.TestCase):
             tar.addfile(entry, io.BytesIO(data))
         version_manager.recover_previous(self.root)
         self.assertEqual(update.read(target), {'version': '2026.10.29', 'installed': '2026.11.02'})
+
+
+class PageServingTests(unittest.TestCase):
+    def test_page_answers_with_an_etag_and_304s_on_a_match(self):
+        import tempfile
+        from pathlib import Path
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        server = version_manager.make_server(Path(tmp.name), 'synthetic-token', ('127.0.0.1', 0))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        base = f'http://127.0.0.1:{server.server_port}/'
+        with urllib.request.urlopen(base, timeout=5) as first:
+            etag = first.headers.get('ETag')
+        self.assertTrue(etag)
+        request = urllib.request.Request(base, headers={'If-None-Match': etag})
+        try:
+            urllib.request.urlopen(request, timeout=5)
+            self.fail('expected 304')
+        except urllib.error.HTTPError as error:
+            self.assertEqual(error.code, 304)

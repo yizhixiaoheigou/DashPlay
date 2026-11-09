@@ -67,6 +67,14 @@ def derived_address(key, purpose):
     return ":".join(f"{b:02x}" for b in raw)
 
 
+def signal_group(pid, sig):
+    """Signal a child's process group; it may exit between poll() and here (ESRCH; board_zte_f50 catches the same)."""
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        pass
+
+
 def ap_width(channel, width):
     """The widest of width that the channel allows: 2.4 GHz and channel 165 have no 80 MHz block."""
     if channel <= 14 or channel == 165:
@@ -114,8 +122,11 @@ def hostapd_config(interface, channel, width, ssid, passphrase, country="CN"):
             # 149/157 pair upward, 153/161 downward; 165 has no 40 MHz partner.
             lines.append("ht_capab=[HT40+]" if channel in (36, 44, 149, 157) else "ht_capab=[HT40-]")
         if width == 80:
-            centre = {149: 155, 153: 155, 157: 155, 161: 155, 36: 42, 40: 42, 44: 42, 48: 42}[channel]
-            lines += ["vht_oper_chwidth=1", f"vht_oper_centr_freq_seg0_idx={centre}"]
+            # The DFS channels (52-144) have no 80 MHz block here: fall back to 40 MHz instead of failing
+            # (a channel out of the map once restarted the service in a loop over one config line).
+            centre = {149: 155, 153: 155, 157: 155, 161: 155, 36: 42, 40: 42, 44: 42, 48: 42}.get(channel)
+            if centre:
+                lines += ["vht_oper_chwidth=1", f"vht_oper_centr_freq_seg0_idx={centre}"]
     return "\n".join(lines) + "\n"
 
 def supports_sta_ap(iw_list):
@@ -279,6 +290,8 @@ class DebianPlatform:
         # The box hotspot runs here: the Wi-Fi interface itself, or AP_VIF next to a car-hotspot client.
         self.ap_interface = interface
         self.children = []
+        self._iw_list, self._iw_list_at = None, 0.0   # shared `iw list` snapshot (iw_list)
+        self._usb_resets, self._usb_resets_at = 0, 0.0   # dmesg resampled at most every 60 s
         self.bluetooth_state = None
 
     ap_vif = AP_VIF
@@ -312,8 +325,12 @@ class DebianPlatform:
             data["mem_mb"] = _number(r"^MemAvailable:\s*(\d+)", meminfo, int) // 1024
         except (OSError, ValueError, TypeError):
             pass
-        kernel = subprocess.run(["dmesg"], capture_output=True, text=True, timeout=5).stdout
-        data["usb_resets"] = kernel.count("USB disconnect")
+        # dmesg holds hundreds of KB when a dongle misbehaves; a 10 s re-count of one substring is waste,
+        # the diagnostics row does not need that granularity. Exceptions here are caught by the caller.
+        if time.monotonic() - self._usb_resets_at > 60:
+            kernel = subprocess.run(["dmesg"], capture_output=True, text=True, timeout=5).stdout
+            self._usb_resets, self._usb_resets_at = kernel.count("USB disconnect"), time.monotonic()
+        data["usb_resets"] = self._usb_resets
         data["link"] = parse_link(self.link())
         data["peers"] = parse_stations(self.ap_iw("station", "dump"))
         if self.ap_interface != self.interface:   # the car hotspot as seen by the client side
@@ -348,11 +365,11 @@ class DebianPlatform:
             if entry[0] == name:
                 self.children.remove(entry)
                 if entry[1].poll() is None:
-                    os.killpg(entry[1].pid, signal.SIGTERM)
+                    signal_group(entry[1].pid, signal.SIGTERM)
                     try:
                         entry[1].wait(timeout=8)
                     except subprocess.TimeoutExpired:
-                        os.killpg(entry[1].pid, signal.SIGKILL)
+                        signal_group(entry[1].pid, signal.SIGKILL)
                         entry[1].wait()
 
     def check_lan_children(self):
@@ -373,19 +390,49 @@ class DebianPlatform:
         # hostapd's own word only. Realtek's 8821cu driver (concurrent STA + AP build) reports no channel
         # for an AP while its station interface is idle (2026-10-11), and the N1's brcmfmac reports type
         # AP with a channel as soon as hostapd starts, before it fails on an 80 MHz channel (2026-10-12):
-        # iw cannot tell. The log is rewritten on every start.
+        # iw cannot tell. The log is rewritten on every start (a new inode), so the tail is read
+        # incrementally: the phone-uplink tick asks every 2 s and the file grows with every association.
         if any(name == 'hostapd' and child.poll() is not None for name, child in self.children):
             return False
+        path = self.run / "hostapd.log"
         try:
-            log = (self.run / "hostapd.log").read_text(errors="replace")
-            return log.rfind('AP-ENABLED') > log.rfind('AP-DISABLED')
+            stat = path.stat()
+        except OSError:
+            self._ap_log = None
+            return False
+        state = getattr(self, '_ap_log', None)
+        if state and state[0] == stat.st_ino and state[1] <= stat.st_size:
+            inode, offset, enabled = state
+        else:   # rewritten, rotated or truncated: start over
+            inode, offset, enabled = stat.st_ino, 0, False
+        try:
+            with path.open('rb') as log:
+                log.seek(offset)
+                for line in log:
+                    if b'AP-ENABLED' in line:
+                        enabled = True
+                    elif b'AP-DISABLED' in line:
+                        enabled = False
+                offset = log.tell()
         except OSError:
             return False
+        self._ap_log = (inode, offset, enabled)
+        return enabled
+
+    def iw_list(self):
+        """One `iw list` snapshot shared by concurrent_ap/five_ghz/ap_channel_problem: each used to spawn
+        its own (hundreds of KB parsed, 2-3 times per start or AP rebuild). A driver change shows up
+        within the TTL or after remove_ap_interface."""
+        now = time.monotonic()
+        if self._iw_list is None or now - self._iw_list_at > 300:
+            self._iw_list = subprocess.run(["iw", "list"], capture_output=True, text=True, timeout=10).stdout
+            self._iw_list_at = now
+        return self._iw_list
 
     def concurrent_ap(self):
         """Channels a station and an AP may use at once: 0 none, 1 the same (rtw88 built by
         build-rtw88-concurrent.sh), 2 different ones (MT7921AU)."""
-        return supports_sta_ap(subprocess.run(["iw", "list"], capture_output=True, text=True, timeout=10).stdout)
+        return supports_sta_ap(self.iw_list())
 
     def wired_capable(self, compatible=Path("/proc/device-tree/compatible")):
         """Whether the iPhone can be plugged in: not on a Snapdragon 410 stick, whose only USB port is its plug (device
@@ -396,10 +443,10 @@ class DebianPlatform:
             return True
 
     def five_ghz(self):
-        return five_ghz(subprocess.run(["iw", "list"], capture_output=True, text=True, timeout=10).stdout)
+        return five_ghz(self.iw_list())
 
     def ap_channel_problem(self, freq):
-        return ap_channel_problem(subprocess.run(["iw", "list"], capture_output=True, text=True, timeout=10).stdout, freq)
+        return ap_channel_problem(self.iw_list(), freq)
 
     def add_ap_interface(self):
         """Create AP_VIF beside the station; its MAC is the dongle's with the locally administered bit
@@ -421,6 +468,7 @@ class DebianPlatform:
         if Path("/sys/class/net", AP_VIF).exists():
             subprocess.run(["iw", "dev", AP_VIF, "del"], capture_output=True, timeout=10)
         self.ap_interface = self.interface
+        self._iw_list, self._iw_list_at = None, 0.0   # the radio was reconfigured; ask it again
 
     def iw(self, *args):
         return subprocess.run(["iw", "dev", self.interface, *args], capture_output=True, text=True, timeout=20).stdout
@@ -463,7 +511,7 @@ class DebianPlatform:
         self.start("wpa_supplicant", ["wpa_supplicant", "-D", "nl80211", "-i", self.interface, "-c", str(conf)])
         try:
             wait_for(lambda: subprocess.run(["networkctl", "reload"], capture_output=True,
-                                            timeout=20).returncode == 0, 30, interval=0.25)
+                                            timeout=20).returncode == 0, 30, interval=0.5)
             subprocess.run(["networkctl", "reconfigure", self.interface], capture_output=True, timeout=20)
             joined = lambda: "Connected to" in self.iw("link")
             if known:
@@ -485,13 +533,13 @@ class DebianPlatform:
                     write_conf(None)
                     subprocess.run(["wpa_cli", "-p", str(self.run / "wpa"), "-i", self.interface, "reconfigure"],
                                    capture_output=True, timeout=10)
-                    wait_for(joined, max(1, seconds - JOIN_KNOWN_FREQ_SECONDS), interval=0.25)
+                    wait_for(joined, max(1, seconds - JOIN_KNOWN_FREQ_SECONDS), interval=0.5)
             else:
-                wait_for(joined, seconds, interval=0.25)
+                wait_for(joined, seconds, interval=0.5)
             # rtw88 client power save buffered frames: RTT 6-214 ms, a third of 1400-byte packets
             # lost and browser TLS handshakes stalled (2026-10-10). Box-hotspot mode never enables it.
             self.iw("set", "power_save", "off")
-            wait_for(lambda: self.ipv4_address() is not None, 30, interval=0.2)
+            wait_for(lambda: self.ipv4_address() is not None, 30, interval=0.5)
         except TimeoutError:
             self.stop_child("wpa_supplicant")
             self.remove_sta_network()
@@ -511,7 +559,7 @@ class DebianPlatform:
         subprocess.run(["wpa_cli", "-p", str(self.run / "wpa"), "-i", self.interface, "reassociate"],
                        capture_output=True, timeout=10)
         try:
-            wait_for(lambda: "Connected to" in self.iw("link"), seconds, interval=0.25)
+            wait_for(lambda: "Connected to" in self.iw("link"), seconds, interval=0.5)
             return True
         except TimeoutError:
             return False
@@ -1092,8 +1140,12 @@ class DebianPlatform:
             return
         ap, self.ap_interface = self.ap_interface, saved.get('interface') or self.ap_interface
         try:
-            for table, rule in reversed(self.usb_tether_rules(ipaddress.ip_network(saved['network']))):
-                subprocess.run(['iptables', *table, '-D', *rule], capture_output=True, timeout=5)
+            if saved.get('network'):
+                for table, rule in reversed(self.usb_tether_rules(ipaddress.ip_network(saved['network']))):
+                    subprocess.run(['iptables', *table, '-D', *rule], capture_output=True, timeout=5)
+        except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
+            # A damaged journal must not take the service down; sharing is best undone, not guaranteed.
+            print(f"usb sharing cleanup incomplete: {type(error).__name__}", flush=True)
         finally:
             self.ap_interface = ap
         subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=' + str(saved.get('forward', '0'))],
@@ -1111,35 +1163,45 @@ class DebianPlatform:
             subprocess.run(['iptables', *table, '-I', *rule], check=True, capture_output=True, timeout=5)
 
     def cleanup_phone_uplink(self):
+        """Undo a previous boot's phone uplink. Best effort: a journal left by a crash names an interface that
+        may be gone (another dongle), and one failed restore must not restart-loop the whole service."""
         path = self.run / 'phone-uplink.json'
-        if not path.exists():
+        try:
+            saved = json.loads(path.read_text())
+        except (OSError, ValueError):
+            path.unlink(missing_ok=True)
             return
-        saved = json.loads(path.read_text())
-        self.stop_child('wpa_supplicant')
-        self.remove_sta_network()
-        if saved.get('network'):
-            for table, rule in reversed(self.phone_nat_rules(ipaddress.ip_network(saved['network']))):
-                subprocess.run(['iptables', *table, '-D', *rule], capture_output=True, timeout=5)
-        subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=' + saved['forward']],
-                       capture_output=True, check=True, timeout=5)
-        subprocess.run(['iw', 'dev', 'ap0', 'del'], capture_output=True, timeout=5)
-        for args in (['down'], ['address', saved['mac']]):
-            subprocess.run(['ip', 'link', 'set', 'dev', saved['interface'], *args],
-                           check=True, capture_output=True, timeout=5)
-        subprocess.run(['ip', 'addr', 'flush', 'dev', saved['interface']], check=True, capture_output=True, timeout=5)
-        self.ap_interface = self.interface
-        path.unlink()
+        try:
+            self.stop_child('wpa_supplicant')
+            self.remove_sta_network()
+            if saved.get('network'):
+                for table, rule in reversed(self.phone_nat_rules(ipaddress.ip_network(saved['network']))):
+                    subprocess.run(['iptables', *table, '-D', *rule], capture_output=True, timeout=5)
+            subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=' + str(saved.get('forward', '0'))],
+                           capture_output=True, timeout=5)
+            subprocess.run(['iw', 'dev', 'ap0', 'del'], capture_output=True, timeout=5)
+            interface = saved.get('interface')
+            if interface:
+                for args in (['down'], ['address', saved.get('mac', '')]):
+                    subprocess.run(['ip', 'link', 'set', 'dev', interface, *args],
+                                   capture_output=True, timeout=5)
+                subprocess.run(['ip', 'addr', 'flush', 'dev', interface], capture_output=True, timeout=5)
+        except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
+            print(f"phone uplink cleanup incomplete: {type(error).__name__}", flush=True)
+        finally:
+            self.ap_interface = self.interface
+            path.unlink(missing_ok=True)
 
     def stop_all(self):
         for name, child in reversed(self.children):
             if child.poll() is None:
-                os.killpg(child.pid, signal.SIGTERM)
+                signal_group(child.pid, signal.SIGTERM)
                 try:
                     # The JVM writes its AppCDS archive while exiting; that took longer than 8 s here. A board's
                     # Bluetooth helper stops its own children within 6 s (board_zte_f50.py).
                     child.wait(timeout={"receiver": 40, "bluetooth": 15}.get(name, 8))
                 except subprocess.TimeoutExpired:
-                    os.killpg(child.pid, signal.SIGKILL)
+                    signal_group(child.pid, signal.SIGKILL)
                     child.wait()
 
     def join_log(self):

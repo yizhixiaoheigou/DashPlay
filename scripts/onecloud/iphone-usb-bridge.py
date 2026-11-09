@@ -17,6 +17,7 @@ import fcntl
 import glob
 import os
 from pathlib import Path
+import select
 import struct
 import subprocess
 import sys
@@ -84,9 +85,21 @@ def control_in(fd, request_type, request, value, index, length):
     return buffer.raw
 
 
+_THREAD = threading.local()
+
+
 def bulk(fd, endpoint, data=None, length=READ_CHUNK, timeout=1000):
-    buffer = ctypes.create_string_buffer(data if data is not None else length, len(data) if data is not None else length)
-    request = struct.pack(BULK_STRUCT, endpoint, len(buffer), timeout, ctypes.addressof(buffer))
+    if data is None:
+        # Reuse one read buffer per thread: the from_phone and NCM threads call here for every
+        # USBMUX packet or 64 KB block, each with a fresh ctypes allocation and raw copy otherwise.
+        buffer = getattr(_THREAD, 'bulk_buffer', None)
+        if buffer is None or len(buffer) < length:
+            buffer = _THREAD.bulk_buffer = ctypes.create_string_buffer(length)
+        size = length
+    else:
+        buffer = ctypes.create_string_buffer(data, len(data))
+        size = len(buffer)
+    request = struct.pack(BULK_STRUCT, endpoint, size, timeout, ctypes.addressof(buffer))
     count = fcntl.ioctl(fd, USBDEVFS_BULK, bytearray(request))
     return buffer.raw[:count] if data is None else count
 
@@ -298,7 +311,9 @@ def open_tap(mac):
     fd = os.open("/dev/net/tun", os.O_RDWR)
     fcntl.ioctl(fd, TUNSETIFF, struct.pack("16sH", TAP_NAME.encode(), IFF_TAP | IFF_NO_PI))
     subprocess.run(["sysctl", "-qw", f"net.ipv6.conf.{TAP_NAME}.disable_ipv6=0"], capture_output=True)
-    subprocess.run(["ip", "link", "set", TAP_NAME, "address", mac, "up"], check=True)
+    # mtu 1500 keeps every frame within the tap_to_ncm read buffer (2048); a write past it would
+    # end that thread and leave a silent half-bridge.
+    subprocess.run(["ip", "link", "set", TAP_NAME, "address", mac, "mtu", "1500", "up"], check=True)
     subprocess.run(["ip", "-6", "addr", "replace", LINK_LOCAL, "dev", TAP_NAME, "nodad"], check=True)
     return fd
 
@@ -314,7 +329,13 @@ def prepare_carplay(serial, off, stream=None, environ=None):
     state = 'tether' if off else ('prepare' if needs_ack else 'iphone')
     log(f'usb {state} {serial}'.strip())
     if needs_ack:
-        reply = (sys.stdin.buffer if stream is None else stream).read(4)
+        source = sys.stdin.buffer if stream is None else stream
+        reply = b''
+        try:   # a stuck receiver must not hold the USB role for ever; BytesIO (tests) has no fileno
+            if select.select([source], [], [], 10)[0]:
+                reply = source.read(4)
+        except (OSError, ValueError, TypeError, AttributeError):
+            reply = source.read(4)
         if reply != b'RDY!':
             raise RuntimeError('receiver did not confirm USB CarPlay preparation')
         off = cable_carplay_off(environ)
@@ -351,7 +372,15 @@ def relay_usbmux(fd, mux):
         if len(header) < 4:
             return 0
         (length,) = struct.unpack(">I", header)
+        if not 0 < length <= 1 << 20:
+            # A corrupted stream must not ask for gigabytes (an ARM box has one or two): leave and let the
+            # receiver restart the bridge rather than hang on a read that never completes.
+            log(f"USBMUX frame length {length} out of range")
+            return 1
         data = stdin.read(length)
+        if len(data) < length:
+            log("USBMUX stream ended mid-frame")
+            return 0
         try:
             bulk(fd, out_ep, data, timeout=2000)
         except OSError as error:
@@ -441,12 +470,22 @@ def main():
                 if len(frame) >= 12 and behind.get(frame[6:12]) != index:
                     behind[frame[6:12]] = index
                     log(f"NCM peer {frame[6:12].hex(':')} on function {functions[index][0]}")
-                os.write(tap, frame)
+                try:
+                    os.write(tap, frame)
+                except OSError as error:
+                    # A dead TAP must not leave a silent half-bridge (a frame larger than the MTU ends here too):
+                    # leave, so that the receiver restarts the whole bridge.
+                    log(f"TAP write ended: {error.strerror}")
+                    os._exit(0)
 
     def tap_to_ncm():
         sent, timed_out = [0] * len(functions), [0] * len(functions)
         while True:
-            frame = os.read(tap, 2048)
+            try:
+                frame = os.read(tap, 2048)
+            except OSError as error:
+                log(f"TAP read ended: {error.strerror}")
+                os._exit(0)
             target = behind.get(frame[:6]) if not frame[0] & 1 else None
             for index in ([target] if target is not None else range(len(functions))):
                 try:

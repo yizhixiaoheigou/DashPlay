@@ -54,6 +54,18 @@ class PhoneUplinkTests(unittest.TestCase):
         self.u.tick()
         self.assertEqual(self.u.phase, 'online')
 
+    def test_steady_uplink_probes_the_address_and_gateway_every_fifth_tick(self):
+        # A steady connection answers the same for 10 s; the 2 s tick probes `ip -j addr`/`ip -j
+        # route` per 10 s once both are up, and still immediately while they are missing.
+        self.boot()
+        self.connected()
+        calls = self.p.phone_station_address.call_count
+        for _ in range(8):
+            self.connected()
+        self.assertEqual(self.u.phase, 'online')
+        self.assertLessEqual(self.p.phone_station_address.call_count - calls, 2,
+                             'a steady connection must not fork one probe per 2 s tick')
+
     def test_boot_on_discovered_channel_starts_receiver_only_once(self):
         self.boot(5805)
         self.receiver.assert_called_once_with(161)

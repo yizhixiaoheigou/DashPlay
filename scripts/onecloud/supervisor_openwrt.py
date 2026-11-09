@@ -282,8 +282,13 @@ def shared_lan_conflict(ip_addresses, lan_device, ruleset=None):
     return ""
 
 
+_NET_WARN_CACHE = {"key": None, "warning": ""}
+
+
 def refresh_network_warning(on, lan_device, status, base_warning="", path=None):
-    """Read live routes without changing them; publish only a warning for settings and LuCI."""
+    """Read live routes without changing them; publish only a warning for settings and LuCI. The full
+    `nft list ruleset` dump runs only when the addresses changed: on the 10 s loop it was the most
+    expensive call, and an unchanged warning rewrote its file every time."""
     warning = ""
     if on:
         try:
@@ -291,19 +296,29 @@ def refresh_network_warning(on, lan_device, status, base_warning="", path=None):
                                        capture_output=True, text=True, timeout=5)
             if addresses.returncode:
                 raise OSError("ip failed")
-            try:
-                nft = subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True, timeout=10)
-                ruleset = nft.stdout if nft.returncode == 0 else None
-            except (OSError, subprocess.SubprocessError):
-                ruleset = None
-            warning = shared_lan_conflict(addresses.stdout, lan_device, ruleset)
-            if warning:
-                warning += "。请检查运营商/上游网络；不要反复开关特斯拉模式，避免管理连接中断。"
+            key = (lan_device, addresses.stdout)
+            if key == _NET_WARN_CACHE["key"]:
+                warning = _NET_WARN_CACHE["warning"]
+            else:
+                try:
+                    nft = subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True, timeout=10)
+                    ruleset = nft.stdout if nft.returncode == 0 else None
+                except (OSError, subprocess.SubprocessError):
+                    ruleset = None
+                warning = shared_lan_conflict(addresses.stdout, lan_device, ruleset)
+                if warning:
+                    warning += "。请检查运营商/上游网络；不要反复开关特斯拉模式，避免管理连接中断。"
+                _NET_WARN_CACHE["key"], _NET_WARN_CACHE["warning"] = key, warning
         except (OSError, subprocess.SubprocessError):
             warning = "暂时无法检查特斯拉网段冲突，请检查系统网络状态。"
     status["warning"] = "；".join(x for x in (base_warning, warning) if x)
     path = path or RUN / "network-status.json"
-    setup_wizard.save_json(path, {"warning": status["warning"], "checked_at": int(time.time())})
+    try:
+        previous = json.loads(path.read_text()).get("warning", "")
+    except (OSError, ValueError):
+        previous = None
+    if previous != status["warning"]:
+        setup_wizard.save_json(path, {"warning": status["warning"], "checked_at": int(time.time())})
 
 
 def wait_for_confirm(stopped, seconds=120):
@@ -560,20 +575,24 @@ def main():
         # The JVM needs several seconds before it first invites the iPhone: start it on what the Wi-Fi
         # configuration says while the radio comes up, and check it against the live Wi-Fi below.
         early = None
+        planned = None
         if have_identity:
             early, _ = platform.handoff(config["wifi"], live=False, external=config)
             if early:
                 ensure_leaf(state, [config["name"], setup_wizard.MDNS_NAME], [str(early["address"].ip)])
                 launch(early, has_bluez, wait=True)
                 mark(f"receiver launched early for {early['ssid']}")
+            planned = early   # the same look below would run the same three commands again
+        else:
+            planned = platform.handoff(config["wifi"], live=False, external=config)[0]
 
         # The Wi-Fi comes up some seconds after procd starts us; wait for it rather than fail. The settings page
         # opens meanwhile, so that a Wi-Fi that never comes up (the router's own switched off) still leaves a page
         # saying why (2026-10-19).
         reason = ""
         network = None
-        planned = early or platform.handoff(config["wifi"], live=False, external=config)[0]
         settings_open = False
+        waited = 0
         while not stopped.is_set():
             network, why = platform.handoff(config["wifi"], external=config)
             if network:
@@ -593,7 +612,11 @@ def main():
                 settings_open = True
                 say(f"settings page open on {host} while waiting for the Wi-Fi")
                 continue
-            stopped.wait(1)
+            # A Wi-Fi still down after half a minute is off or misconfigured, not slow: each look runs two
+            # ubus calls and an iw, far too often to keep up at 1 Hz for hours (F50, review 2026-11-04).
+            interval = 1 if waited < 30 else 5
+            stopped.wait(interval)
+            waited += interval
         if stopped.is_set():
             raise InterruptedError("Service stopping")
         status.pop("warning", None)
@@ -649,7 +672,7 @@ def main():
         if ddns:
             maintainer.append(own_domain.Maintainer(root, ddns, host, stopped, say, tesla=config["tesla_mode"] == "1"))
             maintainer[0].start()
-        if network["mode"] != "ap" and platform.zone_input(network["network"]) not in ("ACCEPT", None):
+        if network["mode"] != "ap" and platform.zone_policy(network["network"]) not in ("ACCEPT", None):
             # A client network usually sits in the wan zone, which rejects the iPhone's AirPlay connections.
             status["warning"] = (f"「{network['ssid']}」所在的防火墙区域拒绝入站连接，iPhone 连不上 DashPlay。"
                                  f"请在 OpenWrt 后台把网络 {network['network']} 放进允许入站的区域，或改用路由器自己的 WiFi。")
@@ -686,12 +709,15 @@ def main():
         say(f"DashPlay services started on {network['ssid']} ({host}, channel {network['channel']})")
         plan = plan_of(network)
         next_check = time.monotonic() + RECHECK_EVERY
+        sound_retry_at = 0.0
         while not stopped.wait(2):
-            if receiver_refresh:
+            if receiver_refresh and time.monotonic() >= sound_retry_at:
                 receiver_refresh.clear()
                 try:
                     latest = audio_routes.read_uci()
                 except ValueError:
+                    # A broken uci otherwise answered with a fork and two log lines every 2 s.
+                    sound_retry_at = time.monotonic() + 30
                     say('Sound settings unavailable; keeping receiver running and retrying')
                     receiver_refresh.append('receiver options changed')
                 else:

@@ -9,6 +9,7 @@ Markup lives in settings_ui.py; this module holds the behaviour.
 """
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import ipaddress
 import json
 import audio_routes
@@ -17,7 +18,9 @@ from pathlib import Path
 import secrets
 import threading
 import time
+import traceback
 import urllib.parse
+import zlib
 
 import debug_uplink
 import own_domain
@@ -75,8 +78,9 @@ def _car_credentials(form, old):
     password = form.get("password", "")
     if not password and old.get("ssid") == ssid:
         password = old.get("passphrase", "")
-    if not 8 <= len(password) <= 63:
-        raise ValueError("热点密码为 8–63 个字符。")
+    # Same WPA rule as the hotspot password: a newline would become its own wpa line.
+    if not (8 <= len(password) <= 63 and all(32 <= ord(c) <= 126 for c in password)):
+        raise ValueError("热点密码为 8–63 个英文字母、数字或符号（可含空格）。")
     return ssid, password
 
 
@@ -222,26 +226,45 @@ class SettingsPage:
             self.scanner.refresh(fresh=True) if hasattr(self.scanner, 'refresh') else self.scanner.results(fresh=True)
 
     def apply_later(self, reason):
-        threading.Timer(APPLY_DELAY, self.on_change, args=(reason,)).start()
+        timer = threading.Timer(APPLY_DELAY, self.on_change, args=(reason,))
+        timer.daemon = True   # a systemd stop within the delay must not wait for the pending apply
+        timer.start()
 
     def start(self, port=80):
         page = self
 
         class Handler(BaseHTTPRequestHandler):
+            # The allowed networks change with the box's own interfaces, not per request: the page re-asks on
+            # every reload (pairing: every 3 s), and on Debian each ask forked one `ip` process (review 2026-11-04).
+            allowed_nets = []
+            allowed_at = 0.0
+            timeout = 30   # a client that stops mid-request must not hold its thread and socket forever
+            protocol_version = "HTTP/1.1"   # every response carries Content-Length: keep-alive saves
+                                            # the TCP handshake on the 3 s auto-refresh
+
             def log_message(self, *_):   # keep tokens/passwords out of the journal
                 pass
 
             def _allowed(self):
                 client = ipaddress.ip_address(self.client_address[0].removeprefix("::ffff:"))
-                return client.is_loopback or any(client in net for net in page.allowed())
+                if time.monotonic() - Handler.allowed_at > 5:
+                    Handler.allowed_nets, Handler.allowed_at = page.allowed(), time.monotonic()
+                return client.is_loopback or any(client in net for net in Handler.allowed_nets)
 
-            def _send(self, code, body, ctype="text/html; charset=utf-8", extra=None):
+            def _send(self, code, body, ctype="text/html; charset=utf-8", extra=None, cache="no-store"):
                 data = body if isinstance(body, bytes) else body.encode()
+                extra = dict(extra or {})
+                # The pages are large Chinese-text HTML, re-sent on the 3 s auto-refresh: gzip roughly
+                # halves them. Never compress binary bodies (a certificate would not shrink anyway).
+                if (isinstance(body, str) and len(data) > 512
+                        and "gzip" in self.headers.get("Accept-Encoding", "").lower()):
+                    data = zlib.compress(data, 6)
+                    extra["Content-Encoding"] = "gzip"
                 self.send_response(code)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(data)))
-                self.send_header("Cache-Control", "no-store")
-                for k, v in (extra or {}).items():
+                self.send_header("Cache-Control", cache)
+                for k, v in extra.items():
                     self.send_header(k, v)
                 self.end_headers()
                 self.wfile.write(data)
@@ -258,8 +281,12 @@ class SettingsPage:
                 if portal:
                     return self._send(portal[0], portal[1], portal[2], portal[3])
                 if self.path == "/ca.crt" and page.ca_file.exists():
-                    return self._send(200, page.ca_file.read_bytes(), "application/x-x509-ca-cert",
-                                      {"Content-Disposition": 'attachment; filename="dashplay-ca.crt"'})
+                    data = page.ca_file.read_bytes()
+                    etag = '"' + hashlib.sha256(data).hexdigest()[:32] + '"'
+                    extra = {"Content-Disposition": 'attachment; filename="dashplay-ca.crt"', "ETag": etag}
+                    if self.headers.get("If-None-Match") == etag:
+                        return self._send(304, b"", extra=extra, cache="no-cache")
+                    return self._send(200, data, "application/x-x509-ca-cert", extra, cache="no-cache")
                 if self.path == "/audio-routes":
                     try:
                         return self._send(200, json.dumps({'routes': page.sound_routes(), 'nonce': page.pairing.nonce}),
@@ -271,13 +298,21 @@ class SettingsPage:
                                       {"Content-Disposition": 'attachment; filename="dashplay-diag.txt"'})
                 if self.path.split("?")[0] != "/":
                     return self._send(404, "not found")
-                self._send(200, page.render(self.path.partition("?")[2]))
+                try:
+                    html = page.render(self.path.partition("?")[2])
+                except Exception:
+                    traceback.print_exc()   # the journal keeps the cause; the car still gets a page
+                    return self._send(500, "页面渲染出错，详情见盒子日志。")
+                self._send(200, html)
 
             def do_POST(self):
                 if not self._allowed():
                     return self._send(403, "forbidden")
-                length = int(self.headers.get("Content-Length") or 0)
-                if length > (CERT_BODY if self.path == "/cert" else MAX_BODY):
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    return self._send(400, "bad length")
+                if not 0 <= length <= (CERT_BODY if self.path == "/cert" else MAX_BODY):
                     return self._send(413, "too large")
                 form = {k: v[0] for k, v in urllib.parse.parse_qs(self.rfile.read(length).decode(),
                                                                  keep_blank_values=True).items()}
@@ -292,9 +327,12 @@ class SettingsPage:
                     result = page.apply(self.path, form)
                 except ValueError as error:
                     result = "错误：" + str(error)
+                except Exception:
+                    traceback.print_exc()
+                    return self._send(500, "操作处理出错，请重试；详情见盒子日志。")
                 if isinstance(result, tuple) and result[0] == 'versions':
                     host = urllib.parse.urlsplit('http://' + self.headers.get('Host', '')).hostname
-                    if not host:
+                    if not page.versions_redirect_allowed(host):
                         return self._send(400, '无法确定盒子地址')
                     if ':' in host:
                         host = '[' + host + ']'
@@ -307,6 +345,15 @@ class SettingsPage:
                 self._send(303, "", extra={"Location": back + urllib.parse.urlencode({"m": result})})
 
         self.server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+        report_error = self.server.handle_error
+
+        def quiet_error(request, client_address, error):
+            # The page reloads every few seconds; a browser or captive window abandoning a load is normal,
+            # not a traceback in the journal (and the log mirror below it).
+            if not isinstance(error, (ConnectionError, TimeoutError)):
+                report_error(request, client_address, error)
+
+        self.server.handle_error = quiet_error
         threading.Thread(target=self.server.serve_forever, name="settings-page", daemon=True).start()
 
     def stop(self):
@@ -317,6 +364,20 @@ class SettingsPage:
 
     def home(self):
         return self.status().get("home", "/")
+
+    def versions_redirect_allowed(self, host):
+        """The version-manager token rides the redirect fragment: only this box (its address, its mDNS
+        name or its own domain) may receive it, never wherever a crafted Host header points."""
+        host = (host or '').lower()
+        home = (urllib.parse.urlsplit(self.home()).hostname or '').lower()
+        ddns = own_domain.load(self.state) or {}
+        own = {home, setup_wizard.MDNS_NAME.lower(), 'dashplay.local',
+               (own_domain.name_of(ddns) or '').lower()}
+        try:
+            ip = ipaddress.ip_address(host)
+            return bool(host) and (ip.is_loopback or any(ip in net for net in self.allowed()))
+        except ValueError:
+            return bool(host) and host in own
 
     def tesla_check(self, host, path="/"):
         status = self.status()
@@ -333,6 +394,8 @@ class SettingsPage:
             return
         key, now = (name, path.split("?")[0][:100], reply), time.monotonic()
         with self.checks_lock:
+            if len(self.checks_seen) > 64:   # only check names should be here; a flood of crafted paths
+                self.checks_seen.clear()     # would otherwise grow it (and its eMMC log) without bound
             last, repeats = self.checks_seen.get(key, (None, 0))
             if last is not None and now - last < CHECK_LOG_EVERY:
                 self.checks_seen[key] = (last, repeats + 1)

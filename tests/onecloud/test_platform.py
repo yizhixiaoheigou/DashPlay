@@ -367,6 +367,37 @@ class PlatformTests(unittest.TestCase):
         self.assertIn('hw_mode=g', hostapd_config('ap', 11, 80, 'Box', 'synthetic-password'))
         self.assertIn('vht_oper_centr_freq_seg0_idx=42', hostapd_config('ap', 44, 80, 'Box', 'synthetic-password'))
 
+    def test_hostapd_config_falls_back_when_the_channel_has_no_80mhz_block(self):
+        # A DFS channel (52-144) with width 80 once raised KeyError and restarted the service in a loop.
+        config = hostapd_config('ap', 52, 80, 'Box', 'synthetic-password')
+        self.assertNotIn('vht_oper', config)
+        self.assertIn('ht_capab=[HT40', config)
+        self.assertIn('vht_oper_centr_freq_seg0_idx=42', hostapd_config('ap', 40, 80, 'Box', 'synthetic-password'))
+
+    @patch('platform_debian.subprocess.run')
+    def test_cleanup_phone_uplink_survives_a_stale_journal(self, run):
+        # A journal left by a crash names interfaces and keys that a re-cabled box no longer has.
+        run.return_value = Mock(returncode=1, stdout='')
+        (self.root / 'phone-uplink.json').write_text('{"network": "192.0.2.0/24", "forward": "1"}')
+        self.platform.cleanup_phone_uplink()
+        self.assertFalse((self.root / 'phone-uplink.json').exists())
+        self.assertEqual(self.platform.ap_interface, self.platform.interface)
+
+    @patch('platform_debian.subprocess.run')
+    def test_cleanup_phone_uplink_removes_a_corrupt_journal(self, run):
+        run.return_value = Mock(returncode=0, stdout='')
+        (self.root / 'phone-uplink.json').write_text('{')
+        self.platform.cleanup_phone_uplink()
+        self.assertFalse((self.root / 'phone-uplink.json').exists())
+        run.assert_not_called()
+
+    @patch('platform_debian.subprocess.run')
+    def test_stop_usb_sharing_survives_a_damaged_journal(self, run):
+        run.return_value = Mock(returncode=0, stdout='')
+        (self.root / 'usb-tether.json').write_text('{"interface": "wlx1", "network": "not-a-network"}')
+        self.platform.stop_usb_sharing()
+        self.assertFalse((self.root / 'usb-tether.json').exists())
+
     @patch('platform_debian.subprocess.run')
     def test_second_interface_carries_the_box_hotspot(self, run):
         net = self.root / 'net'
@@ -446,7 +477,7 @@ class PlatformTests(unittest.TestCase):
             self.assertTrue(predicate())
         with patch.object(self.platform, 'start') as start, patch.object(self.platform, 'ipv4_address', return_value='192.0.2.9'):
             self.assertTrue(self.platform.join_wifi(car, {'ssid': car['ssid'], 'address': '192.0.2.9'}, wait, 60))
-        self.assertEqual(waits, [(30, .25), (60, .25), (30, .2)])
+        self.assertEqual(waits, [(30, .5), (60, .5), (30, .5)])   # 0.5 s: DHCP needs no tighter polling
         self.assertIn('RequestAddress=192.0.2.9', self.platform.sta_network.read_text())
         self.assertEqual(self.platform.sta_network.stat().st_mode & 0o777, 0o644)
         # The name in hex and the password as written (wpa_supplicant has no escapes in quoted values).
@@ -608,6 +639,32 @@ class WpaSupplicantQuotingTests(unittest.TestCase):
             wpa_network_lines("Car", 'abcdefgh"\n key_mgmt=NONE')
         with self.assertRaises(ValueError):
             wpa_network_lines("Car\n", "abcdefgh")
+
+
+class ApReadyLogTailTests(unittest.TestCase):
+    """ap_ready() is asked every 2 s by the phone-uplink tick; the hostapd log grows with every
+    association, so it is read as a tail (inode plus offset) and reread from the top only when
+    hostapd rewrites it."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.platform = get_platform('wlan-test', run=self.root)
+
+    def test_ready_follows_the_tail_and_restarts_after_a_rewrite(self):
+        log = self.root / 'hostapd.log'
+        log.write_text('hostapd starting\nAP-ENABLED\n')
+        self.assertTrue(self.platform.ap_ready())
+        with log.open('a') as append:
+            append.write('a station associated\nAP-DISABLED\n')
+        self.assertFalse(self.platform.ap_ready())
+        with log.open('a') as append:
+            append.write('AP-ENABLED\n')
+        self.assertTrue(self.platform.ap_ready())
+        # The next hostapd start truncates and rewrites the same inode: the state must start over.
+        log.write_text('hostapd starting\n')
+        self.assertFalse(self.platform.ap_ready())
 
 
 if __name__ == '__main__':
