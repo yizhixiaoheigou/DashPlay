@@ -537,8 +537,12 @@ def forbidden_in_plan(simulation):
 
 
 def previous_packages(version, prefixes, work, report=None):
-    """The installed release's three packages (to go back to), checked against that release's SHA256SUMS."""
+    """The installed release's three packages (to go back to), checked against that release's SHA256SUMS.
+    Mirrors only carry the current release and the threat model calls them hostile: the way back must
+    come from GitHub itself, or a mirror could hand over a matching fake SUMS + package pair that the
+    rollback then installs with --allow-untrusted."""
     base = PREVIOUS_FEED.format(version=version)
+    prefixes = (DIRECT,)
     try:
         sums = fetch(base + "SHA256SUMS", prefixes, limit=1 << 16).decode()
     except NotFound:
@@ -597,7 +601,19 @@ def backup(root, openwrt):
             if Path(config).exists():
                 out.add(config, arcname="config/" + Path(config).name)
     os.chmod(target.with_suffix(".tmp"), 0o600)
+    # The backup is the only copy of the owner's data: the tar must reach the disk before it replaces
+    # the previous one, and the rename must reach the directory (as save_json does for the settings).
+    fd = os.open(target.with_suffix(".tmp"), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     os.replace(target.with_suffix(".tmp"), target)
+    dirfd = os.open(target.parent, os.O_RDONLY)
+    try:
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)
     return target
 
 
@@ -638,8 +654,12 @@ def install_openwrt(root, manifest, status, work):
         raise UpdateError("升级会改动内核、内核模块或系统蓝牙（" + "、".join(blocked) + "），已停止，请按说明手动升级")
     status("installing", "正在安装，CarPlay 会断开约 1 分钟")
     port = settings_port()
-    result = run("apk", "add", *direction, "--allow-untrusted", *map(str, files), timeout=600)
-    if result.returncode == 0 and service_up(port):
+    try:
+        result = run("apk", "add", *direction, "--allow-untrusted", *map(str, files), timeout=600)
+        failed = result.returncode != 0
+    except subprocess.TimeoutExpired:
+        failed = True   # the killed apk leaves the system half-upgraded: go back, the previous packages are here
+    if not failed and service_up(port):
         return
     status("restoring", "新版本没有正常启动，正在退回原来的版本")
     back = run("apk", "add", "--allow-untrusted", *map(str, previous), timeout=600)
@@ -664,8 +684,11 @@ def install_debian(root, manifest, status, work):
     # Downgrading must not hand control to an old installer that lacks today's preservation checks.
     retained = Path(root) / 'state/version-manager/upgrade.py'
     upgrader = retained if retained.is_file() else Path(root) / 'firmware/upgrade.py'
-    result = run(sys.executable, str(upgrader), str(bundle), timeout=900)
-    if result.returncode != 0:
+    try:
+        result = run(sys.executable, str(upgrader), str(bundle), timeout=900)
+    except subprocess.TimeoutExpired:
+        result = None   # a killed upgrader may have half-swapped the program; report it like a failure
+    if result is None or result.returncode != 0:
         raise UpdateError("新版本没有正常启动，已自动退回原来的程序（详见 state/upgrade.log）")
     save(Path(root) / "state/update.json", {"version": manifest["version"], "at": int(time.time())})
 

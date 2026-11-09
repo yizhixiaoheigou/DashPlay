@@ -679,5 +679,35 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(value['mirrors'], list(update.MIRRORS), 'boxes from then on measure the mirrors of the release')
 
 
+class InstallFailurePathsTests(unittest.TestCase):
+    def test_a_killed_debian_upgrader_reports_the_rollback_instead_of_tracebacking(self):
+        # subprocess.run kills the upgrader at its timeout and raises; the half-swapped program must
+        # be reported exactly like a non-zero exit, not left to the generic handler.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        manifest = {'version': '2026.11.05', 'debian': {
+            'base': 'http://updates.example/', 'bundle': {'file': 'dashplay-bundle.tar', 'size': 8,
+                                                          'sha256': hashlib.sha256(b'bundle').hexdigest()}}}
+        status = lambda phase, message, **extra: None
+        with patch.object(update, 'sources', lambda *args, **kwargs: ('http://updates.example/',)),              patch.object(update, 'fetch', return_value=Path(tmp.name) / 'bundle.tar'),              patch.object(update, 'keep'),              patch.object(update, 'run',
+                          side_effect=subprocess.TimeoutExpired(cmd='upgrade.py', timeout=900)):
+            with self.assertRaises(update.UpdateError) as raised:
+                update.install_debian(Path(tmp.name) / 'root', manifest, status, Path(tmp.name) / 'work')
+        self.assertIn('退回', str(raised.exception))
+
+    def test_the_rollback_packages_come_from_github_only(self):
+        # Mirrors are untrusted and only carry the current release: a mirror could otherwise serve a
+        # matching fake SHA256SUMS + package pair that the rollback installs --allow-untrusted.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with patch.object(update, 'fetch', side_effect=update.NotFound) as fetch:
+            with self.assertRaises(update.UpdateError) as raised:
+                update.previous_packages('2026.10.19', ('http://mirror.example/', 'http://other.example/'),
+                                         Path(tmp.name))
+        self.assertIn('无法退回', str(raised.exception))
+        self.assertEqual(fetch.call_args.args[1], (update.DIRECT,),
+                         'the way back is fetched from GitHub itself, never from a mirror')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -185,6 +185,38 @@ class LogMirrorTests(unittest.TestCase):
 
 
 
+    def test_prune_keeps_total_under_the_byte_budget(self):
+        # Eight boots of five 40 MB logs would ask 1.6 GB of a small eMMC; the oldest go first.
+        for index in range(4):
+            boot = self.root / f'boot{index:02d}'
+            boot.mkdir()
+            (boot / 'receiver.log').write_text('x' * 200)
+            os.utime(boot, (index, index))
+        mirror = diagnostics.LogMirror(self.root, self.run, 'current0')
+        mirror.directory.mkdir()
+        with patch.object(diagnostics, 'LOG_TOTAL_MAX', 500):
+            mirror.prune()
+        left = sorted(d.name for d in self.root.iterdir())
+        self.assertIn('current0', left)
+        self.assertNotIn('boot00', left, 'the oldest boot goes when the budget is exceeded')
+        kept = sum(f.stat().st_size for f in self.root.rglob('*') if f.is_file())
+        self.assertLessEqual(kept, 500)
+
+    def test_offsets_are_written_atomically_and_the_journal_waits_its_turn(self):
+        receiver = self.run / 'receiver.log'
+        receiver.write_text('one\n')
+        mirror = diagnostics.LogMirror(self.root, self.run, 'abcdef0123456789')
+        mirror.directory.mkdir()
+        with patch('diagnostics.subprocess.run') as run:
+            run.return_value = Mock(stdout=b'')
+            mirror.cycle({}, {})
+            mirror.cycle({}, {})
+        self.assertEqual(run.call_count, 1, 'journalctl runs at most once per JOURNAL_EVERY')
+        self.assertEqual(list(mirror.directory.glob('*.tmp')), [], 'no partial offsets file left behind')
+        inode = (self.run / 'receiver.log').stat().st_ino
+        self.assertEqual(mirror.load(), {'receiver.log': [inode, 4]})
+
+
 class CarHotspotLagTests(unittest.TestCase):
     @patch('diagnostics.subprocess.run')
     def test_ping_burst_and_tcp_state(self, run):

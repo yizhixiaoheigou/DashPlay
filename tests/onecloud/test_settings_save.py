@@ -43,5 +43,19 @@ class ConcurrentSaveTests(unittest.TestCase):
         self.assertIs(settings_page._save, setup_wizard.save_json)
 
 
+class RemoveConfirmationTests(unittest.TestCase):
+    def test_a_device_name_with_u2028_still_gets_a_working_confirm(self):
+        # U+2028/2029 are valid JSON but invalid inside a JS string literal on older WebViews: the
+        # confirm would throw there and the removal would run without asking. Escaped, it degrades
+        # to a removal without a dialog instead of a broken onclick on every other name too.
+        import settings_ui
+        html = settings_ui.phone_rows({'AA:BB:CC:DD:EE:FF': 'separated\u2028name'}, active=None,
+                                      last=None, nonce='synthetic-nonce', idle=True)
+        # The display text keeps the character (legal HTML); only the JS string in the onclick is
+        # escaped, so the confirm either shows or is skipped — it never throws and never breaks.
+        self.assertEqual(html.count('\u2028'), 1)
+        self.assertIn('\\u2028', html)
+
+
 if __name__ == "__main__":
     unittest.main()

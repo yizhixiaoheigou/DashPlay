@@ -445,7 +445,7 @@ def main():
     state = root / "state"
     # Keep the uci mirroring the effective port, so the LuCI link and field show it (an owner's older
     # state/receiver/config.json value is adopted once; the uci survives package updates).
-    if not args.check and str(viewer) != config.get("viewer_port", ""):
+    if str(viewer) != config.get("viewer_port", ""):
         subprocess.run(["uci", "set", f"dashplay.main.viewer_port={viewer}"], check=False, capture_output=True)
         subprocess.run(["uci", "commit", "dashplay"], check=False, capture_output=True)
         config["viewer_port"] = str(viewer)

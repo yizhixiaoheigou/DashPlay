@@ -195,7 +195,10 @@ def main():
     stamp = state / "app-cds.classpath"
     if not stamp.exists() or stamp.read_text() != fingerprint:
         (state / "app-cds.jsa").unlink(missing_ok=True)
-        stamp.write_text(fingerprint)
+        # Atomic: a power cut mid-write would mismatch on every later start and cost a rebuild each time.
+        tmp = stamp.with_suffix(".classpath.tmp")
+        tmp.write_text(fingerprint)
+        tmp.replace(stamp)
     # A dump interrupted by a restart leaves a truncated archive that the JVM then refuses ("bad magic
     # number", "invalid archive") and never replaces, costing ~3 s on every start (dp-0017, 2026-10-31:
     # 3.9 MB instead of ~39 MB). The last start's log says so; drop it and the JVM dumps a fresh one on exit.
@@ -241,12 +244,17 @@ def main():
         (state / "java.pid").write_text(str(process.pid) + "\n")
         for line in process.stdout:
             line = redact(line, token, password)
-            print(line, end="", flush=True)
-            # The JVM's timestamps follow the wall clock, which jumps when time is synced during boot
-            # (~27 s on 2026-10-11); mark milestones on the boot clock, comparable with "boot" lines.
-            milestone = next((name for key, name in MILESTONES if key in line), None)
-            if milestone:
-                print(f"boot {time.monotonic():.2f}s {milestone}", flush=True)
+            try:
+                print(line, end="", flush=True)
+                # The JVM's timestamps follow the wall clock, which jumps when time is synced during boot
+                # (~27 s on 2026-10-11); mark milestones on the boot clock, comparable with "boot" lines.
+                milestone = next((name for key, name in MILESTONES if key in line), None)
+                if milestone:
+                    print(f"boot {time.monotonic():.2f}s {milestone}", flush=True)
+            except OSError:
+                # A full tmpfs log must not kill this process: the JVM would be orphaned, keep holding
+                # the ports while the supervisor starts a second one against them. Drain until it exits.
+                pass
         raise SystemExit(process.wait())
 
 

@@ -71,7 +71,9 @@ class LogTail:
 
 LOG_BOOTS = 8                 # boots whose full logs are kept
 LOG_FILE_MAX = 40_000_000     # per mirrored file and boot
+LOG_TOTAL_MAX = 200_000_000   # all boots together: five /run logs x 40 MB x 8 boots would be 1.6 GB
 MIRROR_INTERVAL = 5
+JOURNAL_EVERY = 15            # one journalctl fork per three rounds, not a constant 0.2/s
 
 
 class LogMirror:
@@ -93,6 +95,15 @@ class LogMirror:
                        key=lambda d: d.stat().st_mtime)
         for old in boots[:max(0, len(boots) - (LOG_BOOTS - 1))]:
             shutil.rmtree(old, ignore_errors=True)
+        # Small eMMCs: 8 boots x five files x 40 MB can ask for 1.6 GB, and a full root fs then also
+        # kills the diagnostics writes. Keep dropping the oldest until the rest fits the budget.
+        used = sum(path.stat().st_size for path in self.root.rglob('*') if path.is_file())
+        for old in boots:
+            if used <= LOG_TOTAL_MAX:
+                break
+            size = sum(path.stat().st_size for path in old.rglob('*') if path.is_file())
+            shutil.rmtree(old, ignore_errors=True)
+            used -= size
 
     def load(self):
         try:
@@ -122,32 +133,45 @@ class LogMirror:
                 stat = path.stat()
             except OSError:
                 continue
-            inode, offset = offsets.get(key, (None, 0))
-            if inode != stat.st_ino or stat.st_size < offset:
-                if inode is not None:
-                    self.append(key, f"[log mirror: {key} restarted]\n".encode(), handles)
-                offset = 0
-            if stat.st_size > offset:
-                with path.open("rb") as log:
-                    log.seek(offset)
-                    data = log.read(4_000_000)
-                end = data.rfind(b"\n") + 1
-                if end:
-                    self.append(key, data[:end], handles)
-                    offset += end
-            offsets[key] = (stat.st_ino, offset)
-        journal = self.journal and subprocess.run(["journalctl", "-b", "-o", "short-monotonic", "--no-pager", "-q",
-                                                   f"--cursor-file={self.cursor}"], capture_output=True, timeout=20).stdout
+            try:
+                inode, offset = offsets.get(key, (None, 0))
+                if inode != stat.st_ino or stat.st_size < offset:
+                    if inode is not None:
+                        self.append(key, f"[log mirror: {key} restarted]\n".encode(), handles)
+                    offset = 0
+                if stat.st_size > offset:
+                    with path.open("rb") as log:
+                        log.seek(offset)
+                        data = log.read(4_000_000)
+                    end = data.rfind(b"\n") + 1
+                    if end:
+                        self.append(key, data[:end], handles)
+                        offset += end
+                offsets[key] = (stat.st_ino, offset)
+            except OSError as error:   # one failing log must not skip the journal, fsync and offsets
+                print(f"log mirror {key} skipped: {error.strerror}", flush=True)
+        journal = None
+        if self.journal and time.monotonic() - getattr(self, '_journal_at', 0) >= JOURNAL_EVERY:
+            self._journal_at = time.monotonic()
+            journal = subprocess.run(["journalctl", "-b", "-o", "short-monotonic", "--no-pager", "-q",
+                                      f"--cursor-file={self.cursor}"], capture_output=True, timeout=20).stdout
         if journal:
             self.append("journal.log", journal, handles)
         for fd in handles.values():
             os.fsync(fd)
-        self.state_file.write_text(json.dumps(offsets))
+        # Atomic: a power cut mid-write used to leave half a JSON, and every log then restarted from
+        # offset 0, silently appending the whole boot again (the mirror exists for power cuts).
+        tmp = self.state_file.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(offsets))
+        tmp.replace(self.state_file)
 
     def start(self, stopped, interval=MIRROR_INTERVAL):
-        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.utime(self.directory)
-        self.prune()
+        try:
+            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.utime(self.directory)
+            self.prune()
+        except OSError as error:   # the mirror is a convenience; a failing disk must not stop the service
+            print(f"log mirror not started: {error.strerror}", flush=True)
         offsets = {key: tuple(value) for key, value in self.load().items()}
         handles = {}
 
@@ -308,10 +332,15 @@ def keep(lines, limit=MAX_LINES):
 def start(stopped, log: DiagLog, receiver_log: Path, platform, status, interval=INTERVAL, state: Path = None,
           program: Path = Path(__file__).resolve().parent):
     tail = LogTail(receiver_log)
-    # The release this box runs opens every start, so a user's diagnostics say it (2026-10-20: a box still on the
-    # image's 2026.10.15 program was only told apart by the viewer's build stamp).
-    log.append({"event": "start", "wall": round(time.time()), "uptime": round(time.monotonic(), 1),
-                "boot": platform.boot_id()[:8], "version": update.bundled_version(program)})
+    try:
+        # The release this box runs opens every start, so a user's diagnostics say it (2026-10-20: a box still on
+        # the image's 2026.10.15 program was only told apart by the viewer's build stamp). The callers run this
+        # on their main thread inside a try that only catches InterruptedError: a full eMMC here would restart
+        # the whole service, and a full eMMC is exactly when this write fails.
+        log.append({"event": "start", "wall": round(time.time()), "uptime": round(time.monotonic(), 1),
+                    "boot": platform.boot_id()[:8], "version": update.bundled_version(program)})
+    except Exception as error:   # diagnostics must never take the service down
+        print(f"diagnostics start skipped: {type(error).__name__}", flush=True)
 
     def loop():
         while not stopped.wait(interval):
