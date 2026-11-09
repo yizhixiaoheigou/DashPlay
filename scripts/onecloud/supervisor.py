@@ -245,10 +245,12 @@ def main():
     RUN.mkdir(mode=0o700, exist_ok=True)
     state = root / "state"
     if interface == "auto":
-        for _ in range(60):   # the unit may start before udev has named the dongle
-            # The kernel's "wlan0" is renamed to wlx<MAC> moments later; taking the old name made the
-            # service wait 30 s for an interface that no longer existed and fail once (2026-10-12).
-            subprocess.run(["udevadm", "settle", "--timeout=10"], capture_output=True)
+        until = time.monotonic() + 60   # the unit may start before udev has named the dongle
+        # The kernel's "wlan0" is renamed to wlx<MAC> moments later; taking the old name made the
+        # service wait 30 s for an interface that no longer existed and fail once (2026-10-12).
+        # One total deadline: settle's own timeout (60 x 10 s) could otherwise stall this for minutes.
+        while time.monotonic() < until:
+            subprocess.run(["udevadm", "settle", "--timeout=1"], capture_output=True)
             interface = setup_wizard.wifi_interface() or "auto"
             if interface != "auto" and Path("/sys/class/net", interface).exists():
                 break

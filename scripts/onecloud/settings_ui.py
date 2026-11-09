@@ -265,7 +265,11 @@ def phone_rows(devices, active, last, nonce, idle, paused=(), connecting=None):
             actions += form + f'<button class="cell action" name=action value=switch>{label}</button></form>'
             if not idle:
                 actions += ('<p class=foot>会结束正在用的那部手机的 CarPlay；它保留配对和 Wi-Fi，随时可以切回来。</p>')
-        confirmation = escape('return confirm(' + json.dumps(f'从盒子上删除「{name}」？当前连接会结束，以后要用需要重新配对。', ensure_ascii=False) + ')', quote=True)
+        # U+2028/2029 are valid JSON but not valid in a JS string literal on older WebViews: escaped,
+        # the worst case is the confirm dialog not appearing instead of a removal without one.
+        confirmation = escape('return confirm(' + json.dumps(
+            f'从盒子上删除「{name}」？当前连接会结束，以后要用需要重新配对。', ensure_ascii=False
+        ).replace("\u2028", "\\u2028").replace("\u2029", "\\u2029") + ')', quote=True)
         actions += (form + f'<button class="cell destructive" name=action value=remove '
                     f'onclick="{confirmation}">删除此手机</button></form>')
         html += f'<details>{summary}<div class=inner>{actions}</div></details>'
