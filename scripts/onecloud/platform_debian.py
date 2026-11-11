@@ -18,10 +18,13 @@ import subprocess
 import time
 
 RUN = Path("/run/dashplay")
-STA_NETWORK = Path("/run/systemd/network/60-onecloud-sta.network")
+# Runtime units go to /etc, not /run: the HiNAS image on the Huawei EC6108V9 ignores /run units on
+# `networkctl reload` (2026-11-11: wpa_supplicant had associated with the phone hotspot, but DHCP never
+# ran — the unit kept pending — until the same file moved to /etc and reconfigured instantly).
+STA_NETWORK = Path("/etc/systemd/network/60-onecloud-sta.network")
 # USB shared network (iPhone ipheth, Android/MiFi rndis_host, cdc_ether, cdc_ncm), options.json car_internet "usb_tether"; sorted
 # before any image-wide match so its route stays behind the Ethernet cable (default metric 1024).
-USB_TETHER_NETWORK = Path("/run/systemd/network/05-dashplay-usb-tether.network")
+USB_TETHER_NETWORK = Path("/etc/systemd/network/05-dashplay-usb-tether.network")
 # Armbian N1 images hand every Ethernet-like device to NetworkManager (netplan renderer), which would otherwise give
 # the iPhone a default profile with the cable's priority; this profile, matched on the driver, wins (dp-0017, NM 1.52).
 USB_TETHER_PROFILE = Path("/run/NetworkManager/system-connections/dashplay-usb-tether.nmconnection")
@@ -174,12 +177,14 @@ def wifi_driver(interface, net=Path("/sys/class/net")):
 
 
 def wifi_interface(net=Path("/sys/class/net")):
-    """The Wi-Fi interface, whatever udev named it (USB dongles get a MAC-based wlx… name)."""
+    """The Wi-Fi interface, whatever udev named it (USB dongles get a MAC-based wlx… name). Vendor firmware's
+    own p2p* vifs are never it: the RTL8188FU keeps a p2p0 that sorts before wlan0 and is only usable as
+    an AP, so picking it as the station swaps both roles (2026-11-11)."""
     try:
         names = sorted(entry.name for entry in net.iterdir())
     except OSError:
         return None
-    return next((name for name in names if name not in (AP_VIF, "ap0") and
+    return next((name for name in names if name not in (AP_VIF, "ap0") and not name.startswith("p2p") and
                  ((net / name / "wireless").exists() or (net / name / "phy80211").exists())), None)
 
 
@@ -384,8 +389,23 @@ class DebianPlatform:
 
     def concurrent_ap(self):
         """Channels a station and an AP may use at once: 0 none, 1 the same (rtw88 built by
-        build-rtw88-concurrent.sh), 2 different ones (MT7921AU)."""
-        return supports_sta_ap(subprocess.run(["iw", "list"], capture_output=True, text=True, timeout=10).stdout)
+        build-rtw88-concurrent.sh, RTL8188FU vendor firmware), 2 different ones (MT7921AU)."""
+        channels = supports_sta_ap(subprocess.run(["iw", "list"], capture_output=True, text=True, timeout=10).stdout)
+        if channels:
+            return channels
+        # Vendor drivers can run concurrent STA + AP without listing a parsable combination: the RTL8188FU
+        # firmware shows no valid interface combinations at all, yet keeps its own p2p0 vif for an AP while
+        # wlan0 is a client (2026-11-11). Trust what is already running, or a second wiphy, before giving
+        # up on the phone hotspot for good.
+        try:
+            dev = subprocess.run(["iw", "dev"], capture_output=True, text=True, timeout=10).stdout
+            kinds = set(re.findall(r"^\ttype (\S+)$", dev, re.M))
+            phys = subprocess.run(["iw", "phy"], capture_output=True, text=True, timeout=10).stdout.count("Wiphy ")
+            if ("managed" in kinds and "AP" in kinds) or phys > 1:
+                return 1
+        except subprocess.SubprocessError:
+            pass
+        return 0
 
     def wired_capable(self, compatible=Path("/proc/device-tree/compatible")):
         """Whether the iPhone can be plugged in: not on a Snapdragon 410 stick, whose only USB port is its plug (device
@@ -438,6 +458,12 @@ class DebianPlatform:
             self.sta_network.unlink()
             subprocess.run(["networkctl", "reload"], capture_output=True, timeout=20)
 
+    def write_sta_unit(self, text):
+        """Runtime unit for the station's DHCP client, in /etc (see STA_NETWORK); the directory may not exist."""
+        self.sta_network.parent.mkdir(parents=True, exist_ok=True)
+        self.sta_network.write_text(text)
+        self.sta_network.chmod(0o644)   # read by systemd-networkd; no secrets
+
     def join_wifi(self, car, lease, wait_for, seconds):
         """Associate with the car hotspot and get a DHCP lease; returns True on success, False after timeout cleanup."""
         conf = self.run / "wpa.conf"
@@ -455,9 +481,8 @@ class DebianPlatform:
         write_conf(known)
         request = f"RequestAddress={lease['address']}\n" if lease.get("ssid") == car["ssid"] else ""
         # Ask the car's DHCP server for the previous address, so the head unit's bookmark keeps working.
-        self.sta_network.write_text(f"[Match]\nName={self.interface}\n[Network]\nDHCP=ipv4\n"
-                               f"[DHCPv4]\nRouteMetric=2048\n{request}")
-        self.sta_network.chmod(0o644)   # read by systemd-network; no secrets
+        self.write_sta_unit(f"[Match]\nName={self.interface}\n[Network]\nDHCP=ipv4\n"
+                            f"[DHCPv4]\nRouteMetric=2048\n{request}")
         subprocess.run(["ip", "addr", "flush", "dev", self.interface], check=True)
         subprocess.run(["ip", "link", "set", self.interface, "up"], check=True)
         self.start("wpa_supplicant", ["wpa_supplicant", "-D", "nl80211", "-i", self.interface, "-c", str(conf)])
@@ -810,9 +835,8 @@ class DebianPlatform:
                         f' scan_freq={frequency}\n'
                         f' freq_list={frequency}\n}}\n')
         conf.chmod(0o600)
-        self.sta_network.write_text(f'[Match]\nName={self.interface}\n[Network]\nDHCP=ipv4\n'
-                                    '[DHCPv4]\nRouteMetric=2048\n')
-        self.sta_network.chmod(0o644)
+        self.write_sta_unit(f'[Match]\nName={self.interface}\n[Network]\nDHCP=ipv4\n'
+                            '[DHCPv4]\nRouteMetric=2048\n')
         subprocess.run(['ip', 'link', 'set', 'dev', self.interface, 'up'],
                        check=True, capture_output=True, timeout=5)
         self.start('wpa_supplicant', ['wpa_supplicant', '-D', 'nl80211', '-i', self.interface, '-c', str(conf)])
@@ -824,9 +848,8 @@ class DebianPlatform:
         self.stop_child('wpa_supplicant')
         # Removing the .network file alone can leave networkd's old DHCP client alive.
         # Explicitly disable it without bringing the shared radio or AP down.
-        self.sta_network.write_text(f'[Match]\nName={self.interface}\n[Network]\n'
-                                    'DHCP=no\nLinkLocalAddressing=no\n')
-        self.sta_network.chmod(0o644)
+        self.write_sta_unit(f'[Match]\nName={self.interface}\n[Network]\n'
+                            'DHCP=no\nLinkLocalAddressing=no\n')
         for argv in (['networkctl', 'reload'], ['networkctl', 'reconfigure', self.interface]):
             subprocess.run(argv, check=True, capture_output=True, timeout=5)
         subprocess.run(['ip', '-4', 'route', 'flush', 'dev', self.interface],
@@ -875,24 +898,41 @@ class DebianPlatform:
             original = info['address']
         from setup_wizard import save_json
         save_json(self.run / 'phone-uplink.json', {'mac': original, 'interface': self.interface,
-                  'forward': Path('/proc/sys/net/ipv4/ip_forward').read_text().strip(), 'network': None})
-        for args in (['down'], ['address', station_mac(original)]):
+                  'forward': Path('/proc/sys/net/ipv4/ip_forward').read_text().strip(), 'network': None,
+                  'ap_vif': None})
+        steps = (['down'],)
+        # The RTL8188FU vendor firmware never associates again once the interface gets a locally
+        # administered MAC (2026-11-11); it keeps its factory address, which is unique enough.
+        if wifi_driver(self.interface) != '8188fu':
+            steps += (['address', station_mac(original)],)
+        for args in steps:
             subprocess.run(['ip', 'link', 'set', 'dev', self.interface, *args], check=True, capture_output=True, timeout=5)
 
     def add_phone_ap(self):
+        from setup_wizard import save_json
         saved = json.loads((self.run / 'phone-uplink.json').read_text())
         # STA already has a different MAC. ap0 gets the same MAC as the normal daily AP.
-        subprocess.run(['iw', 'dev', self.interface, 'interface', 'add', 'ap0', 'type', '__ap'],
-                       check=True, capture_output=True, timeout=10)
-        self.ap_interface = 'ap0'
-        self.release_phone_ap_from_networkmanager()
-        subprocess.run(['ip', 'link', 'set', 'dev', 'ap0', 'address', saved['mac']],
-                       check=True, capture_output=True, timeout=5)
+        vif = 'ap0'
+        if subprocess.run(['iw', 'dev', self.interface, 'interface', 'add', 'ap0', 'type', '__ap'],
+                          capture_output=True, timeout=10).returncode != 0:
+            # The RTL8188FU vendor firmware refuses a second __ap vif (nl80211 error 237) but keeps its own
+            # p2p0 usable as the AP while wlan0 is a client (2026-11-11). It must never be deleted: the
+            # firmware does not bring it back (see cleanup_phone_uplink).
+            if not (SYS_NET / 'p2p0').exists():
+                return False
+            vif = 'p2p0'
+        self.ap_interface = vif
+        self.release_phone_ap_from_networkmanager(vif)
+        # Best effort on the vendor vif: its firmware may keep the address it wants.
+        subprocess.run(['ip', 'link', 'set', 'dev', vif, 'address', saved['mac']],
+                       check=(vif == 'ap0'), capture_output=True, timeout=5)
+        saved['ap_vif'] = vif
+        save_json(self.run / 'phone-uplink.json', saved)
         return True
 
-    def release_phone_ap_from_networkmanager(self):
-        # Older installs exclude wl*/dpap0 but not ap0. NM can take it over after
-        # hostapd starts and remove its address. Claim only our new interface;
+    def release_phone_ap_from_networkmanager(self, vif='ap0'):
+        # Older installs exclude wl*/dpap0 but not ap0. NM can take the new vif over after
+        # hostapd starts and remove its address. Claim only this interface;
         # do not reload NM, change Ethernet, or write permanent system settings.
         if not shutil.which('nmcli'):
             return
@@ -905,9 +945,9 @@ class DebianPlatform:
             raise RuntimeError('Cannot determine NetworkManager state')
         # Its D-Bus device may appear slightly after iw creates the interface.
         for attempt in range(10):
-            subprocess.run(['nmcli', 'device', 'set', 'ap0', 'managed', 'no'],
+            subprocess.run(['nmcli', 'device', 'set', vif, 'managed', 'no'],
                            capture_output=True, timeout=3)
-            state = subprocess.run(['nmcli', '-g', 'GENERAL.STATE', 'device', 'show', 'ap0'],
+            state = subprocess.run(['nmcli', '-g', 'GENERAL.STATE', 'device', 'show', vif],
                                    capture_output=True, text=True, timeout=3,
                                    env={**os.environ, 'LC_ALL': 'C'})
             if state.returncode == 0 and re.match(r'^10(?:\s|$)', state.stdout.strip()):
@@ -922,14 +962,15 @@ class DebianPlatform:
                                 if not line.startswith(('ieee80211ac=', 'vht_', 'ht_capab='))))
 
     def phone_nat_rules(self, network):
-        # Follow routing (Ethernet at home, phone Wi-Fi in the car), never translate back onto ap0.
-        return [(['-t', 'nat'], ['POSTROUTING', '-s', str(network), '!', '-o', 'ap0',
-                                '-m', 'comment', '--comment', 'dashplay-phone-uplink', '-j', 'MASQUERADE']),
-                ([], ['FORWARD', '-i', 'ap0', '!', '-o', 'ap0', '-s', str(network),
-                      '-m', 'comment', '--comment', 'dashplay-phone-uplink', '-j', 'ACCEPT']),
-                ([], ['FORWARD', '!', '-i', 'ap0', '-o', 'ap0', '-d', str(network),
-                      '-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED',
-                      '-m', 'comment', '--comment', 'dashplay-phone-uplink', '-j', 'ACCEPT'])]
+        # Follow routing (Ethernet at home, phone Wi-Fi in the car), never translate back onto the AP vif
+        # (ap0, or the vendor's p2p0 on the RTL8188FU). No -m comment: ARM images such as the HiNAS one on
+        # the Huawei EC6108V9 ship an iptables without the comment extension, and one missing module
+        # rejects the whole rule (exit 2, 2026-11-11).
+        ap = self.ap_interface
+        return [(['-t', 'nat'], ['POSTROUTING', '-s', str(network), '!', '-o', ap, '-j', 'MASQUERADE']),
+                ([], ['FORWARD', '-i', ap, '!', '-o', ap, '-s', str(network), '-j', 'ACCEPT']),
+                ([], ['FORWARD', '!', '-i', ap, '-o', ap, '-d', str(network),
+                      '-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED', '-j', 'ACCEPT'])]
 
     def usb_tether_rules(self, network):
         """Box hotspot clients out through whatever holds the default route (the iPhone's USB interface in the car,
@@ -1122,12 +1163,18 @@ class DebianPlatform:
                 subprocess.run(['iptables', *table, '-D', *rule], capture_output=True, timeout=5)
         subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=' + saved['forward']],
                        capture_output=True, check=True, timeout=5)
-        subprocess.run(['iw', 'dev', 'ap0', 'del'], capture_output=True, timeout=5)
+        vif = saved.get('ap_vif') or 'ap0'
+        # The vendor p2p0 must never be deleted: the RTL8188FU firmware does not bring it back (2026-11-11).
+        if vif != 'p2p0':
+            subprocess.run(['iw', 'dev', vif, 'del'], capture_output=True, timeout=5)
         for args in (['down'], ['address', saved['mac']]):
             subprocess.run(['ip', 'link', 'set', 'dev', saved['interface'], *args],
                            check=True, capture_output=True, timeout=5)
         subprocess.run(['ip', 'addr', 'flush', 'dev', saved['interface']], check=True, capture_output=True, timeout=5)
-        self.ap_interface = self.interface
+        # Point the AP back at the station only once the vif the hotspot ran on is really gone; a surviving
+        # vendor vif keeps the role it will run again on the next start.
+        if vif == 'ap0' or not (SYS_NET / vif).exists():
+            self.ap_interface = self.interface
         path.unlink()
 
     def stop_all(self):
