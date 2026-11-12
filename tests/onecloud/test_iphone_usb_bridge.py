@@ -1,15 +1,111 @@
 """USB request layout of the wired-CarPlay helper: no device, fcntl.ioctl is mocked."""
 import importlib.util
+import io
 from pathlib import Path
 import struct
 import unittest
 import tempfile
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 PATH = Path(__file__).resolve().parents[2] / 'scripts/onecloud/iphone-usb-bridge.py'
 spec = importlib.util.spec_from_file_location('iphone_usb_bridge', PATH)
 bridge = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bridge)
+
+
+class UsbMuxFrameTests(unittest.TestCase):
+    def relay(self, stream):
+        with patch.object(bridge.sys, 'stdin', Mock(buffer=stream)), \
+                patch.object(bridge.sys, 'stdout', Mock(buffer=io.BytesIO())), \
+                patch.object(bridge.threading, 'Thread'), patch.object(bridge, 'log'), \
+                patch.object(bridge, 'bulk') as bulk:
+            result = bridge.relay_usbmux(7, (0, 1, 129))
+        return result, bulk
+
+    def test_invalid_length_is_rejected_before_reading_payload(self):
+        class HeaderOnly:
+            def __init__(self, length): self.header = struct.pack('>I', length)
+            def read(self, size):
+                if self.header is None:
+                    raise AssertionError('must reject the length before requesting payload bytes')
+                header, self.header = self.header, None
+                return header
+        for length in (0, (1 << 20) + 1, 0xffffffff):
+            with self.subTest(length=length):
+                result, bulk = self.relay(HeaderOnly(length))
+                self.assertEqual(result, 1)
+                bulk.assert_not_called()
+
+    def test_short_frames_are_not_forwarded(self):
+        for data in (b'\x00\x00', struct.pack('>I', 8) + b'short'):
+            with self.subTest(data=data):
+                result, bulk = self.relay(io.BytesIO(data))
+                self.assertEqual(result, 1)
+                bulk.assert_not_called()
+
+    def test_normal_frames_and_upper_boundary_keep_order(self):
+        packets = [b'normal', b'x' * (1 << 20)]
+        result, bulk = self.relay(io.BytesIO(b''.join(struct.pack('>I', len(p)) + p for p in packets)))
+        self.assertEqual(result, 0)
+        self.assertEqual([call.args for call in bulk.call_args_list], [(7, 1, p) for p in packets])
+
+
+class DeviceSelectionTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.bus = Path(temporary.name)
+        listing = patch.object(bridge.glob, 'glob', side_effect=lambda _: [
+            str(path) for path in reversed(sorted(self.bus.iterdir()))])
+        listing.start()
+        self.addCleanup(listing.stop)
+
+    def write_usb(self, node, vendor='05ac', product='12a8', name='iPhone'):
+        path = self.bus / node
+        path.mkdir()
+        for key, value in (('idVendor', vendor), ('idProduct', product), ('product', name)):
+            if value is not None:
+                (path / key).write_text(value + '\n')
+        return path
+
+    def test_iphone_selected_after_keyboard_and_ipad_with_shared_ids(self):
+        self.write_usb('1-1', product='024f', name='Aluminium Keyboard')
+        self.write_usb('1-2', name='iPad')
+        self.write_usb('1-3', name='iPod')
+        phone = self.write_usb('2-1')
+        self.write_usb('3-1', vendor='1234')
+        self.assertEqual(bridge.apple_device(), phone)
+
+    def test_only_non_phones_or_usb_interface_entries_are_ignored(self):
+        self.write_usb('1-1', product='024f', name='Aluminium Keyboard')
+        self.write_usb('1-2', name='iPad')
+        self.write_usb('1-3', name='iPod')
+        self.write_usb('1-4', vendor='1234')
+        self.write_usb('1-5:1.0')
+        self.assertIsNone(bridge.apple_device())
+
+    def test_missing_descriptors_do_not_hide_a_later_iphone(self):
+        self.write_usb('1-1', name=None)
+        self.write_usb('1-2', vendor=None)
+        self.write_usb('1-3', name='')
+        phone = self.write_usb('2-1')
+        self.assertEqual(bridge.apple_device(), phone)
+
+    def test_product_name_is_case_insensitive_and_whitespace_is_ignored(self):
+        phone = self.write_usb('1-1', name='  iPhOnE  ')
+        self.assertEqual(bridge.apple_device(), phone)
+
+    def test_disappearing_iphone_is_not_replaced_with_an_ipad(self):
+        self.write_usb('1-1', name='iPad')
+        phone = self.write_usb('2-1')
+        listing = [str(path) for path in self.bus.iterdir()]
+        with patch.object(bridge.glob, 'glob', return_value=listing):
+            self.assertEqual(bridge.apple_device(), phone)
+            phone.rename(self.bus / 'detached')
+            self.assertIsNone(bridge.apple_device())
+
+    def test_no_devices(self):
+        self.assertIsNone(bridge.apple_device())
 
 
 class UsbRequestTests(unittest.TestCase):

@@ -94,7 +94,7 @@ internal class IphethUsbTransport private constructor(
             try {
                 // A userspace owner deserves the polite claim; a *kernel* driver does not. Many vendor kernels set
                 // CONFIG_USB_IPHETH=y, which binds Apple's Ethernet interface before we ever see it, and Android never
-                // configures that netdev — so borrowing the iPhone's network silently never comes up (SY910, 2026-11-02).
+                // configures that netdev — so borrowing the iPhone's network silently never comes up (observed on a TV box, 2026-11-02).
                 // Try the polite claim first, then take the interface over from the kernel driver.
                 claimed = connection.claimInterface(usb, false)
                 if (!claimed) claimed = connection.claimInterface(usb, true)

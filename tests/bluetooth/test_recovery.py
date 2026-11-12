@@ -20,6 +20,24 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ,{},clear=True),patch.object(bridge,'call',side_effect=self.call):
             self.assertFalse(await bridge.recover_stale_link(None,A,D))
         self.assertEqual(self.power,[])
+    async def test_corrupt_stamp_allows_recovery_and_restores_cooldown(self):
+        for text in ('half-written', 'NaN', 'Infinity'):
+            with self.subTest(text=text):
+                self.power.clear()
+                Path(self.stamp).write_text(text)
+                with patch.dict(os.environ, {'BT_BRIDGE_RECOVERY_STATE': self.stamp}), \
+                        patch.object(bridge, 'call', side_effect=self.call):
+                    self.assertTrue(await bridge.recover_stale_link(None, A, D))
+                    self.assertFalse(await bridge.recover_stale_link(None, A, D))
+                self.assertEqual(self.power, [False, True])
+
+    async def test_corrupt_stamp_does_not_bypass_other_connected_device_guard(self):
+        Path(self.stamp).write_text('half-written')
+        self.data[A+'/dev_other'] = {bridge.DEVICE: {'Adapter': Variant('o', A), 'Connected': Variant('b', True)}}
+        with patch.dict(os.environ, {'BT_BRIDGE_RECOVERY_STATE': self.stamp}), \
+                patch.object(bridge, 'call', side_effect=self.call):
+            self.assertFalse(await bridge.recover_stale_link(None, A, D))
+        self.assertEqual(self.power, [])
     async def test_dedicated_adapter_recovers_once_and_keeps_pairing(self):
         with patch.dict(os.environ,{'BT_BRIDGE_RECOVERY_STATE':self.stamp}),patch.object(bridge,'call',side_effect=self.call):
             self.assertTrue(await bridge.recover_stale_link(None,A,D))

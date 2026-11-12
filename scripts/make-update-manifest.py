@@ -16,6 +16,7 @@ only ever compares that version with its own; the box version (2026.10.31.3) bel
 sort above every app version forever.
 """
 import argparse
+import ast
 import hashlib
 import json
 from pathlib import Path
@@ -45,6 +46,20 @@ def one(directory, pattern):
     return found[0]
 
 
+def openwrt_dns_providers(staging):
+    """Read the bundle's declared UCI capabilities without importing or executing its code."""
+    source = Path(staging) / 'supervisor_openwrt.py'
+    if source.is_file():
+        for node in ast.parse(source.read_text()).body:
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'DNS_PROVIDERS' for t in node.targets):
+                providers = ast.literal_eval(node.value)
+                if (not isinstance(providers, (tuple, list)) or not providers or
+                        not all(isinstance(p, str) and re.fullmatch(r'[a-z][a-z0-9_]*', p) for p in providers)):
+                    raise ValueError('invalid OpenWrt DNS provider declaration')
+                return list(providers)
+    return ['duckdns']
+
+
 def manifest(version, notes, release, owner, online, android=None):
     openwrt, dashplay = Path(release) / "openwrt", Path(release) / "dashplay"
     packages = {name: entry(one(openwrt, rf"{re.escape(name)}-[0-9][^_]*\.apk"))
@@ -65,11 +80,12 @@ def manifest(version, notes, release, owner, online, android=None):
         extract_bundle(bundle, staging)
         files = {path: hashlib.sha256((Path(staging) / path).read_bytes()).hexdigest()
                  for path in sorted(program_files(staging)) if not (Path(staging) / path).is_symlink()}
+        providers = openwrt_dns_providers(staging)
     value = {
         "format": 1, "version": version, "notes": notes, "online": online, "mirrors": list(MIRRORS),
         "compatibility": {"settings": 1},
         "openwrt": {"base": f"https://github.com/{owner}/openwrt-dashplay/releases/download/v{version}/",
-                    "packages": packages, "jre": jre},
+                    "packages": packages, "jre": jre, "dns_providers": providers},
         "debian": {"base": f"https://github.com/{owner}/DashPlay/releases/download/v{version}/",
                    "bundle": entry(bundle), "files": files},
     }

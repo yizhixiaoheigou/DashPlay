@@ -8,6 +8,8 @@ import io
 import json
 import subprocess
 import tarfile
+import os
+import stat
 
 spec = importlib.util.spec_from_file_location(
     "upgrade", Path(__file__).resolve().parents[2] / "scripts/onecloud/firmware/upgrade.py")
@@ -23,6 +25,90 @@ def make(root, files):
 
 
 class UpgradeInPlaceTests(unittest.TestCase):
+    def test_complete_program_archive_is_synced_before_publish_and_directory_after(self):
+        previous = Path(self.tmp.name) / 'previous.tar'
+        previous.write_bytes(b'previous generation')
+        events, descriptors = [], []
+        fsync, replace = os.fsync, os.replace
+        def synced(fd):
+            descriptors.append(fd)
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                events.append('directory')
+                with tarfile.open(previous) as archive:
+                    self.assertEqual(archive.extractfile('supervisor.py').read(), b'old')
+            else:
+                events.append('archive')
+                self.assertEqual(previous.read_bytes(), b'previous generation')
+                with tarfile.open(previous.with_suffix('.tar.tmp')) as archive:
+                    self.assertEqual(archive.extractfile('supervisor.py').read(), b'old')
+                    self.assertFalse(any(name.startswith(('state/', 'identity/')) for name in archive.getnames()))
+            fsync(fd)
+        def published(src, dst):
+            events.append('publish'); replace(src, dst)
+        with patch.object(upgrade, 'PREVIOUS', previous), patch.object(upgrade.os, 'fsync', side_effect=synced), \
+                patch.object(upgrade.os, 'replace', side_effect=published):
+            upgrade.backup(self.box)
+        self.assertEqual(events, ['archive', 'publish', 'directory'])
+        self.assertEqual(previous.stat().st_mode & 0o777, 0o600)
+        for fd in descriptors:
+            with self.assertRaises(OSError): os.fstat(fd)
+
+    def test_archive_sync_or_publish_failure_preserves_previous_generation(self):
+        previous = Path(self.tmp.name) / 'previous.tar'
+        for failure in ('fsync', 'replace'):
+            with self.subTest(failure=failure):
+                previous.write_bytes(b'old complete backup')
+                with patch.object(upgrade, 'PREVIOUS', previous), \
+                        patch.object(upgrade.os, failure, side_effect=OSError('synthetic failure')):
+                    with self.assertRaises(OSError): upgrade.backup(self.box)
+                self.assertEqual(previous.read_bytes(), b'old complete backup')
+
+    def test_file_or_directory_sync_failure_stops_before_service_or_program_changes(self):
+        for name in upgrade.NEEDED: make(self.bundle, {name: 'candidate'})
+        archive = Path(self.tmp.name) / 'bundle.tar'
+        previous = Path(self.tmp.name) / 'previous.tar'
+        with tarfile.open(archive, 'w') as out: out.add(self.bundle, arcname='.')
+        for directory_failure in (False, True):
+            descriptors = []
+            def fail(fd):
+                descriptors.append(fd)
+                if stat.S_ISDIR(os.fstat(fd).st_mode) == directory_failure:
+                    raise OSError('synthetic sync failure')
+            with self.subTest(directory=directory_failure), patch.object(upgrade, 'ROOT', self.box), \
+                    patch.object(upgrade, 'PREVIOUS', previous), patch.object(upgrade.os, 'geteuid', return_value=0), \
+                    patch.object(upgrade.os, 'fsync', side_effect=fail), patch.object(upgrade, 'run') as run, \
+                    patch.object(upgrade, 'apply') as apply, patch.object(upgrade, 'domain_check', return_value={}):
+                self.assertEqual(upgrade.main([str(archive)]), 1)
+            run.assert_not_called(); apply.assert_not_called()
+            self.assertEqual((self.box / 'supervisor.py').read_text(), 'old')
+            for fd in descriptors:
+                with self.assertRaises(OSError): os.fstat(fd)
+
+    def test_local_bundle_and_previous_program_are_ready_before_service_stop(self):
+        for name in upgrade.NEEDED:
+            make(self.bundle, {name: 'candidate'})
+        archive = Path(self.tmp.name) / 'bundle.tar'
+        previous = Path(self.tmp.name) / 'previous.tar'
+        with tarfile.open(archive, 'w') as out:
+            out.add(self.bundle, arcname='.')
+        stopped = []
+        def run(*args):
+            if args == ('systemctl', 'stop', 'dashplay'):
+                self.assertTrue(archive.is_file())
+                with tarfile.open(previous) as old:
+                    self.assertEqual(old.extractfile('supervisor.py').read(), b'old')
+                self.assertEqual((self.box / 'supervisor.py').read_text(), 'old')
+                stopped.append(True)
+            return subprocess.CompletedProcess(args, 0, '', '')
+        with patch.object(upgrade, 'ROOT', self.box), patch.object(upgrade, 'PREVIOUS', previous), \
+                patch.object(upgrade.os, 'geteuid', return_value=0), patch.object(upgrade.os, 'chown'), \
+                patch.object(upgrade, 'run', side_effect=run), patch.object(upgrade, 'install_unit'), \
+                patch.object(upgrade, 'domain_check', return_value={}), \
+                patch.object(upgrade, 'service_up', return_value=True):
+            self.assertEqual(upgrade.main([str(archive)]), 0)
+        self.assertEqual(stopped, [True])
+        self.assertEqual((self.box / 'supervisor.py').read_text(), 'candidate')
+
     def test_candidate_without_domain_support_is_rejected_before_backup_or_write(self):
         make(self.box, {'state/ddns.json': '{"provider":"desec"}'})
         for name in upgrade.NEEDED:
@@ -63,6 +149,8 @@ class UpgradeInPlaceTests(unittest.TestCase):
     """firmware/upgrade.py: a box keeps its first-run setup, iPhones, identity and settings (2026-10-14)."""
 
     def setUp(self):
+        selection = patch.object(upgrade, 'platform_environment', return_value={})
+        selection.start(); self.addCleanup(selection.stop)
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.box, self.bundle = Path(self.tmp.name, "box"), Path(self.tmp.name, "bundle")
         make(self.box, {

@@ -195,7 +195,8 @@ def main():
     stamp = state / "app-cds.classpath"
     if not stamp.exists() or stamp.read_text() != fingerprint:
         (state / "app-cds.jsa").unlink(missing_ok=True)
-        stamp.write_text(fingerprint)
+        # Publish a complete, synced fingerprint so an interrupted write cannot leave a partial stamp.
+        durable_write(stamp, fingerprint)
     # A dump interrupted by a restart leaves a truncated archive that the JVM then refuses ("bad magic
     # number", "invalid archive") and never replaces, costing ~3 s on every start (dp-0017, 2026-10-31:
     # 3.9 MB instead of ~39 MB). The last start's log says so; drop it and the JVM dumps a fresh one on exit.
@@ -241,12 +242,17 @@ def main():
         (state / "java.pid").write_text(str(process.pid) + "\n")
         for line in process.stdout:
             line = redact(line, token, password)
-            print(line, end="", flush=True)
-            # The JVM's timestamps follow the wall clock, which jumps when time is synced during boot
-            # (~27 s on 2026-10-11); mark milestones on the boot clock, comparable with "boot" lines.
-            milestone = next((name for key, name in MILESTONES if key in line), None)
-            if milestone:
-                print(f"boot {time.monotonic():.2f}s {milestone}", flush=True)
+            try:
+                print(line, end="", flush=True)
+                # The JVM's timestamps follow the wall clock, which jumps when time is synced during boot
+                # (~27 s on 2026-10-11); mark milestones on the boot clock, comparable with "boot" lines.
+                milestone = next((name for key, name in MILESTONES if key in line), None)
+                if milestone:
+                    print(f"boot {time.monotonic():.2f}s {milestone}", flush=True)
+            except (OSError, ValueError):
+                # A full log or closed output must not interrupt draining the JVM's pipe. Keep reading
+                # until it exits, and retry logging on the next line if storage becomes writable again.
+                pass
         raise SystemExit(process.wait())
 
 

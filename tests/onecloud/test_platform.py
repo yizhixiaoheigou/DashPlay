@@ -28,6 +28,89 @@ class PlatformTests(unittest.TestCase):
                 self.assertTrue(callable(getattr(self.platform, name)), name)
         self.assertEqual(self.platform.children, [])
 
+    def test_adaptive_dns_keeps_viewer_static_and_only_signals_dnsmasq(self):
+        from test_connectivity import sample
+        import setup_wizard
+        self.platform.run = self.root / 'run'
+        self.platform.connectivity_enabled = True
+        child = Mock()
+        with patch('connectivity.Monitor.start'), patch.object(self.platform, 'start', return_value=child) as start:
+            self.platform.start_dhcp(ipaddress.ip_interface('100.96.0.1/24'), False,
+                                     (*setup_wizard.TESLA_CHECK_NAMES, 'viewer.example'), router=True)
+            argv = start.call_args.args[1]
+            self.assertIn('--address=/viewer.example/100.96.0.1', argv)
+            self.assertIn('--local=/viewer.example/', argv)
+            self.assertNotIn('--address=/www.baidu.com/100.96.0.1', argv)
+            self.assertIn('--dhcp-option=3,100.96.0.1', argv)
+            self.assertIn('--dhcp-option=6,100.96.0.1', argv)
+            monitor = self.platform.connectivity
+            self.assertEqual(monitor.files.hosts.stat().st_mode & 0o777, 0o644)
+            monitor.probe = Mock(return_value=sample())
+            for _ in range(3): monitor.step()
+            monitor.probe.return_value = sample(False)
+            monitor.step(); monitor.step()
+            self.assertEqual(child.send_signal.call_args_list, [call(signal.SIGHUP)] * 2)
+            start.assert_called_once()
+            revision = monitor.revision
+            self.platform.set_phone_dns('192.0.2.1')
+            self.assertGreater(monitor.revision, revision)
+            self.platform.stop_child('dnsmasq')
+            self.assertTrue(monitor.stop.is_set())
+            self.assertIsNone(self.platform.connectivity)
+
+    def test_dynamic_file_failure_keeps_static_protection_and_local_viewer(self):
+        self.platform.run = self.root / 'run'
+        self.platform.connectivity_enabled = True
+        self.platform.connectivity_notify = Mock()
+        with patch('connectivity.DnsFiles.prepare', side_effect=OSError('synthetic disk failure')), \
+                patch.object(self.platform, 'start') as start:
+            self.platform.start_dhcp(ipaddress.ip_interface('100.96.0.1/24'), False,
+                                     ('www.baidu.com', 'viewer.example'), router=True)
+        argv = start.call_args.args[1]
+        self.assertIn('--address=/www.baidu.com/100.96.0.1', argv)
+        self.assertIn('--local=/viewer.example/', argv)
+        self.assertIsNone(self.platform.connectivity)
+        self.assertEqual(self.platform.connectivity_notify.call_args.args[0]['error'], 'OSError')
+
+    def test_box_internet_cannot_release_checks_before_sharing_is_ready(self):
+        import connectivity
+        self.platform.run = self.root / 'run'
+        self.platform.ap_interface = 'ap0'
+        self.platform.connectivity_enabled = True
+        names = (*connectivity.CHECKS, 'www.baidu.com')
+        with patch('connectivity.Monitor.start'), patch.object(self.platform, 'start'):
+            self.platform.start_dhcp(ipaddress.ip_interface('100.96.0.1/24'), False, names, router=True)
+        monitor = self.platform.connectivity
+        with patch.object(monitor.probe, 'route', return_value=('usb0', ['192.0.2.1'], 'usb0')), \
+                patch.object(monitor.probe, 'endpoint', return_value=True) as endpoint:
+            for _ in range(3): monitor.step()
+        self.assertEqual(monitor.files.applied, names, 'box internet alone does not prove forwarding to the car')
+        endpoint.assert_not_called()
+
+        # Only a completed installation of the AP's own rules can enable release.
+        self.platform.run.mkdir(exist_ok=True)
+        (self.platform.run / 'phone-uplink.json').write_text('{"network":null,"forward":"0"}')
+        with patch('platform_debian.subprocess.run', side_effect=OSError('iptables unavailable')), \
+                patch('setup_wizard.os.sync'), self.assertRaises(OSError):
+            self.platform.enable_phone_nat(ipaddress.ip_network('100.96.0.0/24'))
+        with patch('connectivity.ipv4_forwarding', return_value=True):
+            self.assertFalse(self.platform.sharing_ready('ap0'))
+        with patch('platform_debian.subprocess.run'), patch('setup_wizard.os.sync'):
+            self.platform.enable_phone_nat(ipaddress.ip_network('100.96.0.0/24'))
+        with patch('connectivity.ipv4_forwarding', return_value=True), \
+                patch.object(monitor.probe, 'route', return_value=('usb0', [], 'usb0')), \
+                patch.object(monitor.probe, 'endpoint', return_value=True):
+            self.assertTrue(self.platform.sharing_ready('ap0'))
+            self.assertFalse(self.platform.sharing_ready('wlan-test'))
+            for _ in range(2):
+                monitor.step(); self.assertEqual(monitor.files.applied, names)
+            monitor.step()
+            self.assertNotIn('www.baidu.com', monitor.files.applied)
+        with patch('connectivity.ipv4_forwarding', return_value=False), \
+                patch.object(monitor.probe, 'route', return_value=('usb0', [], 'usb0')):
+            monitor.step()
+        self.assertEqual(monitor.files.applied, names)
+
     @patch('platform_debian.subprocess.run')
     def test_scan_and_scanner_cache(self, run):
         run.return_value = Mock(returncode=0, stdout='BSS 00\n\tSSID: Test\n\tsignal: -40 dBm\n\tfreq: 5180\n')

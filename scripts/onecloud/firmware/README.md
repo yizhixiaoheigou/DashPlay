@@ -48,3 +48,30 @@ this repository's build), and inspect the unpacked rootfs: `burnimg.py extract I
 `burnimg.py unsparse X.sparse X.ext4`, then `debugfs -R "rdump /opt /etc /root /var/log …"` and
 `scripts/scan-sensitive.py` on the dump. Expect empty `identity/offline-mfi`, `state/` holding only
 `hotspot.json` and the AppCDS cache, no `/etc/ssh/ssh_host_*`, an empty `/etc/machine-id`, empty logs.
+
+## Firmware platform adapters
+
+The default adapter stays Debian/Armbian; OpenWrt selects its own adapter. Firmware may set
+`DASHPLAY_PLATFORM_MODULE` to a single Python module name in the main service environment and make it
+importable through `PYTHONPATH`. The module defines `Platform(interface="", **paths)`, implements the
+methods in `platform_api.Platform`, and may declare `PLATFORM_API_VERSION = 1`. Existing modules without
+a declaration are API 1. Module import must not change hardware state; initialization belongs in the
+constructor or lifecycle methods. Breaking interface changes require a new API version.
+
+Keep firmware modules, configuration and service drop-ins outside the application directory. They are
+not part of public program bundles or the previous-program archive. Program upgrade/rollback changes
+the main service unit, retaining its external drop-ins. A program update does not update firmware.
+
+The current Debian upgrader reads the main service's adapter selection independently of the process
+that launched the upgrade. Before stopping the service, it requires the candidate loader/API and imports
+the installed adapter against the candidate's dependencies without constructing it. Missing methods,
+unsupported APIs and adapters supplied from inside the application/candidate directory are rejected.
+This is an offline interface check, not proof of hardware behavior; normal post-install health checks and
+automatic rollback still apply. Firmware configuration must remain stable during an upgrade.
+
+A stopped service with EnvironmentFile settings must be started before checking; unreadable or changed
+service settings stop the upgrade. Old releases without the loader remain installable on default-adapter
+boxes, but are rejected on boxes selecting an external adapter. The retained version-selection tool also
+needs this capability: reopen it from the updated settings page to refresh an older copy. A first upgrade
+performed by an old tool still has that old tool's checks. Automatic recovery and `--rollback` restore the
+known previous-program archive rather than downloading another release; they do not replace firmware.

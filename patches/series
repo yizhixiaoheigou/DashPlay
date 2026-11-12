@@ -90,3 +90,4 @@ playport-browser-mode-sparse-flags.patch
 playport-active-phone-presence.patch
 playport-viewer-phone-disconnect.patch
 playport-phone-connection-confirmation.patch
+playport-wired-display-startup.patch

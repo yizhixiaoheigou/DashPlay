@@ -212,7 +212,7 @@ class MainActivity : Activity() {
             when {
                 !identity -> getString(R.string.iphone_no_identity)
                 snapshot.sessionActive -> getString(R.string.iphone_live, snapshot.phoneName ?: "iPhone")
-                settings.wiredCarPlaySupported && (!plan.wireless || settings.usesUsb && !bluetooth) -> AndroidWiredController.detail
+                !plan.wireless || settings.usesUsb && !bluetooth -> AndroidWiredController.detail
                 !bluetooth -> getString(R.string.iphone_no_bluetooth)
                 phones == null -> "暂时无法读取手机记录"
                 paused -> "已暂停自动连接"
@@ -226,7 +226,6 @@ class MainActivity : Activity() {
             },
         )
         val rows = listOf(networkRow, carRow, iphoneRow)
-        val wirelessProblem = WirelessReadiness.problem(this)
 
         fun setup(only: String? = null) = Intent(this, SetupActivity::class.java).also { if (only != null) it.putExtra(SetupActivity.EXTRA_ONLY, only) }
         return when {
@@ -234,26 +233,12 @@ class MainActivity : Activity() {
                 Home(getString(R.string.home_stopped), getString(R.string.home_stopped_sub), rows, getString(R.string.action_start)) {
                     DashPlayService.start(this)
                 }
-            !settings.setupDone -> Home(getString(R.string.home_needs_setup), getString(R.string.home_needs_setup_sub), rows, getString(R.string.action_setup)) {
-                startActivity(setup())
-            }
-            settings.connectionProblem(settings.network, settings.iphoneLink) != null ->
-                Home("请调整连接设置", settings.connectionProblem(settings.network, settings.iphoneLink)!!, rows, "连接设置") {
-                    startActivity(setup(SetupActivity.STEP_NETWORK))
-                }
-            !snapshot.sessionActive && wirelessProblem != null ->
-                Home("请设置无线网络", wirelessProblem, rows, "设置无线网络") {
-                    startActivity(setup(SetupActivity.STEP_WIFI))
-                }
             !identity -> Home(getString(R.string.home_needs_identity), getString(R.string.home_needs_identity_sub), rows, getString(R.string.action_import)) {
                 startActivity(setup(SetupActivity.STEP_IDENTITY))
             }
-            !snapshot.sessionActive && (settings.iphoneLink == IphoneLink.WIRED || settings.iphoneLink == IphoneLink.ANY && !settings.usbChoiceMade &&
-                packageManager.hasSystemFeature(PackageManager.FEATURE_USB_HOST)) &&
-                (!settings.usbEnabled || android.net.VpnService.prepare(this) != null) ->
-                Home("完成数据线授权", "首次需要允许本机 VPN 与 USB。是否使用 iPhone 网络，以数据线设置页保存的选择为准。", rows, "数据线连接设置") {
-                    startActivity(Intent(this, UsbActivity::class.java))
-                }
+            !settings.setupDone -> Home(getString(R.string.home_needs_setup), getString(R.string.home_needs_setup_sub), rows, getString(R.string.action_setup)) {
+                startActivity(setup())
+            }
             snapshot.status == Status.FAILED -> Home(getString(R.string.home_failed), snapshot.detail.orEmpty(), rows, getString(R.string.action_retry)) {
                 DashPlayService.restart(this)
             }
@@ -261,7 +246,7 @@ class MainActivity : Activity() {
                 Home("正在准备本地热点", DashPlayService.managedHotspot?.message.orEmpty(), rows, "本地热点设置") {
                     startActivity(Intent(this, HotspotActivity::class.java))
                 }
-            net == null && settings.network != Network.THIS_HOTSPOT -> Home("等待外部网络", snapshot.detail ?: "请让这台设备加入外部 Wi-Fi，或通过网线连接路由器。车机需能访问同一网络中的设备；本地接收不要求互联网。", rows, "打开系统网络设置") {
+            net == null && settings.network != Network.THIS_HOTSPOT -> Home("等待外部网络", "请让这台设备加入外部 Wi-Fi，或通过网线连接路由器。车机需能访问同一网络中的设备；本地接收不要求互联网。", rows, "打开系统网络设置") {
                 runCatching { startActivity(Intent(android.provider.Settings.ACTION_WIRELESS_SETTINGS)) }
                     .onFailure { startActivity(Intent(android.provider.Settings.ACTION_SETTINGS)) }
             }
@@ -276,13 +261,13 @@ class MainActivity : Activity() {
             ) {
                 DashPlayService.stop(this)
             }
-            settings.wiredCarPlaySupported && (!plan.wireless || settings.usesUsb && (!bluetooth || AndroidWiredController.status !in setOf("OFF", "CABLE", "TETHER"))) -> Home(getString(R.string.home_wired_only), AndroidWiredController.detail, rows, "数据线连接设置") {
+            !plan.wireless || settings.usesUsb && (!bluetooth || AndroidWiredController.status !in setOf("OFF", "CABLE", "TETHER")) -> Home(getString(R.string.home_wired_only), AndroidWiredController.detail, rows, "数据线连接设置") {
                 startActivity(Intent(this, UsbActivity::class.java))
             }
-            !bluetooth -> Home(getString(R.string.home_no_bluetooth), (if (settings.wiredCarPlaySupported) getString(R.string.home_no_bluetooth_sub) else ConnectionSupport.PHONE_NO_BLUETOOTH), rows, getString(R.string.settings)) {
+            !bluetooth -> Home(getString(R.string.home_no_bluetooth), getString(R.string.home_no_bluetooth_sub), rows, getString(R.string.settings)) {
                 startActivity(Intent(this, SettingsActivity::class.java))
             }
-            !settings.usesLocalHotspot && settings.connectionWifi() == null -> Home(getString(R.string.home_no_wifi_info), getString(R.string.home_no_wifi_info_sub), rows, getString(R.string.action_fill_wifi)) {
+            !settings.usesLocalHotspot && settings.hotspot() == null -> Home(getString(R.string.home_no_wifi_info), getString(R.string.home_no_wifi_info_sub), rows, getString(R.string.action_fill_wifi)) {
                 startActivity(setup(SetupActivity.STEP_WIFI))
             }
             phones == null -> Home("暂时无法读取手机记录", "请进入手机管理重试。原有记录已保留。", rows, "管理 iPhone") {
@@ -309,9 +294,8 @@ class MainActivity : Activity() {
     private fun refresh() {
         val home = home()
         val snapshot = DashPlayService.snapshot()
-        val link = DashPlayService.url
-        val hint = getString(R.string.browser_scheme_hint)
-        val key = listOf(home.head, home.sub, home.rows, home.action, snapshot.address, link, hint)
+        val hint = getString(if (Settings(this).car == Car.TESLA) R.string.address_tesla else R.string.address_hint)
+        val key = listOf(home.head, home.sub, home.rows, home.action, snapshot.address, hint)
         action.setOnClickListener { home.run(); refresh() }
         // The TV's own Add iPhone button would repeat the main one.
         addIphone?.visibility = if (home.action == getString(R.string.action_add_iphone)) View.GONE else View.VISIBLE
@@ -322,9 +306,10 @@ class MainActivity : Activity() {
             rows.removeAllViews()
             rows.addView(ui.list(home.rows.map { (name, value, light) -> ui.statusRow(name, value, light) }), ui.matchWidth())
             action.text = home.action
-            address.text = link?.substringBefore("?") ?: "—"
+            address.text = snapshot.address ?: "—"
             addressHint.text = hint
         }
+        val link = DashPlayService.url
         if (link != shownAddress) {
             shownAddress = link
             if (link != null) qr.setImageBitmap(ui.qr(link, QR_PIXELS)) else qr.setImageDrawable(null)
@@ -340,7 +325,7 @@ class MainActivity : Activity() {
             if (Build.VERSION.SDK_INT >= 33) add("android.permission.POST_NOTIFICATIONS")
             // iPhone USB Configuration 2 declares USB Audio Capture (mHasAudioCapture=true). Android 9+
             // refuses to show the "Always allow" USB checkbox or remember USB permission unless RECORD_AUDIO is granted.
-            if (Settings(this@MainActivity).let { it.wiredCarPlaySupported || it.usesUsb } && packageManager.hasSystemFeature(PackageManager.FEATURE_USB_HOST)) add("android.permission.RECORD_AUDIO")
+            if (packageManager.hasSystemFeature(PackageManager.FEATURE_USB_HOST)) add("android.permission.RECORD_AUDIO")
         }.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (wanted.isNotEmpty()) requestPermissions(wanted.toTypedArray(), REQUEST_PERMISSIONS)
     }

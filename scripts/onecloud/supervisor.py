@@ -89,10 +89,29 @@ def hotspot_attempts(channel, width):
     return attempts
 
 
+def recover_network_sharing(platform, say=print):
+    """Keep recovery records on failure; the caller then starts without sharing/joining.
+
+    Do not let a partial cleanup overwrite another record or turn into a service restart loop.
+    Both owners get an attempt even when the first cleanup fails.
+    """
+    ready = True
+    for name, cleanup in (("phone", platform.cleanup_phone_uplink), ("usb", platform.stop_usb_sharing)):
+        try:
+            cleanup()
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as error:
+            ready = False
+            say(f"Network recovery incomplete: {name}: {type(error).__name__}")
+    return ready
+
+
 def radio_hotspot(channel, width, five, quiet=6):
     """The box hotspot's (channel, width) on this radio: five is platform.five_ghz(). A radio without 5 GHz (the
     WCN3620 of Snapdragon 410 sticks) starts on 2.4 GHz channel quiet (quiet_channel) instead of failing on 149
     first; unknown keeps it. A 2.4 GHz channel set in service.json is kept as it is."""
+    from platform_debian import AP_CHANNELS
+    if channel not in AP_CHANNELS:
+        return quiet, 20
     return (quiet, 20) if channel > 14 and five is False else (channel, width)
 
 
@@ -205,6 +224,24 @@ def receiver_options(argv, state):
     return kept + ["--idle-release", str(idle_release(state)), *car_audio_args(state)]
 
 
+def wait_for_wifi_interface(timeout=60):
+    """Bound udev settling and interface polling by one monotonic deadline."""
+    deadline = time.monotonic() + timeout
+    while (left := deadline - time.monotonic()) > 0:
+        try:
+            subprocess.run(["udevadm", "settle", "--timeout=1"], capture_output=True,
+                           timeout=min(2, left))
+        except subprocess.TimeoutExpired:
+            pass
+        interface = setup_wizard.wifi_interface()
+        if interface and Path("/sys/class/net", interface).exists():
+            return interface
+        left = deadline - time.monotonic()
+        if left > 0:
+            time.sleep(min(0.5, left))
+    raise RuntimeError("No Wi-Fi interface found")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True, type=Path)
@@ -228,7 +265,7 @@ def main():
             "passphrase" in hotspot and not 8 <= len(hotspot["passphrase"]) <= 63):
         raise ValueError("Invalid hotspot credentials")
     for relative in ["run-receiver.py", "phone-presence.py", "pair-phone.py", "pairing_window.py", "setup_wizard.py",
-                     "settings_ui.py", "mdns_name.py", "debug_uplink.py", "status_light.py", "platform_api.py", "platform_debian.py", "diagnostics.py", "iphone-usb-bridge.py", "linux-bt-bridge/bt-bridge"]:
+                     "settings_ui.py", "mdns_name.py", "debug_uplink.py", "status_light.py", "platform_api.py", "platform_debian.py", "connectivity.py", "diagnostics.py", "iphone-usb-bridge.py", "linux-bt-bridge/bt-bridge"]:
         if not (root / relative).is_file():
             raise RuntimeError("Missing runtime input: " + relative)
     identity = [root / "identity/offline-mfi/identity.pk8", root / "identity/offline-mfi/certificate.p7b"]
@@ -245,20 +282,10 @@ def main():
     RUN.mkdir(mode=0o700, exist_ok=True)
     state = root / "state"
     if interface == "auto":
-        for _ in range(60):   # the unit may start before udev has named the dongle
-            # The kernel's "wlan0" is renamed to wlx<MAC> moments later; taking the old name made the
-            # service wait 30 s for an interface that no longer existed and fail once (2026-10-12).
-            subprocess.run(["udevadm", "settle", "--timeout=10"], capture_output=True)
-            interface = setup_wizard.wifi_interface() or "auto"
-            if interface != "auto" and Path("/sys/class/net", interface).exists():
-                break
-            time.sleep(0.5)
-        else:
-            raise RuntimeError("No Wi-Fi interface found")
+        interface = wait_for_wifi_interface()
     platform = get_platform(interface, run=RUN)
     platform.bluetooth_state = state
-    platform.cleanup_phone_uplink()  # restore MAC/NAT after an interrupted previous run
-    platform.stop_usb_sharing()      # and the USB-tethering NAT; its profiles are decided below
+    sharing_ready = recover_network_sharing(platform)
     setup = setup_wizard.load(state)
     # Tesla mode: the box hotspot moves to setup_wizard.SHARED_LAN, which a Tesla's browser opens (2026-10-14).
     tesla = tesla_mode(state)
@@ -285,7 +312,10 @@ def main():
         except (OSError, subprocess.SubprocessError):
             pass
         print(f"box hotspot: 2.4 GHz only; channel {quiet} is the quietest of {QUIET_CHANNELS}", flush=True)
-    channel, width = radio_hotspot(channel, width, five, quiet)
+    selected = radio_hotspot(channel, width, five, quiet)
+    if selected != (channel, width):
+        print(f"box hotspot: using channel {selected[0]} / {selected[1]} MHz", flush=True)
+    channel, width = selected
     platform.configure_hotspot(channel, width, hotspot["ssid"], ap_passphrase)
     stopped = threading.Event()
     reexec = []   # reason, when the configuration changed and the service should restart itself
@@ -295,6 +325,9 @@ def main():
     children = platform.children
     status = {"mode": "starting", "entries": [], "box_ssid": hotspot["ssid"], "home": f"http://{address.ip}/",
               "identity": have_identity, "ap_ip": str(address.ip), "tesla": tesla, "only_24ghz": five is False}
+
+    if not sharing_ready:
+        status["warning"] = "上次共享网络状态未能恢复，本次已暂停共享上网，保留设置和恢复记录。请重启盒子后重试。"
 
     def load_json(name):
         try:
@@ -441,6 +474,8 @@ def main():
             print(f"remote debugging: joining the phone hotspot for {debug_uplink.remaining(RUN) / 60:.0f} min", flush=True)
         # The iPhone on the box's own hotspot beside the joined one (design 5.2a): on by default for the car hotspot
         # when the radio can (setup_wizard.direct_phone); the user made it a normal choice on 2026-10-17.
+        if not sharing_ready:
+            car = None  # do not reuse station/AP ownership while its recovery is incomplete
         direct_requested = bool(car and not debug and setup.get('iphone') != 'wired' and
                                 setup_wizard.direct_phone(options(state), status["direct_capable"], use))
         status.pop('direct_phone', None)
@@ -572,7 +607,7 @@ def main():
             # 车机上网 (2026-10-31): "USB 共享网络" keeps the cable first and the saved phone hotspot as the
             # fallback, so unplugging the cable no longer leaves the box offline until it is plugged in again.
             daily = (use == "box_hotspot" and (setup.get("done") or setup.get("confirmed")) and not debug)
-            internet = options(state)["car_internet"]
+            internet = options(state)["car_internet"] if sharing_ready else "none"
             usb_tether = False
             wants_usb_tether = daily and internet == "usb_tether" and platform.wired_capable()
             if wants_usb_tether:
@@ -589,9 +624,15 @@ def main():
                     platform.disable_usb_tether()
                     wants_usb_tether = False
                     print(f"USB shared network unavailable: {type(error).__name__}", flush=True)
-            else:
+            elif sharing_ready:
                 platform.disable_usb_tether()
             daily_uplink = daily and internet in ("phone_hotspot", "usb_tether")
+            platform.connectivity_enabled = bool(daily_uplink and tesla)
+            def connectivity_status(snapshot):
+                from connectivity import description
+                status["connectivity"] = snapshot
+                status["tesla_internet"] = description(snapshot)
+            platform.connectivity_notify = connectivity_status
             if daily_uplink and (tesla or wants_usb_tether):
                 # usb_tether shares the uplink with the car (share=True) and keeps the AP while it joins.
                 uplink = PhoneUplink(platform, state, address, hotspot, channel, width, wait_for,
@@ -739,7 +780,7 @@ def main():
         if direct_ap:
             direct_ap.close()
         platform.remove_sta_network()
-        platform.stop_usb_sharing()
+        recover_network_sharing(platform)
         platform.flush_address()
         print("DashPlay services stopped", flush=True)
     if reexec and reexec[0] is not None:

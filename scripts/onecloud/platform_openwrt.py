@@ -181,6 +181,10 @@ def hottest(zones=Path("/sys/class/thermal")):
     return round(max(temps) / 1000, 1) if temps else None
 
 
+class HandoffUnavailable(RuntimeError):
+    """A failed Wi-Fi query is not evidence that the live network disappeared."""
+
+
 class OpenWrtPlatform(DebianPlatform):
     """Process handling, Bluetooth and addresses as on Debian; Wi-Fi is read from OpenWrt."""
 
@@ -201,8 +205,16 @@ class OpenWrtPlatform(DebianPlatform):
         device, address = interface_address(_ubus(f"network.interface.{network['network']}"))
         if not address:
             return None, f"network {network['network']} for Wi-Fi {network['ssid']} has no IPv4 address yet"
-        info = subprocess.run(["iw", "dev", network["ifname"], "info"], capture_output=True, text=True,
-                              timeout=5).stdout if live and network["ifname"] else ""
+        info = ""
+        if live and network["ifname"]:
+            try:
+                result = subprocess.run(["iw", "dev", network["ifname"], "info"], capture_output=True,
+                                        text=True, timeout=5)
+                if result.returncode:
+                    raise HandoffUnavailable("Wi-Fi 状态查询暂时失败，正在重试。")
+                info = result.stdout
+            except (OSError, subprocess.SubprocessError) as error:
+                raise HandoffUnavailable("Wi-Fi 状态查询暂时失败，正在重试。") from error
         channel = parse_channel(info) or (int(network["channel"]) if str(network["channel"]).isdigit() else None)
         if not channel:
             return None, f"Wi-Fi {network['ssid']} has no channel yet"

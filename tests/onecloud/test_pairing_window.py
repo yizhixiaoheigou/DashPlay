@@ -1,3 +1,5 @@
+import json
+from html.parser import HTMLParser
 import sys
 from pathlib import Path
 import tempfile
@@ -227,7 +229,23 @@ class PairingTests(unittest.TestCase):
         self.assertIn('<b>A</b><span>蓝牙 …00:01</span></span><span class=value>正在使用</span>',page)
         self.assertEqual(page.count('value=remove'),2)
         self.assertEqual(page.count('value=disconnect'),1)
-        self.assertIn('删除「&lt;B&gt;」',page)
+        # Compare the decoded confirmation, including the hostile-looking phone name:
+        # Unicode escapes keep the same text valid in old WebViews.
+        class DeleteButtons(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.handlers = []
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                if tag == 'button' and attrs.get('value') == 'remove':
+                    self.handlers.append(attrs['onclick'])
+        buttons = DeleteButtons(); buttons.feed(page)
+        self.assertEqual(len(buttons.handlers), 2)
+        confirmations = []
+        for handler in buttons.handlers:
+            self.assertTrue(handler.startswith('return confirm(') and handler.endswith(')'))
+            confirmations.append(json.loads(handler[len('return confirm('):-1]))
+        self.assertTrue(any('删除「<B>」' in value for value in confirmations))
         self.assertEqual(page.count('value=switch'),1)   # the other phone can take CarPlay over
         self.assertIn('切换到这部手机',page)
 

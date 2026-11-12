@@ -59,6 +59,7 @@ tar -xzf "$work/acme.tar.gz" -C "$work"
 cp "$work/acme.sh-$ACME_VERSION/acme.sh" "$stage/acme/acme.sh"
 cp "$work/acme.sh-$ACME_VERSION/dnsapi/dns_duckdns.sh" "$stage/acme/dnsapi/dns_duckdns.sh"
 cp "$repo/scripts/onecloud/acme/dnsapi/dns_desec.sh" "$stage/acme/dnsapi/dns_desec.sh"
+cp "$repo/scripts/onecloud/acme/dnsapi/dns_dp.sh" "$repo/scripts/onecloud/acme/dnsapi/dns_dynv6.sh" "$stage/acme/dnsapi/"
 cp "$work/acme.sh-$ACME_VERSION/LICENSE.md" "$stage/acme/LICENSE.md"
 [ "$(sha256 "$stage/acme/acme.sh")" = "$ACME_SHA256" ] || { echo "acme.sh hash mismatch" >&2; exit 1; }
 [ "$(sha256 "$stage/acme/dnsapi/dns_duckdns.sh")" = "$DUCKDNS_SHA256" ] || { echo "dns_duckdns.sh hash mismatch" >&2; exit 1; }

@@ -28,13 +28,15 @@ def inspect(root):
         raise ValueError("新程序无法读取设备已有的域名配置")
     name = own_domain.name_of(config)
     expected = raw["domain"].strip().lower().rstrip(".")
-    if config.get("provider") != "desec":
+    if config.get("provider", "duckdns") == "duckdns":
         expected = expected.removesuffix(".duckdns.org") + ".duckdns.org"
     if name != expected:
         raise ValueError("新程序解释出的域名与原配置不一致")
-    hook = "dns_desec.sh" if config.get("provider") == "desec" else "dns_duckdns.sh"
+    hook = own_domain.DNS_HOOKS[config.get("provider", "duckdns")] + ".sh"
     if not (Path(__file__).parent / "acme/dnsapi" / hook).is_file():
         raise ValueError("升级包缺少设备所需的 DNS 验证脚本")
+    if config.get("provider") in (own_domain.DNSPOD, own_domain.DYNV6) and not (Path(__file__).parent / "dns_provider.py").is_file():
+        raise ValueError("升级包缺少设备所需的 DNS 服务商模块")
     return config
 
 
@@ -111,7 +113,7 @@ def check(root, health=False, require_https=False):
         if require_https and not certificate:
             raise ValueError("升级后设备的有效域名证书不可用")
         setup = setup_wizard.load(state)
-        if config.get("provider") == "desec" and setup.get("mode") == "box_hotspot":
+        if config.get("provider") in own_domain.FULL_NAME_PROVIDERS and setup.get("mode") == "box_hotspot":
             settings = json.loads((Path(root) / "service.json").read_text())
             address, _ = setup_wizard.box_hotspot_address(
                 ipaddress.IPv4Interface(settings["address"]), setup_wizard.options(state).get("tesla"), [])

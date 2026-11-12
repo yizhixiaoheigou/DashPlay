@@ -1,10 +1,17 @@
 """System boundary for the shared receiver supervisor.
 
-get_platform() is the Debian/Armbian adapter (OneCloud, N1), which builds the network itself. OpenWrt
+get_platform() defaults to the Debian/Armbian adapter (OneCloud, N1). Firmware may select an external
+adapter with DASHPLAY_PLATFORM_MODULE; its files must live outside the program directory. OpenWrt
 keeps its own network: supervisor_openwrt.py uses platform_openwrt.OpenWrtPlatform explicitly, which
 only reads it. Never pick an adapter by distro detection.
 """
+import importlib
+import os
+from pathlib import Path
+import re
 from typing import Protocol
+
+PLATFORM_API_VERSION = 1
 
 
 class Platform(Protocol):
@@ -49,5 +56,55 @@ class Platform(Protocol):
 
 
 def get_platform(interface="", **paths) -> Platform:
+    return platform_class()(interface, **paths)
+
+
+def platform_class():
+    """Resolve the firmware's adapter without constructing it or touching the network.
+
+    Existing external adapters without a version declaration implement API 1. Future incompatible
+    changes must bump PLATFORM_API_VERSION; adapters may declare the version they require explicitly.
+    """
+    name = os.environ.get("DASHPLAY_PLATFORM_MODULE")
+    if name is not None:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise ValueError("invalid external platform module")
+        module = importlib.import_module(name)
+        if type(getattr(module, "PLATFORM_API_VERSION", 1)) is not int or \
+                getattr(module, "PLATFORM_API_VERSION", 1) != PLATFORM_API_VERSION:
+            raise ValueError("incompatible external platform API")
+        adapter = getattr(module, "Platform", None)
+        if not isinstance(adapter, type) or adapter.__module__ != name or any(
+                not callable(getattr(adapter, method, None)) for method, member in vars(Platform).items()
+                if not method.startswith("_") and callable(member)):
+            raise ValueError("incomplete external platform API")
+        return adapter
     from platform_debian import DebianPlatform
-    return DebianPlatform(interface, **paths)
+    return DebianPlatform
+
+
+def check_external(root):
+    """Offline upgrade check. Import only; adapters must keep module import free of hardware actions."""
+    name = os.environ.get("DASHPLAY_PLATFORM_MODULE")
+    if name is None:
+        raise ValueError("external platform not selected")
+    adapter = platform_class()
+    module = importlib.import_module(adapter.__module__)
+    source = Path(module.__file__).resolve()
+    if any(source.is_relative_to(base.resolve()) for base in (Path(root), Path(__file__).parent)):
+        raise ValueError("external platform must be outside the program")
+
+
+if __name__ == "__main__":
+    import contextlib
+    import io
+    import sys
+    try:
+        if len(sys.argv) != 3 or sys.argv[1] != "--check-external":
+            raise ValueError("invalid arguments")
+        # Firmware import errors/output may contain private paths or configuration.
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            check_external(sys.argv[2])
+    except BaseException:
+        raise SystemExit("external platform compatibility check failed") from None
+    print("platform-ok:1")

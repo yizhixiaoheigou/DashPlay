@@ -18,11 +18,13 @@ the session, and read the outcome afterwards:
 For the same system packages and services as when the box was installed (firmware/install.sh); a release
 that changes those says so and needs the firmware image instead.
 """
+import ast
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -31,6 +33,8 @@ import time
 
 ROOT = Path("/opt/dashplay")
 PREVIOUS = Path("/opt/dashplay-previous.tar")
+PROGRAM_BACKUP_FSYNC = 1  # capability checked by the updater without importing/executing this tool
+PLATFORM_UPGRADE_CHECK = 1
 UNIT = Path("/etc/systemd/system/dashplay.service")
 KEEP = ("state/", "identity/")          # the owner's data
 KEEP_FILES = ("service.json",)          # this box's own settings, written at installation
@@ -51,7 +55,16 @@ def plan(old, new):
     before, after = program_files(old), program_files(new)
     remove = sorted(before - after)
     write = sorted(p for p in after if p not in before or not same(Path(old) / p, Path(new) / p))
+    check_targets(old, write)
     return remove, write
+
+
+def check_targets(root, paths):
+    # A previously installed directory symlink must not redirect a public write into firmware files.
+    root = Path(root)
+    for name in paths:
+        if any((root / parent).is_symlink() for parent in Path(name).parents if str(parent) != '.'):
+            raise ValueError("升级目标目录包含符号链接，已停止")
 
 
 def same(a, b):
@@ -62,6 +75,7 @@ def same(a, b):
 
 def apply(old, new, remove, write):
     old, new = Path(old), Path(new)
+    check_targets(old, write)
     for path in write:
         source, target = new / path, old / path
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -132,11 +146,82 @@ def domain_check(program, root, health=False, require_https=False):
     return json.loads(result.stdout)
 
 
+def platform_environment():
+    """Read the main service's selection, even when invoked by the separate version service or CLI.
+
+    The running process also covers EnvironmentFile settings. For a stopped service only direct unit
+    Environment entries are supported; refuse unreadable/ambiguous settings instead of guessing.
+    """
+    result = subprocess.run(['systemctl', 'show', 'dashplay.service', '--property=Environment',
+                             '--property=EnvironmentFiles', '--property=MainPID'],
+                            capture_output=True, text=True, timeout=10)
+    if result.returncode:
+        raise ValueError("无法核对主服务的设备适配配置，已停止")
+    properties = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+    if 'MainPID' not in properties:
+        raise ValueError("无法核对主服务的设备适配配置，已停止")
+    wanted = ('DASHPLAY_PLATFORM_MODULE', 'PYTHONPATH')
+    declared = dict(item.split('=', 1) for item in shlex.split(properties.get('Environment', '')) if '=' in item)
+    declared = {key: value for key, value in declared.items() if key in wanted}
+    pid = int(properties['MainPID'])
+    if pid < 0:
+        raise ValueError("无法核对主服务的设备适配配置，已停止")
+    running = {}
+    if pid > 0:
+        raw = Path(f'/proc/{pid}/environ').read_bytes().decode()
+        running = dict(item.split('=', 1) for item in raw.split('\0') if '=' in item)
+        running = {key: value for key, value in running.items() if key in wanted}
+        if any(key in running and running[key] != value for key, value in declared.items()):
+            raise ValueError("主服务的设备适配配置已改变，请重启主服务后再升级")
+    elif properties.get('EnvironmentFiles'):
+        raise ValueError("请先启动主服务，再核对设备适配配置")
+    return {**running, **declared}
+
+
+def platform_check(program, root):
+    """Reject incompatible public bundles before backup, service stop or replacement."""
+    settings = platform_environment()
+    if 'DASHPLAY_PLATFORM_MODULE' not in settings:
+        return
+    source = Path(program) / 'platform_api.py'
+    try:
+        tree = ast.parse(source.read_text())
+        version = next(node.value.value for node in tree.body if isinstance(node, ast.Assign)
+                       and any(isinstance(t, ast.Name) and t.id == 'PLATFORM_API_VERSION' for t in node.targets)
+                       and isinstance(node.value, ast.Constant))
+    except (OSError, UnicodeError, SyntaxError, StopIteration):
+        raise ValueError("升级包缺少设备所需的适配入口，已停止") from None
+    if type(version) is not int or version != 1:
+        raise ValueError("升级包的设备适配接口不兼容，已停止")
+    env = os.environ.copy()
+    # Never let the installed program mask missing dependencies in the candidate.
+    paths = [str(Path(p).resolve()) for p in settings.get('PYTHONPATH', '').split(os.pathsep) if p]
+    paths = [p for p in paths if not Path(p).is_relative_to(Path(root).resolve())
+             and not Path(p).is_relative_to(Path(program).resolve())]
+    env['PYTHONPATH'] = os.pathsep.join(paths)
+    env['DASHPLAY_PLATFORM_MODULE'] = settings['DASHPLAY_PLATFORM_MODULE']
+    result = subprocess.run([sys.executable, '-B', str(source), '--check-external', str(root)],
+                            cwd=program, env=env, capture_output=True, text=True, timeout=30)
+    if result.returncode or result.stdout.strip() != 'platform-ok:1':
+        raise ValueError("升级包与设备已有适配不兼容，已停止")
+
+
 def backup(root):
-    with tarfile.open(PREVIOUS.with_suffix(".tar.tmp"), "w") as out:
+    temporary = PREVIOUS.with_suffix(".tar.tmp")
+    with tarfile.open(temporary, "w") as out:
         for path in sorted(program_files(root)):
             out.add(root / path, arcname=path, recursive=False)
-    os.replace(PREVIOUS.with_suffix(".tar.tmp"), PREVIOUS)
+    temporary.chmod(0o600)
+    # Close the tar (including its end records), then sync before publishing.
+    # A failure here keeps the previous archive and must not stop the service.
+    with temporary.open('rb') as saved:
+        os.fsync(saved.fileno())
+    os.replace(temporary, PREVIOUS)
+    directory = os.open(PREVIOUS.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def extract_bundle(bundle, staging):
@@ -189,13 +274,14 @@ def main(argv):
         if missing:
             raise SystemExit(f"{bundle} is not a DashPlay program bundle (missing {', '.join(missing)})")
         try:
+            platform_check(Path(staging), ROOT)
             expected = domain_check(Path(staging), ROOT)
+            remove, write = plan(ROOT, staging)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             say(str(error), log)
             return 1
         domain_file = ROOT / "state/ddns.json"
         domain_before = domain_file.read_bytes() if domain_file.exists() else None
-        remove, write = plan(ROOT, staging)
         print("\n".join([f"replace/add {p}" for p in write] + [f"remove {p}" for p in remove]) or "nothing to change")
         if dry:
             return 0
@@ -203,7 +289,11 @@ def main(argv):
             say(f"already at bundle {digest[:12]}", log)
             return 0
         say(f"upgrade to bundle sha256 {digest}: {len(write)} files new or changed, {len(remove)} removed", log)
-        backup(ROOT)
+        try:
+            backup(ROOT)
+        except (OSError, tarfile.TarError) as error:
+            say(f"program backup failed ({type(error).__name__}); current program left unchanged", log)
+            return 1
         say(f"previous program saved in {PREVIOUS}", log)
         # Stop before replacing hooks or modules a signer might still be using.
         if run("systemctl", "stop", "dashplay").returncode:

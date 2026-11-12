@@ -228,6 +228,8 @@ class SettingsPage:
         page = self
 
         class Handler(BaseHTTPRequestHandler):
+            timeout = 30   # a client abandoning a request must not retain a worker indefinitely
+
             def log_message(self, *_):   # keep tokens/passwords out of the journal
                 pass
 
@@ -276,11 +278,34 @@ class SettingsPage:
             def do_POST(self):
                 if not self._allowed():
                     return self._send(403, "forbidden")
-                length = int(self.headers.get("Content-Length") or 0)
+                lengths = self.headers.get_all("Content-Length", [])
+                if len(lengths) > 1 or self.headers.get("Transfer-Encoding") is not None:
+                    return self._send(400, "bad length")
+                text_length = lengths[0] if lengths else "0"
+                if not text_length.isascii() or not text_length.isdecimal():
+                    return self._send(400, "bad length")
+                try:
+                    length = int(text_length)
+                except ValueError:
+                    return self._send(400, "bad length")
                 if length > (CERT_BODY if self.path == "/cert" else MAX_BODY):
                     return self._send(413, "too large")
-                form = {k: v[0] for k, v in urllib.parse.parse_qs(self.rfile.read(length).decode(),
-                                                                 keep_blank_values=True).items()}
+                try:
+                    body = self.rfile.read(length)
+                    if len(body) != length:
+                        return self._send(400, "incomplete body")
+                    form = {k: v[0] for k, v in urllib.parse.parse_qs(body.decode(),
+                                                                     keep_blank_values=True).items()}
+                except TimeoutError:
+                    return self._send(408, "request timed out")
+                except UnicodeDecodeError:
+                    return self._send(400, "bad encoding")
+                version_host = None
+                if self.path == "/update" and form.get("action") == "versions":
+                    hosts = self.headers.get_all("Host", [])
+                    version_host = page.version_host(hosts[0], self.connection.getsockname()[0]) if len(hosts) == 1 else None
+                    if not version_host:
+                        return self._send(400, '无法确定盒子地址')
                 if self.path == "/audio-routes":
                     try:
                         routes = page.apply(self.path, form)
@@ -293,9 +318,9 @@ class SettingsPage:
                 except ValueError as error:
                     result = "错误：" + str(error)
                 if isinstance(result, tuple) and result[0] == 'versions':
-                    host = urllib.parse.urlsplit('http://' + self.headers.get('Host', '')).hostname
-                    if not host:
+                    if not version_host:
                         return self._send(400, '无法确定盒子地址')
+                    host = version_host
                     if ':' in host:
                         host = '[' + host + ']'
                     info = result[1]
@@ -318,9 +343,36 @@ class SettingsPage:
     def home(self):
         return self.status().get("home", "/")
 
+    def version_host(self, authority, local_address):
+        """Return only a configured box name/address or this connection's local endpoint.
+
+        LAN client subnets are not a redirect allowlist: another device there must never receive
+        the version-manager token. Do not resolve caller-supplied DNS names to establish trust.
+        """
+        if not authority or any(ord(char) <= 32 or ord(char) == 127 or char in '/\\@?#%' for char in authority):
+            return None
+        try:
+            parsed = urllib.parse.urlsplit('//' + authority)
+            host = parsed.hostname
+            parsed.port   # validate the optional port even though the manager has its own port
+            home = urllib.parse.urlsplit(self.home()).hostname
+        except ValueError:
+            return None
+        if not host:
+            return None
+        def canonical(value):
+            try:
+                return str(ipaddress.ip_address(value))
+            except ValueError:
+                return value.lower().rstrip('.')
+        ddns = own_domain.load(self.state) or {}
+        trusted = (local_address, home, setup_wizard.MDNS_NAME, own_domain.name_of(ddns))
+        host = canonical(host)
+        return host if host in {canonical(value) for value in trusted if value} else None
+
     def tesla_check(self, host, path="/"):
         status = self.status()
-        enabled = status.get("tesla_offline") if self.managed or status.get("tesla_lan_stable") else setup_wizard.tesla_offline(
+        enabled = status.get("tesla_offline") if self.managed or status.get("tesla_lan_stable") or status.get("connectivity") else setup_wizard.tesla_offline(
             self.setup(), setup_wizard.options(self.state),
             status.get("uplink", {}).get("phase") in ("online", "wired"))
         return setup_wizard.check_response(host, path) if enabled and status.get("mode") in ("ap", "openwrt") else None
@@ -606,6 +658,9 @@ class SettingsPage:
             cells += (f'<form method=post action=/update>{ui.hidden(nonce)}<button class="cell action" name=action '
                       'value=install>立即升级（约 2–5 分钟，期间 CarPlay 会断开）</button></form>' if found.get("online") else
                       f'<p class=note>{escape(found.get("reason") or "这一版改了系统")}，不能在线升级：请按装机说明用刷机包升级。</p>')
+            if found.get("online") and not self.managed:
+                cells += ('<p class=note>请停车后升级。有线 CarPlay 可保持连接，请勿拔线：先下载、校验并备份，'
+                          '再自动断开 CarPlay 安装。下载失败不会主动断开；无线 CarPlay 请先断开。</p>')
         elif found.get("latest"):
             cells += (f'<div class=cell><span class=main><b>已是最新</b></span>'
                       f'<span class=value>{escape(found["latest"])}</span></div>')
@@ -709,7 +764,7 @@ class SettingsPage:
                 f'<div class=inner style="padding:0 0 12px">{form}<p class=note>调试中想恢复：给盒子拔电再插上，就回到原来的网络；或等 30 分钟自动结束。</p></div></details>{actions}')
 
     def save_ddns(self, form):
-        """Own DuckDNS name (own_domain.py); a new name or turning it off drops the old name's certificate.
+        """Owner-configured domain (own_domain.py); a new name or turning it off drops the old certificate.
         A deSEC name is configured when the box is prepared (state/ddns.json), not from this page."""
         old = own_domain.load(self.state)
         if old and old.get("provider") == own_domain.DESEC:
@@ -719,18 +774,26 @@ class SettingsPage:
             own_domain.forget_certificate(self.state)
             self.apply_later("own domain cleared")
             return "已关闭自己的域名，盒子约 1 分钟后改回自带证书。"
-        domain = own_domain.sub_domain(form.get("domain"))
+        provider = (form.get("provider") or "duckdns").strip().lower()
+        domain = (own_domain.sub_domain(form.get("domain")) if provider == "duckdns"
+                  else own_domain.domain_name(form.get("domain")))
         token = (form.get("token") or "").strip()
-        if not token and old and old["domain"] == domain:
-            token = old["token"]   # left empty: keep the saved one
-        token = own_domain.check_token(token)
-        if not old or old["domain"] != domain:
-            own_domain.forget_certificate(self.state)
+        token_id = (form.get("dnspod_id") or "").strip()
+        if old and old.get("provider", "duckdns") == provider and old["domain"] == domain:
+            if provider == own_domain.DNSPOD and token_id and token_id != old.get("id") and not token:
+                raise ValueError("更换 DNSPod Token ID 时，请一起填写对应的新 Token。")
+            token = token or old["token"]
+            token_id = token_id or old.get("id", "")
+        config = own_domain.provider_config(provider, domain, token, token_id)
         # Public IPv6 only where the box joins a hotspot: on its own hotspot it has no public address.
-        ipv6 = form.get("ipv6") == "on" and self.setup().get("mode") in setup_wizard.JOINS
-        _save(self.ddns_file, {"domain": domain, "token": token, **({"ipv6": True} if ipv6 else {})})
+        ipv6 = provider == "duckdns" and form.get("ipv6") == "on" and self.setup().get("mode") in setup_wizard.JOINS
+        if ipv6:
+            config["ipv6"] = True
+        _save(self.ddns_file, config)
+        if own_domain.name_of(old) != own_domain.name_of(config):
+            own_domain.forget_certificate(self.state)
         self.apply_later("own domain saved")
-        return (f"已保存 {domain}{own_domain.SUFFIX}。盒子约 1 分钟后重启服务，联网时自动更新解析并申请正式证书"
+        return (f"已保存 {own_domain.name_of(config)}。盒子约 1 分钟后重启服务，联网时自动更新解析并申请正式证书"
                 "（几分钟），下次开机起用。")
 
     def apply_certificate(self, form):
@@ -776,7 +839,7 @@ class SettingsPage:
         return actions
 
     def ddns_block(self, nonce, mode):
-        """Advanced: the own DuckDNS name. On OpenWrt LuCI sets it; this page only tells how it is going."""
+        """Advanced: own domain. On OpenWrt LuCI sets it; this page only tells how it is going."""
         name = self.status().get("own_name")
         if self.managed:
             return (f'<div class=cell><span class=main><b>自己的域名</b><span>{escape(own_domain.message(self.state, name))}'
@@ -788,22 +851,34 @@ class SettingsPage:
                     '<p class=foot>这个域名已由设备提供方配置。证书到期前，盒子联网会自动续期。'
                     '更换域名请联系设备提供方。</p>'
                     + self.certificate_actions(nonce, ddns, name))
+        provider = ddns.get("provider", "duckdns")
+        choices = ''.join(f'<option value="{key}"{" selected" if provider == key else ""}>{label}</option>'
+                          for key, label in (("duckdns", "DuckDNS"), ("dnspod", "DNSPod"), ("dynv6", "dynv6")))
         form = (f'<form method=post action=/ddns>{ui.hidden(nonce)}<div class=group>'
-                f'<label class=cell><span class=main><b>子域名</b></span><input type=text name=domain '
-                f'value="{escape(ddns.get("domain", ""))}" placeholder="如 mycar" required autocapitalize=off '
+                '<label class=cell><span class=main><b>域名服务商</b></span>'
+                f'<select name=provider id=ddns-provider>{choices}</select></label>'
+                '<label class=cell><span class=main><b>域名</b><span>DuckDNS 可只填子域名；其他服务商填完整域名</span></span><input type=text name=domain '
+                f'value="{escape(ddns.get("domain", ""))}" placeholder="mycar 或 box.example.com" required autocapitalize=off '
                 'style="text-align:right"></label>'
+                '<label class=cell id=ddns-id><span class=main><b>DNSPod Token ID</b><span>仅 DNSPod 必填</span></span>'
+                '<input type=text name=dnspod_id inputmode=numeric autocomplete=off '
+                f'placeholder="{"留空表示不修改" if ddns.get("id") else "数字 ID"}" style="text-align:right"></label>'
                 '<label class=cell><span class=main><b>Token</b></span><input type=password name=token '
                 f'placeholder="{"留空表示不修改" if ddns else "必填"}" autocomplete=off style="text-align:right"></label>'
-                + ('<label class=cell><span class=main><b>同时登记公网 IPv6</b><span>车机不让打开 192.168.x.x 这类局域网地址时才勾选</span>'
+                + ('<label class=cell id=ddns-v6><span class=main><b>同时登记公网 IPv6</b><span>仅 DuckDNS：车机不让打开局域网地址时才勾选</span>'
                    f'</span><input type=checkbox name=ipv6 value=on{" checked" if ddns.get("ipv6") else ""}></label>'
                    if mode in setup_wizard.JOINS else "") + '</div>'
                 '<button class="btn plain" name=action value=save>保存</button></form>'
+                '<script>(function(){var s=document.getElementById("ddns-provider");'
+                'function show(){document.getElementById("ddns-id").style.display=s.value==="dnspod"?"":"none";'
+                'var v=document.getElementById("ddns-v6");if(v){v.style.display=s.value==="duckdns"?"":"none";}}'
+                's.onchange=function(){s.form.elements.token.value="";s.form.elements.dnspod_id.value="";show();};show();})();</script>'
                 + (f'<form method=post action=/ddns>{ui.hidden(nonce)}<button class="btn plain" name=action value=clear '
                    'onclick="return confirm(\'关闭后车机改用盒子自带证书的地址，确定？\')">关闭</button></form>' if ddns else ""))
         state = (own_domain.message(self.state, name, mode == "box_hotspot", retry=bool(self.retry_cert))
                  if ddns else "")
         # Only where the car asks the box (its hotspot) and only when it can be turned off (not Tesla mode).
-        if ddns and mode == "box_hotspot" and not setup_wizard.options(self.state).get("tesla"):
+        if ddns and provider == "duckdns" and mode == "box_hotspot" and not setup_wizard.options(self.state).get("tesla"):
             form += f'<div class=group style="margin-top:12px">{self.car_audio_block(nonce, "own_name")}</div>'
         actions = self.certificate_actions(nonce, ddns, name)
         ipv6 = ('勾选「同时登记公网 IPv6」后，盒子把自己的公网 IPv6 地址也登记到这个域名：车机拿到的是公网地址，'
@@ -814,8 +889,14 @@ class SettingsPage:
                 f'<span class=value>{escape(name or "未设置")}</span><span class=chev></span></summary>'
                 f'<div class=inner style="padding:0 0 12px">{form}'
                 + (f'<p class=foot>{escape(state)}</p>' if state else "") + actions +
-                '<p class=foot>在 duckdns.org 免费注册并建一个子域名，把子域名和页面上的 token 填在这里。盒子会把这个域名指向自己，'
-                f'并向 Let’s Encrypt 申请免费的正式证书、到期前自动续签；车机改用 https://子域名.duckdns.org:{viewer_port.resolve(self.state)}/ 打开，'
+                '<p class=foot>DuckDNS：在 duckdns.org 创建子域名并复制 Token。DNSPod：准备由 DNSPod 托管的域名，'
+                '在 API Token 页面创建 Token ID 和 Token（不是腾讯云 SecretId/SecretKey）。dynv6：创建域名，'
+                '在 Keys 页面创建可管理该域名的 HTTP Token。更换服务商或域名时，必须重新填写对应凭据。</p>'
+                '<p class=foot>请使用专供 DashPlay 的域名。DNSPod/dynv6 自动维护该名称的 IPv4 地址；已有冲突的 AAAA、CNAME '
+                '或多条 A 记录时会提示处理，不覆盖其他用途的记录。连车机热点或随身 WiFi 时，会将盒子的局域网地址登记到公网 DNS；'
+                '若该网络过滤局域网解析，仍需使用 IP 地址。连盒子热点时，默认由盒子直接解析。</p>'
+                '<p class=foot>盒子向 Let’s Encrypt 申请免费的正式证书、到期前自动续签；'
+                f'车机用 https://域名:{viewer_port.resolve(self.state)}/ 打开，'
                 f'不再有证书警告。不需要开放任何端口。{ipv6}'
                 + ('盒子热点方式在车上没有网络，申请和续签要在家插上网线开机。' if mode == "box_hotspot" else "") + '</p></div></details>')
 
@@ -977,7 +1058,12 @@ class SettingsPage:
         current = self.status().get('uplink', {})
         phase = current.get('phase')
         label = internet_label(chosen, saved, current, self.status().get('tesla_lan_stable'))
-        rows = ui.banner(label, 'ok' if phase in ('online', 'wired') else 'wait')
+        health = self.status().get('connectivity')
+        if health:
+            from connectivity import description
+            label = description(health)
+        ready = health.get('internet') and not health.get('error') if health else phase in ('online', 'wired')
+        rows = ui.banner(label, 'ok' if ready else 'wait')
         rows += f'<form method=post action=/internet>{ui.hidden(nonce)}'
         choices = [('none', '不上网'), ('phone_hotspot', '连接 WiFi 热点（手机或随身 WiFi）')]
         if self.wired_capable():
@@ -1311,9 +1397,9 @@ class SettingsPage:
                 f'<input type=number name=viewer_port min=1024 max=65535 value={viewer_port.resolve(self.state)}></label>'
                 '<button class="cell action">保存端口</button></form>'
                 f'<form method=post action=/idle-release>{ui.hidden(nonce)}'
-                f'<label class=cell><span class=main><b>没人看画面时释放 iPhone（秒）</b>'
-                '<span>没有网页在看画面超过这么久，就结束无线 CarPlay，iPhone 不再发热；再打开画面约 7 秒出图。'
-                '默认 300，0 为永不释放</span></span>'
+                f'<label class=cell><span class=main><b>无人观看时结束无线 CarPlay（秒）</b>'
+                '<span>没有网页观看画面超过设定时间，就结束无线 CarPlay；再次打开画面会尝试重新连接。'
+                '此设置不作用于有线 CarPlay 或 USB 共享网络。默认 300 秒，0 表示不自动结束。</span></span>'
                 f'<input type=number name=idle_release min=0 max={IDLE_RELEASE_MAX} value={idle_release(self.state)}></label>'
                 '<button class="cell action">保存</button></form>')
 
@@ -1404,8 +1490,8 @@ class SettingsPage:
                        f'<span class=value>{escape(status.get("ssid", "") or "等待 WiFi")}</span></div>'
                        f'<a class=cell href="{escape(admin)}"><span class=main><b>在 {self.managed["by"]} 后台设置 WiFi</b>'
                        '<span>WiFi 名称、密码或信道改了以后，DashPlay 会自动跟着改</span></span><span class=chev></span></a>')
-            if status.get("warning"):
-                fallback = ui.banner(escape(status["warning"]), "bad")
+        if status.get("warning"):
+            fallback = ui.banner(escape(status["warning"]), "bad")
         # Why the head unit may not open the picture, and what to do, in the order to try (2026-10-13).
         reach = (('<a class=cell href="/ca.crt"><span class=main><b>下载盒子 CA 证书</b><span>装到车机上，证书警告就没了</span></span><span class=chev></span></a>'
                   if self.ca_file.exists() else "") + self.ddns_block(nonce, mode))
@@ -1416,7 +1502,7 @@ class SettingsPage:
         # The box answers its own name on its hotspot by default (2026-10-29). A car that keeps its own LTE can then
         # fail to resolve anything else: say where to turn that off, not only inside the folded "own domain" group.
         own = own_domain.load(self.state) or {}
-        if (own and mode == "box_hotspot" and not self.managed and own.get("provider") != own_domain.DESEC
+        if (own and mode == "box_hotspot" and not self.managed and own.get("provider") not in own_domain.FULL_NAME_PROVIDERS
                 and not setup_wizard.options(self.state).get("tesla")):
             reach_foot += ("车机连盒子热点时，盒子默认替车机回答自己的域名；如果车机自带的应用因此上不了网，"
                            "在下面「自己的域名」里关掉「由盒子告诉车机域名在哪」。")

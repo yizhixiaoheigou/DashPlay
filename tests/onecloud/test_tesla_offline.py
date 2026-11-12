@@ -55,6 +55,22 @@ class TeslaOfflineTests(unittest.TestCase):
         (self.state / 'options.json').write_text(json.dumps({'tesla': False, 'local_dns': True}))
         self.assertFalse(supervisor.hotspot_router(self.state, 'box_hotspot'))
 
+    def test_connected_uplink_without_internet_is_not_shown_as_online(self):
+        from connectivity import description
+        status = {'mode': 'ap', 'uplink': {'phase': 'wired'}, 'tesla_lan_stable': True,
+                  'connectivity': {'link': True, 'internet': False, 'mode': 'protect'}}
+        page = SettingsPage(self.state, lambda: status, lambda _: None, lambda: [])
+        with patch.object(page, 'wired_capable', return_value=False):
+            html = page.internet_block('test-nonce')
+        self.assertIn(description(status['connectivity']), html)
+        self.assertIn('外网未通过检测', html)
+
+    def test_cached_local_check_http_remains_available_after_dns_release(self):
+        status = {'mode': 'ap', 'tesla_lan_stable': True, 'tesla_offline': True,
+                  'connectivity': {'internet': True, 'local': [], 'mode': 'public'}}
+        page = SettingsPage(self.state, lambda: status, lambda _: None, lambda: [])
+        self.assertIsNotNone(page.tesla_check(wizard.CONNMAN_NAMES[0]))
+
     def test_http_exact_reply_precedes_access_and_captive_checks(self):
         status = {'mode': 'ap', 'home': 'http://100.96.0.1/'}
         page = SettingsPage(self.state, lambda: status, lambda _: None, lambda: [])

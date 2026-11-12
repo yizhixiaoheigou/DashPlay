@@ -1,5 +1,6 @@
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -119,6 +120,31 @@ class DiagLogTests(unittest.TestCase):
         self.assertEqual(record['direct_phone'], 'validation')
         self.assertEqual(record['tesla_dns_log'], 'stopped')
 
+    def test_write_failure_and_broken_error_output_do_not_stop_diagnostics(self):
+        for fail_at in (1, 2):  # First startup event, or the first periodic record.
+            with self.subTest(fail_at=fail_at):
+                log = diagnostics.DiagLog(self.dir / str(fail_at))
+                append, calls = log.append, []
+                def write(record):
+                    calls.append(record)
+                    if len(calls) == fail_at:
+                        raise OSError(28, 'synthetic disk full')
+                    append(record)
+                platform = Mock()
+                platform.boot_id.return_value = 'synthetic-boot'
+                platform.diagnostics.return_value = {'sample': 'recovered'}
+                stopped = Mock()
+                stopped.wait.side_effect = [False, False, True]
+                with patch.object(log, 'append', side_effect=write), \
+                        patch('diagnostics.threading.Thread') as thread, \
+                        patch('diagnostics.net_counters', return_value={}), \
+                        patch('builtins.print', side_effect=BrokenPipeError('synthetic closed output')):
+                    diagnostics.start(stopped, log, Path(self.tmp.name) / 'receiver.log', platform, {'mode': 'sta'})
+                    thread.return_value.start.assert_called_once()
+                    thread.call_args.kwargs['target']()
+                self.assertEqual(len(calls), 3)
+                self.assertEqual(json.loads(log.text().splitlines()[-1])['sample'], 'recovered')
+
 
 
 class LogMirrorTests(unittest.TestCase):
@@ -128,6 +154,65 @@ class LogMirrorTests(unittest.TestCase):
         self.root, self.run = Path(tmp.name) / 'logs', Path(tmp.name) / 'run'
         self.root.mkdir()
         self.run.mkdir()
+
+    def test_startup_storage_failures_are_retried_in_worker_and_logs_resume(self):
+        (self.run / 'receiver.log').write_text('synthetic recovered log\n')
+        for stage in ('mkdir', 'utime', 'prune'):
+            with self.subTest(stage=stage):
+                mirror = diagnostics.LogMirror(self.root, self.run, 'case-' + stage, journal=False)
+                stopped = Mock()
+                stopped.wait.side_effect = [False, True]
+                target = {'mkdir': Path, 'utime': diagnostics.os, 'prune': mirror}[stage]
+                original = getattr(target, stage)
+                attempts = []
+                def fail_once(*args, **kwargs):
+                    attempts.append(True)
+                    if len(attempts) == 1:
+                        raise OSError(28, 'synthetic disk full')
+                    return original(*args, **kwargs)
+                opened = []
+                open_file = os.open
+                def track_open(*args, **kwargs):
+                    fd = open_file(*args, **kwargs)
+                    opened.append((Path(args[0]), fd))
+                    return fd
+                with patch.object(target, stage, autospec=True, side_effect=fail_once), \
+                        patch('diagnostics.threading.Thread') as thread, \
+                        patch('diagnostics.os.open', side_effect=track_open), \
+                        patch('builtins.print', side_effect=OSError('synthetic output full')):
+                    mirror.start(stopped)
+                    thread.return_value.start.assert_called_once()
+                    self.assertEqual(attempts, [], 'storage setup must not run on the supervisor thread')
+                    thread.call_args.kwargs['target']()
+                self.assertGreaterEqual(len(attempts), 2)
+                self.assertEqual((mirror.directory / 'receiver.log').read_text(), 'synthetic recovered log\n')
+                self.assertEqual(sum(path.name == 'receiver.log' for path, _ in opened), 1)
+                for _, fd in opened:
+                    with self.assertRaises(OSError):
+                        os.fstat(fd)
+
+    def test_persistent_storage_failure_can_stop_without_running_a_copy_cycle(self):
+        mirror = diagnostics.LogMirror(self.root, self.run, 'unwritable', journal=False)
+        stopped = Mock()
+        stopped.wait.return_value = True
+        with patch('diagnostics.Path.mkdir', side_effect=OSError(30, 'synthetic readonly disk')), \
+                patch('diagnostics.threading.Thread') as thread, patch.object(mirror, 'cycle') as cycle, \
+                patch('builtins.print', side_effect=BrokenPipeError('synthetic closed output')):
+            mirror.start(stopped)
+            thread.call_args.kwargs['target']()
+        cycle.assert_not_called()
+        stopped.wait.assert_called_once_with(diagnostics.MIRROR_INTERVAL)
+
+    def test_cycle_failure_and_broken_output_do_not_end_mirror_worker(self):
+        mirror = diagnostics.LogMirror(self.root, self.run, 'runtime', journal=False)
+        stopped = Mock()
+        stopped.wait.side_effect = [False, True]
+        with patch.object(mirror, 'cycle', side_effect=[OSError(28, 'synthetic full disk'), None, None]) as cycle, \
+                patch('diagnostics.threading.Thread') as thread, \
+                patch('builtins.print', side_effect=OSError('synthetic output full')):
+            mirror.start(stopped)
+            thread.call_args.kwargs['target']()
+        self.assertEqual(cycle.call_count, 3, 'the next periodic cycle and final shutdown cycle still run')
 
     @patch('diagnostics.subprocess.run')
     def test_full_logs_survive_restarts_and_truncation(self, run):
@@ -164,6 +249,87 @@ class LogMirrorTests(unittest.TestCase):
         self.assertEqual((mirror.directory / 'supervisor.log').read_text(), 'boot 12.0s supervisor start\n')
         self.assertFalse((mirror.directory / 'journal.log').exists())
 
+    def offset_fixture(self):
+        source = self.run / 'receiver.log'
+        source.write_text('first\n')
+        mirror = diagnostics.LogMirror(self.root, self.run, 'offsets', journal=False)
+        mirror.directory.mkdir()
+        offsets, handles = {}, {}
+        self.addCleanup(lambda: [os.close(fd) for fd in handles.values()])
+        mirror.cycle(offsets, handles)
+        before = mirror.state_file.read_bytes()
+        with source.open('a') as out:
+            out.write('second\n')
+        return mirror, offsets, handles, before
+
+    def test_partial_progress_write_preserves_last_complete_checkpoint(self):
+        mirror, offsets, handles, before = self.offset_fixture()
+        open_file = Path.open
+        class FailingWriter:
+            def __init__(self, stream): self.stream = stream
+            def __enter__(self): return self
+            def __exit__(self, *args): self.stream.close()
+            def __getattr__(self, key): return getattr(self.stream, key)
+            def write(self, text):
+                self.stream.write(text[:3])
+                self.stream.flush()
+                raise OSError('synthetic interrupted progress write')
+        def open_(path, mode='r', *args, **kwargs):
+            stream = open_file(path, mode, *args, **kwargs)
+            if 'w' in mode and path.parent == mirror.directory and path.name.startswith('.offsets'):
+                return FailingWriter(stream)
+            return stream
+        with patch.object(Path, 'open', new=open_):
+            with self.assertRaisesRegex(OSError, 'interrupted progress write'):
+                mirror.cycle(offsets, handles)
+        self.assertEqual(mirror.state_file.read_bytes(), before)
+        self.assertEqual(mirror.load()['receiver.log'][1], len(b'first\n'))
+        # A retry in this process publishes the already-copied bytes without appending them again.
+        mirror.cycle(offsets, handles)
+        self.assertEqual(mirror.load()['receiver.log'][1], len(b'first\nsecond\n'))
+        self.assertEqual((mirror.directory / 'receiver.log').read_bytes(), b'first\nsecond\n')
+
+    def test_progress_replace_failure_keeps_old_checkpoint(self):
+        mirror, offsets, handles, before = self.offset_fixture()
+        with patch.object(diagnostics.os, 'replace', side_effect=OSError('synthetic rename failure')):
+            with self.assertRaisesRegex(OSError, 'rename failure'):
+                mirror.cycle(offsets, handles)
+        self.assertEqual(mirror.state_file.read_bytes(), before)
+
+    def test_logs_then_progress_then_directory_are_synced(self):
+        mirror, offsets, handles, before = self.offset_fixture()
+        events = []
+        fsync, replace = os.fsync, os.replace
+        def sync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                events.append('directory')
+            elif fd in handles.values():
+                events.append('log')
+            else:
+                events.append('progress')
+                self.assertEqual(mirror.state_file.read_bytes(), before)
+            fsync(fd)
+        def publish(source, target):
+            events.append('replace')
+            self.assertEqual(json.loads(Path(source).read_text())['receiver.log'][1], len(b'first\nsecond\n'))
+            replace(source, target)
+        with patch.object(diagnostics.os, 'fsync', side_effect=sync), \
+                patch.object(diagnostics.os, 'replace', side_effect=publish):
+            mirror.cycle(offsets, handles)
+        self.assertEqual(events, ['log', 'progress', 'replace', 'directory'])
+
+    def test_progress_sync_failure_keeps_old_checkpoint(self):
+        mirror, offsets, handles, before = self.offset_fixture()
+        fsync = os.fsync
+        def sync(fd):
+            if fd not in handles.values() and not stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError('synthetic checkpoint sync failure')
+            fsync(fd)
+        with patch.object(diagnostics.os, 'fsync', side_effect=sync):
+            with self.assertRaisesRegex(OSError, 'checkpoint sync failure'):
+                mirror.cycle(offsets, handles)
+        self.assertEqual(mirror.state_file.read_bytes(), before)
+
     def test_old_boots_are_pruned(self):
         for index in range(12):
             (self.root / f'boot{index:02d}').mkdir()
@@ -175,6 +341,117 @@ class LogMirrorTests(unittest.TestCase):
         self.assertEqual(len(left), diagnostics.LOG_BOOTS)
         self.assertIn('current0', left)
         self.assertNotIn('boot00', left)
+
+    def saved_boot(self, name, size, modified):
+        directory = self.root / name
+        (directory / 'nested').mkdir(parents=True)
+        (directory / 'nested/receiver.log').write_bytes(b'x' * size)
+        os.utime(directory, (modified, modified))
+        return directory
+
+    def test_byte_budget_keeps_exact_fit_then_removes_oldest_boot(self):
+        oldest = self.saved_boot('z-oldest', 60, 1)
+        newest = self.saved_boot('a-newest', 25, 2)
+        mirror = diagnostics.LogMirror(self.root, self.run, 'current0', journal=False)
+        mirror.directory.mkdir()
+        current = mirror.directory / 'receiver.log'
+        current.write_bytes(b'x' * 15)
+        with patch.object(diagnostics, 'LOG_TOTAL_MAX', 100, create=True):
+            mirror.prune()
+            self.assertTrue(oldest.exists(), 'an exact fit must not discard history')
+            current.write_bytes(b'x' * 16)
+            mirror.prune()
+        self.assertFalse(oldest.exists())
+        self.assertTrue(newest.exists())
+        self.assertEqual(current.stat().st_size, 16)
+
+    def test_byte_and_boot_count_budgets_keep_newest_history(self):
+        for index in range(11):
+            self.saved_boot(f'boot{index:02d}', 10, index)
+        mirror = diagnostics.LogMirror(self.root, self.run, 'current0', journal=False)
+        mirror.directory.mkdir()
+        (mirror.directory / 'receiver.log').write_bytes(b'x' * 15)
+        with patch.object(diagnostics, 'LOG_TOTAL_MAX', 35, create=True):
+            mirror.prune()
+        self.assertEqual(sorted(path.name for path in self.root.iterdir()), ['boot09', 'boot10', 'current0'])
+
+    def test_running_mirror_reclaims_history_as_current_logs_grow(self):
+        for journal in (False, True):
+            with self.subTest(journal=journal), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                old = root / 'old-boot'
+                old.mkdir()
+                (old / 'receiver.log').write_bytes(b'x' * 600)
+                source = self.run / 'receiver.log'
+                source.write_bytes(b'x' * 99 + b'\n')
+                mirror = diagnostics.LogMirror(root, self.run, 'current0', journal=journal)
+                mirror.directory.mkdir()
+                offsets, handles = {}, {}
+                try:
+                    with patch.object(diagnostics, 'LOG_TOTAL_MAX', 1000, create=True), \
+                            patch('diagnostics.subprocess.run', return_value=Mock(stdout=b'journal\n')):
+                        mirror.cycle(offsets, handles)
+                        self.assertTrue(old.exists())
+                        with source.open('ab') as log:
+                            log.write(b'x' * 499 + b'\n')
+                        mirror.cycle(offsets, handles)
+                        mirror.cycle(offsets, handles)  # the next round checks the new total before writing
+                    self.assertFalse(old.exists(), 'cleanup must also run after startup')
+                    self.assertEqual((mirror.directory / 'receiver.log').read_bytes(), source.read_bytes())
+                    self.assertEqual(mirror.load()['receiver.log'][1], 600)
+                finally:
+                    for fd in handles.values():
+                        os.close(fd)
+
+    def test_current_boot_is_preserved_even_if_it_alone_exceeds_budget(self):
+        old = self.saved_boot('old-boot', 60, 1)
+        mirror = diagnostics.LogMirror(self.root, self.run, 'current0', journal=False)
+        mirror.directory.mkdir()
+        current = mirror.directory / 'receiver.log'
+        current.write_bytes(b'x' * 150)
+        with patch.object(diagnostics, 'LOG_TOTAL_MAX', 100, create=True):
+            mirror.prune()
+        self.assertFalse(old.exists())
+        self.assertEqual(current.read_bytes(), b'x' * 150)
+
+    def test_failed_deletion_is_not_counted_as_freed_space(self):
+        oldest = self.saved_boot('oldest', 600, 1)
+        next_oldest = self.saved_boot('next-old', 400, 2)
+        mirror = diagnostics.LogMirror(self.root, self.run, 'current0', journal=False)
+        mirror.directory.mkdir()
+        (mirror.directory / 'receiver.log').write_bytes(b'x' * 100)
+        remove = diagnostics.shutil.rmtree
+        def fail_oldest(path, *args, **kwargs):
+            if path == oldest:
+                if kwargs.get('ignore_errors'):
+                    return
+                raise OSError('synthetic deletion failure')
+            return remove(path, *args, **kwargs)
+        with patch.object(diagnostics, 'LOG_TOTAL_MAX', 1000, create=True), \
+                patch('diagnostics.shutil.rmtree', side_effect=fail_oldest), \
+                patch('builtins.print', side_effect=OSError('synthetic output full')):
+            mirror.prune()
+        self.assertTrue(oldest.exists())
+        self.assertFalse(next_oldest.exists(), 'failed removal must not pretend the budget is satisfied')
+
+    def test_cleanup_does_not_follow_directory_symlinks(self):
+        outside = self.run / 'outside'
+        outside.mkdir()
+        (outside / 'keep.log').write_bytes(b'x' * 1000)
+        link = self.root / 'linked'
+        link.symlink_to(outside, target_is_directory=True)
+        old = self.saved_boot('old-boot', 60, 1)
+        mirror = diagnostics.LogMirror(self.root, self.run, 'current0', journal=False)
+        mirror.directory.mkdir()
+        (mirror.directory / 'receiver.log').write_bytes(b'x' * 30)
+        with patch.object(diagnostics, 'LOG_TOTAL_MAX', 100, create=True):
+            mirror.prune()
+            self.assertTrue(old.exists(), 'external content is not part of the mirror budget')
+        with patch.object(diagnostics, 'LOG_TOTAL_MAX', 50, create=True):
+            mirror.prune()
+        self.assertFalse(old.exists())
+        self.assertTrue(link.is_symlink())
+        self.assertEqual((outside / 'keep.log').stat().st_size, 1000)
 
     def test_network_counters_parse_snmp(self):
         with patch('diagnostics.Path.read_text', return_value=(

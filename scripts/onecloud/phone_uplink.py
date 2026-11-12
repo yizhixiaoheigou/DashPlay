@@ -310,11 +310,11 @@ class PhoneUplink:
     def own_names(self):
         """Keep the same local-name policy as the initial box AP, regardless of uplink state.
 
-        deSEC names have no public A/AAAA records. Tesla and optional local DNS also
-        keep their own name local; only unrelated names should use the uplink.
+        Full-name providers stay local on the box hotspot, regardless of public records
+        used on joined networks. Only unrelated names should use the uplink.
         """
         config = own_domain.load(self.state)
-        local_only = bool(config and config.get('provider') == own_domain.DESEC)
+        local_only = bool(config and config.get('provider') in own_domain.FULL_NAME_PROVIDERS)
         name = self.status.get('own_name')
         enabled = local_only or self.status.get('tesla') or setup_wizard.options(self.state).get('local_dns')
         return [name] if name and enabled else []

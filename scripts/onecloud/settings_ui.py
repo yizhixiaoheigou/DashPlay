@@ -265,7 +265,7 @@ def phone_rows(devices, active, last, nonce, idle, paused=(), connecting=None):
             actions += form + f'<button class="cell action" name=action value=switch>{label}</button></form>'
             if not idle:
                 actions += ('<p class=foot>会结束正在用的那部手机的 CarPlay；它保留配对和 Wi-Fi，随时可以切回来。</p>')
-        confirmation = escape('return confirm(' + json.dumps(f'从盒子上删除「{name}」？当前连接会结束，以后要用需要重新配对。', ensure_ascii=False) + ')', quote=True)
+        confirmation = escape('return confirm(' + json.dumps(f'从盒子上删除「{name}」？当前连接会结束，以后要用需要重新配对。') + ')', quote=True)
         actions += (form + f'<button class="cell destructive" name=action value=remove '
                     f'onclick="{confirmation}">删除此手机</button></form>')
         html += f'<details>{summary}<div class=inner>{actions}</div></details>'

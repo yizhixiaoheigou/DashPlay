@@ -962,6 +962,20 @@ class UsbTetherPlatformTests(unittest.TestCase):
         self.assertFalse((self.root / 'nm/tether.nmconnection').exists())
         self.assertFalse((self.root / 'usb-tether.json').exists())
 
+    def test_two_stage_start_journals_the_actual_ap_for_rule_cleanup(self):
+        with patch('platform_debian.subprocess.run', side_effect=self.run_fake) as run:
+            self.p.begin_usb_tether(ipaddress.ip_network('100.96.0.0/24'))
+            self.p.ap_interface = 'ap0'  # PhoneUplink creates the persistent AP between the two stages
+            self.p.finish_usb_tether()
+            self.p.stop_usb_sharing()
+        commands = [c.args[0] for c in run.call_args_list if c.args[0][0] == 'iptables']
+        added = [c for c in commands if '-I' in c]
+        removed = [c for c in commands if '-D' in c]
+        self.assertEqual(len(added), 3)
+        self.assertEqual(len(removed), 3)
+        for command in added:
+            self.assertIn([('-D' if arg == '-I' else arg) for arg in command], removed)
+
     def test_with_network_manager_only_its_profile_takes_the_iphone(self):
         # Both managers took a lease on dp-0017: two addresses on the iPhone's interface.
         self.nm_running = True

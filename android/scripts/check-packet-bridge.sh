@@ -4,7 +4,7 @@ set -eu
 api=${1:-34}
 tag=default
 certificate_public_network=true # This local pipe test does not need any emulator network setup.
-out=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)/artifacts/sy910/tun-fix/probe-$api
+out=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)/artifacts/android-packet-bridge/probe-$api
 . "$(dirname -- "$0")/emulator-lib.sh"
 "$adb" -s "$serial" install -r "$apk" >/dev/null
 "$adb" -s "$serial" install -r "$here/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk" >/dev/null

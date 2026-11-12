@@ -15,6 +15,63 @@ CONFIG = {'name': 'example.duckdns.org', 'settings_port': '18080', 'tesla_mode':
 
 
 class OpenWrtOfflineTests(unittest.TestCase):
+    def setUp(self):
+        # All files and commands are isolated; never start real network probes.
+        directory = patch.object(tesla.OfflineChecks, 'dynamic_directory',
+                                 lambda controller, *_: controller.path.parent / 'dnsmasq.d')
+        monitor = patch.object(tesla.connectivity.Monitor, 'start')
+        directory.start(); monitor.start()
+        self.addCleanup(directory.stop); self.addCleanup(monitor.stop)
+
+    def test_retry_must_restore_existing_journal_before_saving_a_new_one(self):
+        with tempfile.TemporaryDirectory() as root:
+            run = Mock(return_value=Mock(stdout=json.dumps({'values': SECTIONS}), returncode=0))
+            controller = tesla.OfflineChecks(root, run)
+            saved = {'before': {'dns.address': ['/original.example/192.0.2.4']},
+                     'alias': '100.96.0.2', 'device': 'br-lan'}
+            controller.path.write_text(json.dumps(saved))
+            with patch.object(controller, 'restore', side_effect=OSError('recovery unavailable')), \
+                    self.assertRaises(OSError):
+                controller.enable(NETWORK, CONFIG['name'], 18080)
+            self.assertEqual(json.loads(controller.path.read_text()), saved)
+            run.assert_not_called()
+
+    def test_static_protection_covers_non_a_queries_without_changing_upstream(self):
+        sections = dict(SECTIONS, dns=dict(SECTIONS['dns'], local='/lan/home/'))
+        _, fields = tesla.offline_fields(sections, 'lan', '100.96.0.1/24', CONFIG['name'])
+        local = fields['dns.local'].split('/')
+        for name in ('lan', 'home', CONFIG['name'], *tesla.setup_wizard.TESLA_CHECK_NAMES):
+            self.assertIn(name, local)
+        self.assertNotIn('dns.server', fields)
+
+    def test_multi_domain_address_keeps_its_unrelated_names(self):
+        sections = dict(SECTIONS, dns=dict(SECTIONS['dns'], address=['/www.qq.com/other.example/192.0.2.5']))
+        _, fields = tesla.offline_fields(sections, 'lan', '100.96.0.1/24', CONFIG['name'])
+        self.assertIn('/other.example/192.0.2.5', fields['dns.address'])
+
+    def test_disabled_mode_retries_an_unfinished_restore(self):
+        with tempfile.TemporaryDirectory() as root:
+            run = Mock(return_value=Mock(stdout=json.dumps({'values': SECTIONS}), returncode=0))
+            controller = tesla.OfflineChecks(root, run)
+            saved = {'before': {'dns.address': ['/original.example/192.0.2.4']},
+                     'alias': '100.96.0.2', 'device': 'br-lan'}
+            controller.path.write_text(json.dumps(saved))
+            restore = controller.restore
+            attempts = []
+            def retry():
+                attempts.append(1)
+                if len(attempts) == 1: raise OSError('temporary restore failure')
+                restore()
+            status = {}
+            with patch.object(controller, 'restore', side_effect=retry):
+                controller.update(dict(CONFIG, answer_tesla_checks='0'), NETWORK, status)
+                self.assertIn('tesla_error', status)
+                self.assertTrue(controller.path.exists())
+                controller.update(dict(CONFIG, answer_tesla_checks='0'), NETWORK, status)
+            self.assertEqual(len(attempts), 2)
+            self.assertFalse(controller.path.exists())
+            self.assertNotIn('tesla_error', status)
+
     def test_dns_and_dhcp_plan(self):
         alias, fields = tesla.offline_fields(SECTIONS, 'lan', '100.96.0.1/24', CONFIG['name'])
         self.assertEqual(alias, '100.96.0.2')
@@ -33,6 +90,58 @@ class OpenWrtOfflineTests(unittest.TestCase):
         self.assertIn('ip daddr 100.96.0.2 tcp dport 80 redirect to :18080', rules)
         self.assertIn('iifname "br-lan"', rules)
         self.assertNotIn('uhttpd', rules)
+        self.assertIn('/old.example/192.0.2.1', fields['dns.address'])
+
+    def test_health_transitions_only_signal_selected_instance_and_restore_snippet(self):
+        from test_connectivity import sample
+        with tempfile.TemporaryDirectory() as root:
+            run = Mock(return_value=Mock(stdout=json.dumps({'values': SECTIONS}), returncode=0))
+            controller = tesla.OfflineChecks(root, run)
+            controller.update(CONFIG, NETWORK, {})
+            self.assertTrue(controller.active)
+            saved = json.loads(controller.path.read_text())
+            snippet = Path(saved['dns_snippet'])
+            self.assertIn('servers-file=', snippet.read_text())
+            self.assertIn('local=/example.duckdns.org/', snippet.read_text())
+            commands = [c.args[0] for c in run.call_args_list]
+            self.assertIn(['uci', 'set', 'dhcp.dns.local=/example.duckdns.org/'], commands)
+            # A static local rule for a check would silently prevent public release.
+            self.assertFalse(any(c[:2] == ['uci', 'set'] and c[2].startswith('dhcp.dns.local=')
+                                 and 'connman' in c[2] for c in commands))
+            # Files live under a directory mount, never a bind-mounted single inode.
+            self.assertEqual(controller.dynamic.directory.parent, snippet.parent)
+            commands = [c.args[0] for c in run.call_args_list]
+            self.assertFalse(any('dhcp.dns.serversfile' in ' '.join(c) for c in commands))
+            self.assertIn(['uci', 'add_list', 'dhcp.dns.address=/old.example/192.0.2.1'], commands)
+            self.assertNotIn(['uci', 'add_list', 'dhcp.dns.address=/www.baidu.com/100.96.0.2'], commands)
+            monitor = controller.monitor
+            monitor.probe = Mock(return_value=sample())
+            run.reset_mock()
+            for _ in range(3): monitor.step()
+            monitor.probe.return_value = sample(False)
+            monitor.step(); monitor.step()
+            commands = [c.args[0] for c in run.call_args_list]
+            self.assertEqual(len(commands), 2)
+            for command in commands:
+                self.assertEqual(command[:4], ['ubus', 'call', 'service', 'signal'])
+                self.assertEqual(json.loads(command[4]), {'name': 'dnsmasq', 'instance': 'dns', 'signal': 1})
+            controller.restore()
+            self.assertFalse(snippet.exists()); self.assertTrue(monitor.stop.is_set())
+            self.assertFalse(controller.path.exists())
+
+    def test_always_answer_and_custom_serversfile_keep_static_protection(self):
+        for choice, extra in (('1', {}), ('auto', {'serversfile': '/user/servers'})):
+            with self.subTest(choice=choice), tempfile.TemporaryDirectory() as root:
+                sections = dict(SECTIONS, dns=dict(SECTIONS['dns'], **extra))
+                run = Mock(return_value=Mock(stdout=json.dumps({'values': sections}), returncode=0))
+                controller = tesla.OfflineChecks(root, run)
+                status = {}
+                controller.update(dict(CONFIG, answer_tesla_checks=choice), NETWORK, status)
+                self.assertTrue(controller.active); self.assertIsNone(controller.monitor)
+                self.assertNotIn('dns_snippet', json.loads(controller.path.read_text()))
+                commands = [c.args[0] for c in run.call_args_list]
+                self.assertIn(['uci', 'add_list', 'dhcp.dns.address=/www.baidu.com/100.96.0.2'], commands)
+                controller.restore()
 
     def test_lan_once_upstream_switch_and_restore(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -103,33 +212,6 @@ class OpenWrtOfflineTests(unittest.TestCase):
                 controller.enable(NETWORK, CONFIG['name'], 18080)
             self.assertFalse(controller.path.exists())
             self.assertFalse(controller.active)
-
-    def test_auto_wan_probe_never_uses_offline_dns_or_tailscale(self):
-        interface = {'interface':'wan', 'up':True, 'route':[{'target':'0.0.0.0','mask':0}],
-                     'ipv4-address':[{'address':'192.0.2.9'}]}
-        run = Mock(return_value=Mock(stdout=json.dumps({'interface':[interface]})))
-        connect = Mock(); connect.return_value.__enter__ = Mock(); connect.return_value.__exit__ = Mock()
-        self.assertTrue(tesla.wan_available(run, connect))
-        self.assertEqual(connect.call_args.kwargs['source_address'], ('192.0.2.9', 0))
-        connect.side_effect = OSError('offline')
-        self.assertFalse(tesla.wan_available(run, connect))
-        interface['interface'] = 'tailscale'
-        run.return_value.stdout = json.dumps({'interface':[interface]})
-        connect.reset_mock()
-        self.assertFalse(tesla.wan_available(run, connect)); connect.assert_not_called()
-
-    def test_wan_counts_as_up_when_only_a_domestic_target_answers(self):
-        # 2026-10-15, F50 with a working SIM: the carrier dropped 1.1.1.1:443 (and 8.8.8.8:443) while 223.5.5.5:443
-        # answered, so a probe of 1.1.1.1 alone kept the box answering Tesla's checks with no upstream DNS.
-        interface = {'interface':'wan', 'up':True, 'route':[{'target':'0.0.0.0','mask':0}],
-                     'ipv4-address':[{'address':'192.0.2.9'}]}
-        run = Mock(return_value=Mock(stdout=json.dumps({'interface':[interface]})))
-        def connect(target, timeout, source_address):
-            if target[0] in ('1.1.1.1', '8.8.8.8'):
-                raise OSError('timed out')
-            conn = Mock(); conn.__enter__ = Mock(return_value=conn); conn.__exit__ = Mock(return_value=False)
-            return conn
-        self.assertTrue(tesla.wan_available(run, connect))
 
     def test_auto_and_always_build_the_lan_even_with_upstream(self):
         with tempfile.TemporaryDirectory() as root:

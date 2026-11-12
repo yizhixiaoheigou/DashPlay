@@ -26,6 +26,7 @@ import time
 ROLE = Path("/sys/class/usb_role/c9040000.usb-role-switch/role")
 CARPLAY_CONFIGURATION = 6
 READ_CHUNK = 16384
+USBMUX_FRAME_MAX = 1 << 20    # defensive ceiling; normal USBMUX transfers are much smaller
 NCM_READ_CHUNK = 65536  # NTB16; iPhone sends ~32 KB transfers (drive F9).
 
 
@@ -55,11 +56,15 @@ def apple_device():
     for device in sorted(glob.glob("/sys/bus/usb/devices/[0-9]-[0-9]*")):
         if ":" in Path(device).name:
             continue
+        path = Path(device)
         try:
-            if Path(device, "idVendor").read_text().strip() == "05ac":
-                return Path(device)
+            if path.joinpath("idVendor").read_text().strip() != "05ac":
+                continue
+            name = path.joinpath("product").read_text().strip().lower()
         except OSError:
             continue
+        if name.startswith("iphone"):
+            return path
     return None
 
 
@@ -294,6 +299,14 @@ def ntb_block(frame, sequence):
     return header + table + b"\0" * 4 + frame + b"\0" * padding
 
 
+def tap_ended(reason):
+    """A dead forwarding direction must end the helper so the receiver can reconnect."""
+    try:
+        log(f"TAP ended: {reason}")
+    finally:
+        os._exit(1)
+
+
 def open_tap(mac):
     fd = os.open("/dev/net/tun", os.O_RDWR)
     fcntl.ioctl(fd, TUNSETIFF, struct.pack("16sH", TAP_NAME.encode(), IFF_TAP | IFF_NO_PI))
@@ -348,10 +361,19 @@ def relay_usbmux(fd, mux):
     stdin = sys.stdin.buffer
     while True:
         header = stdin.read(4)
-        if len(header) < 4:
+        if not header:
             return 0
+        if len(header) != 4:
+            log("USBMUX stream ended mid-header")
+            return 1
         (length,) = struct.unpack(">I", header)
+        if not 0 < length <= USBMUX_FRAME_MAX:
+            log(f"USBMUX frame length {length} out of range")
+            return 1
         data = stdin.read(length)
+        if len(data) != length:
+            log("USBMUX stream ended mid-frame")
+            return 1
         try:
             bulk(fd, out_ep, data, timeout=2000)
         except OSError as error:
@@ -441,12 +463,21 @@ def main():
                 if len(frame) >= 12 and behind.get(frame[6:12]) != index:
                     behind[frame[6:12]] = index
                     log(f"NCM peer {frame[6:12].hex(':')} on function {functions[index][0]}")
-                os.write(tap, frame)
+                try:
+                    if os.write(tap, frame) != len(frame):
+                        tap_ended("short frame write")
+                except OSError as error:
+                    tap_ended(type(error).__name__)
 
     def tap_to_ncm():
         sent, timed_out = [0] * len(functions), [0] * len(functions)
         while True:
-            frame = os.read(tap, 2048)
+            try:
+                frame = os.read(tap, 2048)
+            except OSError as error:
+                tap_ended(type(error).__name__)
+            if not frame:
+                tap_ended("end of stream")
             target = behind.get(frame[:6]) if not frame[0] & 1 else None
             for index in ([target] if target is not None else range(len(functions))):
                 try:

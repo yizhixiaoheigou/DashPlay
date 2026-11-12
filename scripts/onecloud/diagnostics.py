@@ -27,6 +27,14 @@ KEEP = re.compile(r"viewer stats|Receive: (video|audio)|session (active|ended)|d
                   r"|accepted by the iPhone|CarPlay is live|rejecting|WARN|ERROR|^boot ")
 
 
+def report_skipped(component, error):
+    """The error output may share the full filesystem or have been closed too."""
+    try:
+        print(f"{component} skipped: {type(error).__name__}", flush=True)
+    except (OSError, ValueError):
+        pass
+
+
 class DiagLog:
     def __init__(self, directory: Path, max_bytes=MAX_BYTES):
         self.directory, self.max_bytes = directory, max_bytes
@@ -71,6 +79,7 @@ class LogTail:
 
 LOG_BOOTS = 8                 # boots whose full logs are kept
 LOG_FILE_MAX = 40_000_000     # per mirrored file and boot
+LOG_TOTAL_MAX = 200_000_000   # cleanup target; never delete the active boot to meet it
 MIRROR_INTERVAL = 5
 
 
@@ -89,10 +98,25 @@ class LogMirror:
         self.cursor = self.directory / ".journal-cursor"
 
     def prune(self):
-        boots = sorted((d for d in self.root.iterdir() if d.is_dir() and d != self.directory),
+        boots = sorted((d for d in self.root.iterdir()
+                        if not d.is_symlink() and d.is_dir() and d != self.directory),
                        key=lambda d: d.stat().st_mtime)
-        for old in boots[:max(0, len(boots) - (LOG_BOOTS - 1))]:
-            shutil.rmtree(old, ignore_errors=True)
+        def used_bytes():
+            # rglob does not recurse into directory symlinks; do not count linked files either.
+            return sum(path.stat().st_size for path in self.root.rglob('*')
+                       if not path.is_symlink() and path.is_file())
+        used, remaining = used_bytes(), len(boots)
+        for old in boots:
+            if remaining < LOG_BOOTS and used <= LOG_TOTAL_MAX:
+                break
+            try:
+                shutil.rmtree(old)
+            except OSError as error:
+                report_skipped("log mirror prune", error)
+            else:
+                remaining -= 1
+            # A failed removal may have freed only part of the directory, or nothing at all.
+            used = used_bytes()
 
     def load(self):
         try:
@@ -116,53 +140,83 @@ class LogMirror:
         os.write(fd, data)
 
     def cycle(self, offsets, handles):
+        # Reclaim history during long drives too, before a write can fail on a full disk.
+        self.prune()
         for path in sorted(self.run.glob("*.log")):
             key = path.name
             try:
                 stat = path.stat()
             except OSError:
                 continue
-            inode, offset = offsets.get(key, (None, 0))
-            if inode != stat.st_ino or stat.st_size < offset:
-                if inode is not None:
-                    self.append(key, f"[log mirror: {key} restarted]\n".encode(), handles)
-                offset = 0
-            if stat.st_size > offset:
-                with path.open("rb") as log:
-                    log.seek(offset)
-                    data = log.read(4_000_000)
-                end = data.rfind(b"\n") + 1
-                if end:
-                    self.append(key, data[:end], handles)
-                    offset += end
-            offsets[key] = (stat.st_ino, offset)
-        journal = self.journal and subprocess.run(["journalctl", "-b", "-o", "short-monotonic", "--no-pager", "-q",
-                                                   f"--cursor-file={self.cursor}"], capture_output=True, timeout=20).stdout
-        if journal:
-            self.append("journal.log", journal, handles)
-        for fd in handles.values():
-            os.fsync(fd)
-        self.state_file.write_text(json.dumps(offsets))
+            try:
+                inode, offset = offsets.get(key, (None, 0))
+                if inode != stat.st_ino or stat.st_size < offset:
+                    if inode is not None:
+                        self.append(key, f"[log mirror: {key} restarted]\n".encode(), handles)
+                    offset = 0
+                if stat.st_size > offset:
+                    with path.open("rb") as log:
+                        log.seek(offset)
+                        data = log.read(4_000_000)
+                    end = data.rfind(b"\n") + 1
+                    if end:
+                        self.append(key, data[:end], handles)
+                        offset += end
+                if key in handles:
+                    os.fsync(handles[key])
+                offsets[key] = (stat.st_ino, offset)
+            except OSError as error:
+                report_skipped("log mirror " + key, error)
+        try:
+            journal = self.journal and subprocess.run(["journalctl", "-b", "-o", "short-monotonic", "--no-pager", "-q",
+                                                       f"--cursor-file={self.cursor}"], capture_output=True, timeout=20).stdout
+            if journal:
+                self.append("journal.log", journal, handles)
+                if "journal.log" in handles:
+                    os.fsync(handles["journal.log"])
+        except (OSError, subprocess.SubprocessError) as error:
+            report_skipped("log mirror journal", error)
+        # Keep the last complete checkpoint if writing or syncing the next one fails.
+        temporary = self.state_file.with_suffix(".json.tmp")
+        with temporary.open("w") as state:
+            json.dump(offsets, state)
+            state.flush()
+            os.fsync(state.fileno())
+        temporary.replace(self.state_file)
+        directory = os.open(self.directory, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
     def start(self, stopped, interval=MIRROR_INTERVAL):
-        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.utime(self.directory)
-        self.prune()
-        offsets = {key: tuple(value) for key, value in self.load().items()}
-        handles = {}
-
         def loop():
-            while True:
-                try:
-                    self.cycle(offsets, handles)
-                except Exception as error:   # logging must never take the service down
-                    print(f"log mirror skipped: {type(error).__name__}", flush=True)
-                if stopped.wait(interval):
-                    break
+            offsets, handles = None, {}
             try:
-                self.cycle(offsets, handles)   # what the shutdown itself logged
-            except Exception:
-                pass
+                while True:
+                    try:
+                        if offsets is None:
+                            # Setup can fail on a full/read-only disk too. Keep it off the supervisor's
+                            # thread and retry on later cycles when the storage becomes writable again.
+                            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+                            os.utime(self.directory)
+                            offsets = {key: tuple(value) for key, value in self.load().items()}
+                        self.cycle(offsets, handles)
+                    except Exception as error:   # logging must never take the service down
+                        report_skipped("log mirror", error)
+                    if stopped.wait(interval):
+                        break
+                if offsets is not None:
+                    try:
+                        self.cycle(offsets, handles)   # what the shutdown itself logged
+                    except Exception:
+                        pass
+            finally:
+                for fd in handles.values():
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
         threading.Thread(target=loop, name="log-mirror", daemon=True).start()
 
@@ -310,8 +364,11 @@ def start(stopped, log: DiagLog, receiver_log: Path, platform, status, interval=
     tail = LogTail(receiver_log)
     # The release this box runs opens every start, so a user's diagnostics say it (2026-10-20: a box still on the
     # image's 2026.10.15 program was only told apart by the viewer's build stamp).
-    log.append({"event": "start", "wall": round(time.time()), "uptime": round(time.monotonic(), 1),
-                "boot": platform.boot_id()[:8], "version": update.bundled_version(program)})
+    try:
+        log.append({"event": "start", "wall": round(time.time()), "uptime": round(time.monotonic(), 1),
+                    "boot": platform.boot_id()[:8], "version": update.bundled_version(program)})
+    except Exception as error:   # This event runs on the supervisor's thread, before the background loop.
+        report_skipped("diagnostics start", error)
 
     def loop():
         while not stopped.wait(interval):
@@ -319,7 +376,7 @@ def start(stopped, log: DiagLog, receiver_log: Path, platform, status, interval=
                 record = {"uptime": round(time.monotonic(), 1), "mode": status.get("mode")}
                 record.update({key: status[key] for key in ("uplink", "tesla_offline", "tesla_internet",
                                "tesla_dns_log", "direct_phone", "phone_interface", "tesla_lan_stable",
-                               "tesla_upstream", "uplink_link", "uplink_error") if key in status})
+                               "tesla_upstream", "uplink_link", "uplink_error", "connectivity") if key in status})
                 record.update(platform.diagnostics())
                 record["net"] = net_counters()
                 if state is not None:
@@ -338,6 +395,6 @@ def start(stopped, log: DiagLog, receiver_log: Path, platform, status, interval=
                     record["log"] = lines
                 log.append(record)
             except Exception as error:   # diagnostics must never take the service down
-                print(f"diagnostics skipped: {type(error).__name__}", flush=True)
+                report_skipped("diagnostics", error)
 
     threading.Thread(target=loop, name="diagnostics", daemon=True).start()

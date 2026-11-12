@@ -38,6 +38,7 @@ class Server:
 
     def __init__(self, root):
         self.root, self.down, self.seen, self.ranges, self.kinds = Path(root), set(), [], [], {}
+        self.overrides = {}  # (source, relative path) -> bytes, including coherent malicious mirror responses
         server = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -69,7 +70,7 @@ class Server:
                     self.send_header('Content-Length', str(len(page)))
                     self.end_headers()
                     return self.wfile.write(page)
-                data, start = target.read_bytes(), 0
+                data, start = server.overrides.get((kind, path.removeprefix('/gh/')), target.read_bytes()), 0
                 wanted = self.headers.get('Range')
                 if wanted and kind != 'norange':
                     first, _, last = wanted.removeprefix('bytes=').partition('-')
@@ -233,6 +234,7 @@ class SignedReleaseTests(unittest.TestCase):
         (self.root / 'state/bluetooth').mkdir()
         (self.root / 'state/bluetooth/pairing').write_text('link key')
         for name, value in (('OPENSSL', OPENSSL), ('LATEST', self.server.base + 'latest/'), ('MIRRORS', ()),
+                            ('RELEASE_FEED', self.server.base + 'releases/v{version}/'),
                             ('PREVIOUS_FEED', self.server.base + 'owrt/v{version}/'), ('SAMPLE_SECONDS', 2)):
             p = patch.object(update, name, value)
             p.start()
@@ -465,21 +467,35 @@ class SignedReleaseTests(unittest.TestCase):
             self.assertEqual(update.install(self.root, True, self.pub), 0)
             self.assertIn('已是最新', json.loads((self.root / 'state/update-status.json').read_text())['message'])
 
-    def openwrt_install(self, simulation_extra='', comes_up=(True,), old_published=True):
+    def openwrt_install(self, simulation_extra='', comes_up=(True,), old_published=True,
+                        install_timeout=False, rollback_timeout=False, installed_version='2026.10.19.1',
+                        domain_after_plan=False):
+        target_version = '2026.10.21' if installed_version == '2026.10.20' else '2026.10.20'
         # Larger than fetch()'s default limit, as real packages are (37 MB; lab, 2026-10-19).
         if old_published:
-            self.openwrt_release('2026.10.19.1', {n: f'old {n}'.encode() * 200000 for n in update.OPENWRT_PACKAGES})
-        new = self.openwrt_release('2026.10.20', {n: f'new {n}'.encode() for n in update.OPENWRT_PACKAGES})
-        self.publish({'format': 1, 'version': '2026.10.20', 'online': True, 'openwrt': new})
+            if installed_version == '2026.10.20':
+                self.rollback_release(installed_version)
+            else:
+                self.openwrt_release(installed_version, {n: f'old {n}'.encode() * 200000 for n in update.OPENWRT_PACKAGES})
+        new = self.openwrt_release(target_version, {n: f'new {n}'.encode() for n in update.OPENWRT_PACKAGES})
+        self.publish({'format': 1, 'version': target_version, 'online': True, 'openwrt': new})
         calls, ups = [], list(comes_up)
+        configured = []
 
         def run(*args, timeout=300):
             if args[0] == OPENSSL:   # the signature is checked for real
                 return subprocess.run(list(args), capture_output=True, text=True)
             calls.append(list(args))
+            if args[:2] == ('apk', 'add') and '--simulate' not in args:
+                if (install_timeout and '--upgrade' in args) or (rollback_timeout and '--upgrade' not in args):
+                    raise subprocess.TimeoutExpired(args, timeout)
             out = ''
+            if args == ('uci', '-q', 'show', 'dashplay') and configured:
+                out = "dashplay.main.ddns_provider='dnspod'\ndashplay.main.ddns_domain='car.example.org'\n"
             if args[:3] == ('apk', 'add', '--upgrade') and '--simulate' in args:
                 out = '(1/3) Upgrading dashplay (2026.10.19.1-r1 -> 2026.10.20-r1)\n' + simulation_extra
+                if domain_after_plan:
+                    configured.append(True)
             return subprocess.CompletedProcess(args, 0, out, '')
 
         arch = self.dir / 'arch'
@@ -489,13 +505,21 @@ class SignedReleaseTests(unittest.TestCase):
         def fake_path(*parts):
             return arch if parts == ('/etc/apk/arch',) else real_path(*parts)
 
-        versions = {'dashplay': '2026.10.19.1-r1', 'dashplay-jre': '21.0.12.1-r1'}
-        with patch.object(update, 'run', run), patch.object(update, 'apk_version', versions.get), \
+        versions = {'dashplay': installed_version + '-r1', 'dashplay-jre': '21.0.12.1-r1'}
+        with patch.object(update, 'run', run), patch.object(update, 'run_installer', run), \
+                patch.object(update, 'apk_version', versions.get), \
                 patch.object(update, 'Path', fake_path), patch.object(update, 'settings_port', lambda: 18080), \
                 patch.object(update, 'service_up', lambda port, seconds=150: ups.pop(0)), \
                 patch.object(update, 'BACKUP', 'backup.tar.gz'):
             code = update.install(self.root, True, self.pub)
         return code, calls, json.loads((self.root / 'state/update-status.json').read_text())
+
+    def test_openwrt_rechecks_domain_changed_during_download_before_installer(self):
+        code, calls, status = self.openwrt_install(domain_after_plan=True)
+        self.assertEqual(code, 1)
+        self.assertIn('DNSPod', status['message'])
+        self.assertTrue(any(c[:2] == ['apk', 'add'] and '--simulate' in c for c in calls))
+        self.assertFalse(any(c[:2] == ['apk', 'add'] and '--simulate' not in c for c in calls))
 
     def test_openwrt_installs_the_three_packages_after_a_clean_plan(self):
         code, calls, status = self.openwrt_install()
@@ -538,8 +562,143 @@ class SignedReleaseTests(unittest.TestCase):
                          ['dashplay-2026.10.19.1-r1.apk', 'luci-app-dashplay-2026.10.19.1-r1.apk',
                           'luci-i18n-dashplay-zh-cn-2026.10.19.1-r1.apk'])
 
+    def rollback_release(self, version='2026.10.20'):
+        feed = self.openwrt_release(version, {n: ('official ' + n).encode() for n in update.OPENWRT_PACKAGES})
+        manifest = {'format': 1, 'version': version, 'online': True, 'openwrt': feed}
+        data = json.dumps(manifest).encode()
+        base = f'releases/v{version}/'
+        self.server.put(base + update.MANIFEST, data)
+        self.server.put(base + update.SIGNATURE, self.sign(data))
+        return manifest
+
+    def rollback_files(self, version='2026.10.20', prefixes=None):
+        verify = update.verify
+        with patch.object(update, 'verify', side_effect=lambda data, sig, key: verify(data, sig, self.pub)):
+            return update.previous_packages(version, prefixes or (self.server.mirror,), self.dir / 'rollback')
+
+    def forge_rollback_mirror(self, version):
+        sums = []
+        for name in update.OPENWRT_PACKAGES:
+            filename = f'{name}-{version}-r1.apk'
+            fake = ('modified ' + name).encode()  # Same length as official bytes: the hash must catch it.
+            self.server.overrides['mirror', f'owrt/v{version}/{filename}'] = fake
+            sums.append(f'{sha(fake)}  {filename}')
+        self.server.overrides['mirror', f'owrt/v{version}/SHA256SUMS'] = '\n'.join(sums).encode()
+
+    def test_signed_rollback_rejects_coherent_forged_packages_and_unsigned_checksums(self):
+        self.rollback_release()
+        self.forge_rollback_mirror('2026.10.20')
+        with self.assertRaises(update.UpdateError):
+            self.rollback_files()
+        self.assertFalse(any('SHA256SUMS' in p for p in self.server.seen))
+
+    def test_signed_rollback_works_through_mirror_without_direct_github(self):
+        manifest = self.rollback_release()
+        self.server.down.update(p.relative_to(self.server.root).as_posix() for p in self.server.root.rglob('*') if p.is_file())
+        update.keep(self.root, mirrors=['https://current.example/'], used='current-source')
+        before = update.sources_state(self.root)
+        files = self.rollback_files()
+        self.assertEqual(len(files), 3)
+        for path, name in zip(files, update.OPENWRT_PACKAGES):
+            self.assertEqual(sha(path.read_bytes()), manifest['openwrt']['packages'][name]['sha256'])
+        self.assertEqual(update.sources_state(self.root), before, 'old metadata must not overwrite current mirror settings')
+        self.assertTrue(all(p.startswith('/mirror/') for p in self.server.seen))
+
+    def test_signed_rollback_can_recover_from_a_corrupt_mirror(self):
+        self.rollback_release()
+        self.forge_rollback_mirror('2026.10.20')
+        files = self.rollback_files(prefixes=(self.server.mirror, update.DIRECT))
+        for path, name in zip(files, update.OPENWRT_PACKAGES):
+            self.assertEqual(path.read_bytes(), ('official ' + name).encode())
+        self.assertTrue(any(p.startswith('/mirror/') and p.endswith('.apk') for p in self.server.seen))
+        self.assertTrue(any(p.startswith('/gh/') and p.endswith('.apk') for p in self.server.seen))
+
+    def test_incomplete_signed_rollback_manifest_downloads_no_packages(self):
+        manifest = self.rollback_release()
+        del manifest['openwrt']['packages']['luci-app-dashplay']
+        data = json.dumps(manifest).encode()
+        base = 'releases/v2026.10.20/'
+        self.server.put(base + update.MANIFEST, data)
+        self.server.put(base + update.SIGNATURE, self.sign(data))
+        with self.assertRaisesRegex(update.UpdateError, '回退清单不完整'):
+            self.rollback_files()
+        self.assertFalse(any(p.endswith('.apk') for p in self.server.seen))
+
+    def test_signed_rollback_never_falls_back_when_signature_is_bad_or_missing(self):
+        self.rollback_release()
+        signature = 'releases/v2026.10.20/' + update.SIGNATURE
+        for invalid in (b'forged signature', b'', None):
+            with self.subTest(signature=invalid):
+                if invalid is None:
+                    (self.server.root / signature).unlink()
+                else:
+                    self.server.overrides['mirror', signature] = invalid
+                self.server.seen.clear()
+                with self.assertRaises(update.UpdateError):
+                    self.rollback_files()
+                self.assertFalse(any(p.endswith('.apk') or 'SHA256SUMS' in p for p in self.server.seen))
+
+    def test_signed_rollback_rejects_replay_of_a_different_release(self):
+        manifest = self.rollback_release()
+        manifest['version'] = '2026.10.21'
+        data = json.dumps(manifest).encode()
+        base = 'releases/v2026.10.20/'
+        self.server.put(base + update.MANIFEST, data)
+        self.server.put(base + update.SIGNATURE, self.sign(data))
+        with self.assertRaisesRegex(update.UpdateError, '不是所选版本'):
+            self.rollback_files()
+        self.assertFalse(any(p.endswith('.apk') for p in self.server.seen))
+
+    def test_legacy_rollback_never_trusts_mirror_supplied_checksums(self):
+        self.openwrt_release('2026.10.19.1', {n: ('official ' + n).encode() for n in update.OPENWRT_PACKAGES})
+        self.forge_rollback_mirror('2026.10.19.1')
+        with self.assertRaisesRegex(update.UpdateError, '校验不符'):
+            self.rollback_files('2026.10.19.1')
+        self.assertIn('/gh/owrt/v2026.10.19.1/SHA256SUMS', self.server.seen)
+        self.assertFalse(any(p.startswith('/mirror/') and 'SHA256SUMS' in p for p in self.server.seen))
+
+    def test_legacy_rollback_stops_when_official_checksums_are_unreachable(self):
+        self.openwrt_release('2026.10.19.1', {n: b'official' for n in update.OPENWRT_PACKAGES})
+        self.server.down.add('owrt/v2026.10.19.1/SHA256SUMS')
+        with self.assertRaises(update.UpdateError):
+            self.rollback_files('2026.10.19.1')
+        self.assertFalse(any(p.startswith('/mirror/') or p.endswith('.apk') for p in self.server.seen))
+
+    def test_install_authenticates_signed_rollback_and_can_restore_it(self):
+        code, calls, status = self.openwrt_install(installed_version='2026.10.20', install_timeout=True)
+        self.assertEqual(code, 1)
+        self.assertIn('已退回 2026.10.20', status['message'])
+        self.assertTrue(any('/releases/v2026.10.20/' in p and p.endswith(update.SIGNATURE) for p in self.server.seen))
+        self.assertFalse(any('SHA256SUMS' in p for p in self.server.seen))
+
+    def test_missing_signed_rollback_stops_before_installing_new_packages(self):
+        code, calls, status = self.openwrt_install(installed_version='2026.10.20', old_published=False)
+        self.assertEqual(code, 1)
+        self.assertFalse(any(c[:2] == ['apk', 'add'] for c in calls))
+
+    def test_openwrt_install_timeout_runs_local_rollback(self):
+        code, calls, status = self.openwrt_install(install_timeout=True)
+        back = [c for c in calls if c[:2] == ['apk', 'add'] and '--upgrade' not in c]
+        self.assertEqual(len(back), 1)
+        self.assertTrue(all('/previous/' in p for p in back[0][3:]))
+        self.assertEqual((code, status['phase']), (1, 'failed'))
+        self.assertIn('已退回 2026.10.19.1', status['message'])
+
+    def test_openwrt_rollback_timeout_or_unhealthy_service_does_not_claim_success(self):
+        for timed_out, comes_up in ((True, ()), (False, (False,))):
+            with self.subTest(rollback_timeout=timed_out):
+                code, calls, status = self.openwrt_install(install_timeout=True,
+                    rollback_timeout=timed_out, comes_up=comes_up)
+                self.assertEqual(code, 1)
+                self.assertIn('退回也没有成功', status['message'])
+                self.assertNotIn('已退回', status['message'])
+
     def debian_release(self, padding=0):
         """Publish 2026.10.20 for OneCloud / N1: a bundle with a new upgrader (padded to be big); its bytes."""
+        # The installed local upgrader must remain available even if the candidate replaces its path.
+        installed = self.root / 'firmware/upgrade.py'
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        installed.write_text('PROGRAM_BACKUP_FSYNC = 1\nPLATFORM_UPGRADE_CHECK = 1\n# installed upgrader')
         bundle = io.BytesIO()
         with tarfile.open(fileobj=bundle, mode='w') as tar:
             for name, data in (('./firmware/upgrade.py', b'# new upgrader'), ('./supervisor.py', b'new'),
@@ -554,23 +713,179 @@ class SignedReleaseTests(unittest.TestCase):
                                  'bundle': {'file': 'dashplay-bundle-2026.10.20.tar', 'sha256': sha(data), 'size': len(data)}}})
         return data
 
-    def test_a_box_runs_the_new_releases_upgrader_with_the_checked_bundle(self):
-        self.debian_release()
+    def test_program_upgrader_selection_preserves_durable_tool_across_downgrade(self):
+        retained = self.root / 'state/version-manager/upgrade.py'
+        installed = self.root / 'firmware/upgrade.py'
+        retained.parent.mkdir(parents=True, exist_ok=True)
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        supported = 'PROGRAM_BACKUP_FSYNC = 1\nPLATFORM_UPGRADE_CHECK = 1\n'
+        for retained_text, installed_text, expected in (
+                ('# old retained', supported + '# installed', supported + '# installed'),
+                ('PROGRAM_BACKUP_FSYNC = 1\n# old gate', supported, supported),
+                ('PROGRAM_BACKUP_FSYNC = 1\n', 'PROGRAM_BACKUP_FSYNC = 1\n', None),
+                (supported + '# retained', '# old installed after downgrade', supported + '# retained'),
+                ('# old retained', '# old installed', None)):
+            with self.subTest(retained=retained_text, installed=installed_text):
+                retained.write_text(retained_text); installed.write_text(installed_text)
+                manifest = {'version':'2026.11.12', 'debian':{'base':'https://example.invalid/',
+                    'bundle':{'file':'bundle.tar', 'sha256':'synthetic', 'size':1}}}
+                with tempfile.TemporaryDirectory() as work, patch.object(update, 'sources', return_value=[]), \
+                        patch.object(update, 'fetch', return_value=Path(work)/'bundle.tar'), \
+                        patch.object(update, 'keep'), patch.object(update, 'run_installer') as run:
+                    def execute(*args, **kwargs):
+                        self.assertEqual(Path(args[1]).read_text(), expected)
+                        return subprocess.CompletedProcess(args, 0, '', '')
+                    run.side_effect = execute
+                    if expected is None:
+                        with self.assertRaisesRegex(update.UpdateError, '备份'):
+                            update.install_debian(self.root, manifest, lambda *a, **k: None, work)
+                        run.assert_not_called()
+                    else:
+                        update.install_debian(self.root, manifest, lambda *a, **k: None, work)
+                        run.assert_called_once()
+
+    def test_wired_debian_downloads_verified_bundle_before_starting_local_upgrader(self):
+        bundle = self.debian_release()
+        status = self.root / 'wired-status.json'
+        save_status = {'phase': 'live'}
+        update.save(status, save_status)
         calls = []
 
         def run(*args, timeout=300):
             if args[0] == OPENSSL:
                 return subprocess.run(list(args), capture_output=True, text=True)
             calls.append(list(args))
+            self.assertEqual(Path(args[2]).read_bytes(), bundle, 'the whole verified bundle is local before stopping CarPlay')
+            self.assertEqual(update.read(status), save_status)
             (self.root / 'supervisor.py').write_text('new')
             return subprocess.CompletedProcess(args, 0, '', '')
 
-        with patch.object(update, 'run', run), patch.object(update, 'BACKUP', 'backup.tar.gz'):
+        with patch.object(update, 'run', run), patch.object(update, 'run_installer', run), \
+                patch.object(update, 'BACKUP', 'backup.tar.gz'), \
+                patch.object(update, 'WIRED_STATUS', status):
             self.assertEqual(update.install(self.root, False, self.pub), 0)
+        self.assertEqual(len(calls), 1, 'only the local upgrader may stop services')
         self.assertEqual(Path(calls[0][1]).name, 'upgrade.py')
         self.assertEqual(Path(calls[0][2]).name, 'dashplay-bundle-2026.10.20.tar')
         self.assertEqual(json.loads((self.root / 'state/update.json').read_text())['version'], '2026.10.20')
         self.assertFalse(json.loads((self.root / 'state/update-check.json').read_text())['available'])
+
+    def test_wired_download_or_hash_failure_never_starts_the_installer(self):
+        bundle = self.debian_release()
+        path = 'dp/v2026.10.20/dashplay-bundle-2026.10.20.tar'
+        status = self.root / 'wired-status.json'
+        update.save(status, {'phase': 'live'})
+        commands = []
+        def run(*args, **kwargs):
+            if args[0] == OPENSSL:
+                return subprocess.run(list(args), capture_output=True, text=True)
+            commands.append(args)
+            return subprocess.CompletedProcess(args, 0, '', '')
+        for failure in ('unavailable', 'corrupt'):
+            with self.subTest(failure=failure):
+                if failure == 'unavailable':
+                    self.server.down.add(path)
+                else:
+                    self.server.down.clear()
+                    self.server.put(path, b'x' * len(bundle))
+                self.server.seen.clear()
+                with patch.object(update, 'WIRED_STATUS', status), patch.object(update, 'run', run), \
+                        patch.object(update, 'run_installer', run):
+                    self.assertEqual(update.install(self.root, False, self.pub), 1)
+                self.assertTrue(any(path in p for p in self.server.seen), 'wired session must reach download')
+                self.assertEqual(update.read(status), {'phase': 'live'})
+                self.assertEqual(update.read(self.root / 'state/update-status.json')['phase'], 'failed')
+                self.assertEqual(commands, [], 'no service or installer command before a verified download')
+
+    def test_debian_timeout_restores_real_program_files_using_the_saved_upgrader(self):
+        from test_upgrade import upgrade
+        self.debian_release()
+        (self.root / 'supervisor.py').write_text('old program')
+        previous = self.root.parent / 'dashplay-previous.tar'
+        calls = []
+        def installer(*args, timeout):
+            calls.append(args)
+            if args[0] == 'systemctl':
+                self.assertEqual(args, ('systemctl', 'stop', 'dashplay'))
+                return subprocess.CompletedProcess(args, 0, '', '')
+            self.assertEqual(Path(args[1]).read_text(), 'PROGRAM_BACKUP_FSYNC = 1\nPLATFORM_UPGRADE_CHECK = 1\n# installed upgrader')
+            self.assertNotEqual(Path(args[1]), self.root / 'firmware/upgrade.py')
+            if args[2] != '--rollback':
+                upgrade.backup(self.root)
+                (self.root / 'supervisor.py').write_text('half-installed program')
+                (self.root / 'firmware/upgrade.py').write_text('# broken candidate upgrader')
+                (self.root / 'candidate-only.py').write_text('new file')
+                raise subprocess.TimeoutExpired(args, timeout)
+            return subprocess.CompletedProcess(args, upgrade.main(['--rollback']), '', '')
+        with patch.object(update, 'run_installer', side_effect=installer), \
+                patch.object(upgrade, 'ROOT', self.root), patch.object(upgrade, 'PREVIOUS', previous), \
+                patch.object(upgrade.os, 'geteuid', return_value=0), patch.object(upgrade.os, 'chown'), \
+                patch.object(upgrade, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')), \
+                patch.object(upgrade, 'install_unit'), patch.object(upgrade, 'service_up', return_value=True):
+            self.assertEqual(update.install(self.root, False, self.pub), 1)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[1], ('systemctl', 'stop', 'dashplay'))
+        self.assertEqual(calls[2][2], '--rollback')
+        self.assertEqual(calls[0][1], calls[2][1])
+        self.assertEqual((self.root / 'supervisor.py').read_text(), 'old program')
+        self.assertEqual((self.root / 'firmware/upgrade.py').read_text(), 'PROGRAM_BACKUP_FSYNC = 1\nPLATFORM_UPGRADE_CHECK = 1\n# installed upgrader')
+        self.assertFalse((self.root / 'candidate-only.py').exists())
+        self.assertEqual((self.root / 'identity/offline-mfi/identity.pk8').read_bytes(), b'secret identity')
+        self.assertIn('已恢复', update.read(self.root / 'state/update-status.json')['message'])
+        self.assertFalse((self.root / 'state/update.json').exists())
+
+    def test_debian_timeout_before_new_backup_never_restores_an_older_upgrade(self):
+        self.debian_release()
+        previous = self.root.parent / 'dashplay-previous.tar'
+        for old_backup in (False, True):
+            with self.subTest(old_backup=old_backup):
+                if old_backup:
+                    previous.write_bytes(b'backup from an earlier upgrade')
+                with patch.object(update, 'run_installer', side_effect=subprocess.TimeoutExpired('upgrade', 900)) as installer:
+                    self.assertEqual(update.install(self.root, False, self.pub), 1)
+                self.assertEqual(installer.call_count, 1)
+                message = update.read(self.root / 'state/update-status.json')['message']
+                self.assertIn('未确认本次', message)
+                self.assertNotIn('已恢复', message)
+                if old_backup:
+                    self.assertEqual(previous.read_bytes(), b'backup from an earlier upgrade')
+
+    def test_debian_failed_or_timed_out_rollback_never_claims_recovery(self):
+        self.debian_release()
+        previous = self.root.parent / 'dashplay-previous.tar'
+        for outcome in ('failed', 'timeout', 'missing', 'stop-failed', 'stop-timeout'):
+            with self.subTest(outcome=outcome):
+                calls = []
+                def installer(*args, timeout):
+                    calls.append(args)
+                    if args[0] == 'systemctl':
+                        if outcome == 'stop-timeout':
+                            raise subprocess.TimeoutExpired(args, timeout)
+                        return subprocess.CompletedProcess(args, 1 if outcome == 'stop-failed' else 0, '', '')
+                    if args[2] != '--rollback':
+                        temporary = previous.with_suffix('.tmp')
+                        temporary.write_bytes(b'new backup')
+                        temporary.replace(previous)
+                        raise subprocess.TimeoutExpired(args, timeout)
+                    if outcome == 'timeout':
+                        raise subprocess.TimeoutExpired(args, timeout)
+                    if outcome == 'missing':
+                        raise FileNotFoundError('missing interpreter')
+                    return subprocess.CompletedProcess(args, 1, '', '')
+                with patch.object(update, 'run_installer', side_effect=installer):
+                    self.assertEqual(update.install(self.root, False, self.pub), 1)
+                self.assertEqual(len(calls), 2 if outcome.startswith('stop-') else 3)
+                message = update.read(self.root / 'state/update-status.json')['message']
+                self.assertIn('自动恢复没有成功', message)
+                self.assertNotIn('已恢复', message)
+                self.assertFalse((self.root / 'state/update.json').exists())
+
+    def test_debian_nonzero_exit_does_not_assume_internal_rollback_succeeded(self):
+        self.debian_release()
+        with patch.object(update, 'run_installer', return_value=subprocess.CompletedProcess([], 1, '', '')) as installer:
+            self.assertEqual(update.install(self.root, False, self.pub), 1)
+        self.assertEqual(installer.call_count, 1)
+        self.assertNotIn('已自动退回', update.read(self.root / 'state/update-status.json')['message'])
 
     def test_the_page_sees_bytes_speed_and_source_while_downloading(self):
         self.debian_release(padding=60_000)
@@ -589,7 +904,8 @@ class SignedReleaseTests(unittest.TestCase):
             return subprocess.CompletedProcess(args, 0, '', '')
 
         with patch.object(update, 'MIRRORS', (self.server.mirror,)), patch.object(update, 'save', save), \
-                patch.object(update, 'run', run), patch.object(update, 'BACKUP', 'backup.tar.gz'), \
+                patch.object(update, 'run', run), patch.object(update, 'run_installer', run), \
+                patch.object(update, 'BACKUP', 'backup.tar.gz'), \
                 patch.object(update, 'STALL_SECONDS', 60), patch.object(update, 'SAMPLE', 1024):
             self.assertEqual(update.install(self.root, False, self.pub), 0, written[-1])
         phases = [w['phase'] for w in written]
@@ -601,6 +917,34 @@ class SignedReleaseTests(unittest.TestCase):
         last = [w for w in written if w['phase'] == 'downloading'][-1]
         self.assertEqual(last['done'], last['total'])
         self.assertEqual(update.sources_state(self.root)['used'], self.server.mirror)
+
+
+class InstallerProcessTests(unittest.TestCase):
+    def test_output_and_exit_code_are_preserved(self):
+        result = update.run_installer(sys.executable, '-c',
+            "import sys; print('out'); print('err', file=sys.stderr); sys.exit(7)", timeout=5)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (7, 'out\n', 'err\n'))
+
+    @unittest.skipUnless(os.name == 'posix', 'installer process groups require POSIX')
+    def test_timeout_stops_child_processes_before_returning(self):
+        import signal
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / 'child.pid'
+            child = "import os,sys,time; from pathlib import Path; Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"
+            parent = "import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',sys.argv[1],sys.argv[2]]); time.sleep(60)"
+            with self.assertRaises(subprocess.TimeoutExpired):
+                update.run_installer(sys.executable, '-c', parent, child, str(pidfile), timeout=2)
+            self.assertTrue(pidfile.is_file(), 'child was running before the timeout')
+            pid = int(pidfile.read_text())
+            try:
+                # A killed orphan can briefly remain as a zombie until init reaps it.
+                state = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+                self.assertTrue(not state or state.startswith('Z'), state)
+            finally:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 class ServiceUpTests(unittest.TestCase):
@@ -649,6 +993,21 @@ class LaunchTests(unittest.TestCase):
 
 
 class ManifestTests(unittest.TestCase):
+    def test_provider_capability_comes_from_bundle_without_executing_it(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('make_update_manifest', Path(__file__).resolve().parents[2]
+                                                      / 'scripts/make-update-manifest.py')
+        maker = importlib.util.module_from_spec(spec); spec.loader.exec_module(maker)
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'supervisor_openwrt.py'
+            self.assertEqual(maker.openwrt_dns_providers(tmp), ['duckdns'])
+            source.write_text("raise RuntimeError('must not execute')\nDNS_PROVIDERS = ('duckdns', 'dnspod', 'dynv6')\n")
+            self.assertEqual(maker.openwrt_dns_providers(tmp), ['duckdns', 'dnspod', 'dynv6'])
+            source.write_text("# an old reader, with no declared capability\n")
+            self.assertEqual(maker.openwrt_dns_providers(tmp), ['duckdns'])
+            source.write_text("DNS_PROVIDERS = 'dnspod'\n")
+            with self.assertRaises(ValueError): maker.openwrt_dns_providers(tmp)
+
     def test_the_release_manifest_lists_every_download_with_its_hash(self):
         import importlib.util
         spec = importlib.util.spec_from_file_location('make_update_manifest', Path(__file__).resolve().parents[2]
@@ -673,6 +1032,7 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual((value['format'], value['version'], value['online'], value['notes']), (1, '2026.10.20', True, '- 新功能'))
         self.assertEqual(value['openwrt']['packages']['dashplay']['sha256'], sha(b'dashplay-2026.10.20-r1.apk'))
         self.assertEqual(value['openwrt']['jre']['version'], '21.0.12.1-r1')
+        self.assertEqual(value['openwrt']['dns_providers'], ['duckdns'])
         self.assertEqual(sorted(value['openwrt']['jre']['files']), ['aarch64_generic', 'x86_64'])
         self.assertEqual(value['openwrt']['base'], 'https://github.com/owner/openwrt-dashplay/releases/download/v2026.10.20/')
         self.assertEqual(value['debian']['files'], {'supervisor.py': sha(b'program')}, "the owner's data is no program file")

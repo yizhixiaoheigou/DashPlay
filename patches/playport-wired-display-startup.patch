@@ -1,0 +1,173 @@
+diff --git a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+--- a/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
++++ b/server/src/main/kotlin/com/playport/server/CarPlayServer.kt
+@@ -706,18 +706,22 @@
+                 socket.keepAlive = true
+                 socket.setSoLinger(true, 0)
+                 log.info("AirPlay connection accepted from {}", socket.remoteSocketAddress)
+-                val session = AirPlaySession(
+-                    socket = socket,
+-                    config = airPlayConfig,
+-                    identity = identity,
+-                    pairings = pairings,
+-                    mfi = mfi,
+-                    listener = listener,
+-                    media = media,
+-                )
+-                activeSession = session
+-                if (wired) wiredSession = session
+-                session.start()
++                synchronized(this) {
++                    // Publish the session with its display snapshot atomically against applyDisplay:
++                    // a request must either update the next snapshot or renegotiate the accepted one.
++                    val session = AirPlaySession(
++                        socket = socket,
++                        config = airPlayConfig,
++                        identity = identity,
++                        pairings = pairings,
++                        mfi = mfi,
++                        listener = listener,
++                        media = media,
++                    )
++                    activeSession = session
++                    if (wired) wiredSession = session
++                    session.start()
++                }
+             } catch (error: Exception) {
+                 log.warn("AirPlay session bring-up failed: {}", error.message)
+                 runCatching { socket.close() }
+@@ -974,9 +978,10 @@
+     }
+ 
+     /**
+-     * Applies a new display configuration and restarts CarPlay so the phone re-negotiates the
+-     * display. Returns null on success or a human-readable error.
++     * Applies a new display configuration, renegotiating an accepted session when necessary.
++     * Before wired AirPlay arrives, updating its next snapshot needs no USB restart.
+      */
++    @Synchronized
+     fun applyDisplay(request: DisplayRequest): DisplayOutcome {
+         val (width, height, fps, uiScale, hevc) = request
+         DisplayState.validate(width, height, fps)?.let { return DisplayOutcome(it) }
+@@ -1012,6 +1017,14 @@
+         }
+         display.update(width, height, fps, uiScale, hevc, areas, request.area)
+         configStore?.save(PersistentConfig.of(config, display))
++        if (cablePhone && session == null) {
++            // iAP2 identification/start does not carry the display. AirPlay captures it when accepted.
++            // Restarting USB here cut the first wired attempt merely because the viewer changed shape
++            // while waiting for the phone (N1 2026-11-02). Keep the existing startup timeout/retry.
++            log.info("display {}x{} @{}fps codec={} saved for incoming wired AirPlay; keeping USB startup ({})",
++                width, height, fps, if (hevc) "h265" else "h264", reason)
++            return DisplayOutcome()
++        }
+         log.info(
+             "display changed to {}x{} @{}fps uiScale={} codec={} ({}) areas={} ({}); restarting CarPlay",
+             width, height, fps, display.uiScale, if (display.hevc) "h265" else "h264", display.orientation,
+diff --git a/server/src/test/kotlin/com/playport/server/WiredDisplayStartupTest.kt b/server/src/test/kotlin/com/playport/server/WiredDisplayStartupTest.kt
+new file mode 100644
+--- /dev/null
++++ b/server/src/test/kotlin/com/playport/server/WiredDisplayStartupTest.kt
+@@ -0,0 +1,102 @@
++package com.playport.server
++
++import com.shilapi.xcertplay.airplay.*
++import java.net.Socket
++import org.junit.Assert.*
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++
++class WiredDisplayStartupTest {
++    @get:Rule val temp = TemporaryFolder()
++
++    private fun field(owner: Any, name: String) = owner.javaClass.getDeclaredField(name).also { it.isAccessible = true }
++    private fun set(owner: Any, name: String, value: Any?) = field(owner, name).set(owner, value)
++
++    private fun run(block: (CarPlayServer, WiredRunResources, ConfigStore) -> Unit) {
++        val root = temp.newFolder().toPath()
++        val store = ConfigStore(root.resolve("state"))
++        CarPlayServer(ServerConfig(identityDir = root, stateDir = root.resolve("state"),
++            bindAddress = "127.0.0.1", wireless = false), store).use { server ->
++            val bootstrap = WiredBootstrap(server, root.resolve("unused-helper"))
++            val resources = WiredRunResources(AutoCloseable {})
++            set(bootstrap, "link", resources)
++            set(server, "wired", bootstrap)
++            server.setCablePhone(true)
++            block(server, resources, store)
++        }
++    }
++
++    private fun negotiating(server: CarPlayServer): AirPlaySession {
++        val listener = field(server, "listener").get(server) as AirPlaySessionListener
++        return AirPlaySession(Socket(), server.airPlayConfig, server.identity, PairingStore(), null,
++            listener, object : AirPlayMediaHandler {}).also {
++            set(server, "wiredSession", it)
++            set(server, "activeSession", it)
++        }
++    }
++
++    @Test fun newShapeBeforeAirPlayKeepsTheUsbHandshakeAndUpdatesNextConfig() = run { server, resources, store ->
++        // Historical manual switch: start-session sent, then the viewer changes shape before AirPlay arrives.
++        val result = server.applyDisplay(DisplayRequest(2560, 1676, 60, 100, hevc = true, reason = "shape"))
++        assertNull(result.error)
++        assertFalse(result.deferred)
++        assertFalse("display update must not tear down the in-flight USB handshake", resources.closed)
++        assertEquals(2560, server.airPlayConfig.main.widthPixels)
++        assertEquals(1676, server.airPlayConfig.main.heightPixels)
++        assertTrue(server.airPlayConfig.hevc)
++        assertEquals(2560, store.load()!!.display.width)
++    }
++
++    @Test fun latestRequestBeforeAirPlayReplacesPendingAndKeepsUsb() = run { server, resources, store ->
++        server.display.defer(DisplayRequest(1280, 720))
++        val areas = listOf(ViewArea(1920, 1080), ViewArea(1280, 1080))
++        server.applyDisplay(DisplayRequest(1920, 1080, areas = areas, area = 1, defer = true))
++        assertNull(server.display.pending)
++        assertEquals(areas, server.display.areas)
++        assertEquals(1, server.airPlayConfig.main.initialViewArea)
++        assertEquals(1, store.load()!!.display.area)
++        assertFalse(resources.closed)
++        server.applyDisplay(DisplayRequest(1920, 1080, areas = areas, area = 0))
++        assertEquals(0, server.airPlayConfig.main.initialViewArea)
++        assertFalse(resources.closed)
++    }
++
++    @Test fun acceptedButNotYetLiveSessionStillRestartsForNewShape() = run { server, resources, _ ->
++        val session = negotiating(server)
++        assertFalse(server.wiredSessionActive())
++        server.applyDisplay(DisplayRequest(2560, 1676))
++        assertTrue("accepted session has already captured the old display", resources.closed)
++        assertNull(field(server, "activeSession").get(server))
++        session.close()
++    }
++
++    @Test fun liveSessionStillRestartsForImmediateChange() = run { server, resources, _ ->
++        val session = negotiating(server)
++        (field(server, "listener").get(server) as AirPlaySessionListener).onSessionActive(session)
++        assertTrue(server.wiredSessionActive())
++        server.applyDisplay(DisplayRequest(2560, 1676))
++        assertTrue(resources.closed)
++        assertFalse(server.wiredSessionActive())
++    }
++
++    @Test fun deferredChangeWaitsForLiveSessionToEnd() = run { server, resources, _ ->
++        val session = negotiating(server)
++        (field(server, "listener").get(server) as AirPlaySessionListener).onSessionActive(session)
++        val oldWidth = server.display.width
++        val result = server.applyDisplay(DisplayRequest(2560, 1676, defer = true))
++        assertTrue(result.deferred)
++        assertEquals(oldWidth, server.display.width)
++        assertFalse(resources.closed)
++        session.close()
++        assertEquals(2560, server.display.width)
++    }
++
++    @Test fun invalidDisplayCannotAlterStartup() = run { server, resources, store ->
++        val before = server.airPlayConfig
++        assertNotNull(server.applyDisplay(DisplayRequest(1, 1)).error)
++        assertEquals(before.main, server.airPlayConfig.main)
++        assertNull(store.load())
++        assertFalse(resources.closed)
++    }
++}

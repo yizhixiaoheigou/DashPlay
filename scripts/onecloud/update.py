@@ -12,7 +12,8 @@ OpenWrt: the dashplay, luci-app-dashplay and zh-cn packages (the JRE only when i
 refusing a plan with any kernel, kmod or BlueZ package (the ZTE F50 runs a vendor 5.4 kernel); the packages of
 the installed version are fetched first to go back to. OneCloud / N1: firmware/upgrade.py with the release's
 program bundle (it keeps state/ and identity/ and restores the previous program by itself).
-Never while CarPlay is in use, and never by itself: the boxes only check (once a day) and say so.
+Debian wired sessions may stay connected until the verified bundle and local backup are ready; wireless
+sessions and all OpenWrt sessions must disconnect first. Never install automatically: only check once a day.
 Progress goes to state/update-status.json, which the settings page and LuCI show (bytes, total, speed, source).
 Downloads come from the fastest source: GitHub and every mirror download the first 256 KB at once, an install
 always measures again, a check reuses a day-old order; a source that slows below 20 KB/s for 15 s or breaks off
@@ -28,6 +29,8 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -44,7 +47,9 @@ LATEST = os.environ.get("DASHPLAY_UPDATE_LATEST", f"https://github.com/{OWNER}/D
 RELEASE_FEED = os.environ.get("DASHPLAY_RELEASE_FEED", f"https://github.com/{OWNER}/DashPlay/releases/download/v{{version}}/")
 RELEASE_LIST = f"https://api.github.com/repos/{OWNER}/DashPlay/releases?per_page=100"
 SETTINGS_FORMAT = 1
+OPENWRT_DNS_COMPATIBILITY = 1  # reported by the retained version-selection service
 HISTORY_MIN = (2026, 10, 29)
+SIGNED_RELEASE_MIN = (2026, 10, 20)  # Earlier releases did not publish the Ed25519 manifest.
 PREVIOUS_FEED = os.environ.get("DASHPLAY_UPDATE_FEED",
                                f"https://github.com/{OWNER}/openwrt-dashplay/releases/download/v{{version}}/")
 VERSION_FILE = "version.txt"
@@ -99,6 +104,35 @@ def is_openwrt():
 
 def run(*args, timeout=300):
     return subprocess.run(list(args), capture_output=True, text=True, timeout=timeout)
+
+
+def run_installer(*args, timeout):
+    """On timeout, end the installer and its child commands before starting rollback."""
+    # Files avoid waiting forever for a pipe held by a descendant after the parent is killed.
+    with tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='replace') as out, \
+            tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='replace') as err:
+        with subprocess.Popen(list(args), stdout=out, stderr=err, start_new_session=True) as process:
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+                raise
+            out.seek(0)
+            err.seek(0)
+            return subprocess.CompletedProcess(args, process.returncode, out.read(), err.read())
+
+
+def backup_generation(path):
+    """The local upgrader atomically replaces its archive before touching program files."""
+    try:
+        stat = path.stat()
+        return stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size
+    except FileNotFoundError:
+        return None
 
 
 def version_key(version):
@@ -356,14 +390,14 @@ def verify(data, signature, key=KEY):
     return out.returncode == 0 and "Signature Verified Successfully" in out.stdout
 
 
-def latest_manifest(root, openwrt, key=KEY, version=None):
+def latest_manifest(root, openwrt, key=KEY, version=None, *, prefixes=None, remember=True):
     """The latest signed manifest. Its "mirrors", when valid, become the mirrors measured from then on."""
     # One source at a time: a mirror answering fast with a block page must not stop a check another source passes.
     if version is not None and not re.fullmatch(r'20\d{2}\.\d{2}\.\d{2}(?:\.\d+)?', version):
         raise UpdateError('版本号格式不正确')
     base = RELEASE_FEED.format(version=version) if version else LATEST
     errors, forged = [], False
-    for prefix in sources(root, openwrt, base + MANIFEST):
+    for prefix in (sources(root, openwrt, base + MANIFEST) if prefixes is None else prefixes):
         try:
             data = fetch(base + MANIFEST, (prefix,), limit=1 << 20)
             signature = fetch(base + SIGNATURE, (prefix,), limit=4096)
@@ -388,8 +422,9 @@ def latest_manifest(root, openwrt, key=KEY, version=None):
         listed = mirror_list(manifest["mirrors"], https_only=True) if "mirrors" in manifest else None
     except ValueError:
         listed = None   # a list this version cannot read: keep the one before
-    keep(root, used=prefix, used_at=int(time.time()),
-         **({"mirrors": list(listed)} if listed else {}))
+    if remember:
+        keep(root, used=prefix, used_at=int(time.time()),
+             **({"mirrors": list(listed)} if listed else {}))
     return manifest
 
 
@@ -423,6 +458,40 @@ def check_target(root, openwrt, manifest):
             raise UpdateError('所选版本与这台盒子的系统不兼容，已停止')
     elif apk_version('dashplay-jre') != manifest.get('openwrt', {}).get('jre', {}).get('version'):
         raise UpdateError('所选版本需要不同的 Java 运行环境，暂不支持保留系统回退')
+    if openwrt:
+        check_openwrt_domain(manifest)
+
+
+def check_openwrt_domain(manifest):
+    """A signed target must support the configured provider; old releases only knew DuckDNS.
+
+    Read UCI directly: a retained updater may run after the installed program was downgraded, so it must
+    not import that program's older configuration reader (which silently ignores new provider fields).
+    """
+    try:
+        result = run('uci', '-q', 'show', 'dashplay', timeout=5)
+        if result.returncode or not isinstance(result.stdout, str):
+            raise ValueError('uci unavailable')
+        config = {}
+        for line in result.stdout.splitlines():
+            key, separator, value = line.partition('=')
+            if key in ('dashplay.main.ddns_provider', 'dashplay.main.ddns_domain'):
+                values = shlex.split(value)
+                if not separator or len(values) != 1 or key in config:
+                    raise ValueError('invalid UCI option')
+                config[key] = values[0]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise UpdateError('无法核对当前自有域名配置，已停止安装；请检查 OpenWrt 设置后重试') from None
+    provider = config.get('dashplay.main.ddns_provider') or 'duckdns'
+    if provider == 'duckdns' or not config.get('dashplay.main.ddns_domain', '').strip():
+        return
+    supported = manifest.get('openwrt', {}).get('dns_providers', ['duckdns'])
+    if not isinstance(supported, list) or not all(isinstance(p, str) for p in supported):
+        raise UpdateError('所选版本的域名兼容信息无效，已停止安装')
+    if provider not in supported:
+        label = {'dnspod': 'DNSPod', 'dynv6': 'dynv6'}.get(provider, '当前服务商')
+        raise UpdateError(f'所选版本不支持正在配置的 {label} 自有域名，已保留当前程序和设置；'
+                          '请先关闭自有域名或切回旧版支持的服务商，再切换版本')
 
 
 def file_sha256(path):
@@ -530,17 +599,52 @@ def carplay_in_use(root):
             read(WIRED_STATUS).get('phase') in ('starting', 'live'))
 
 
+def carplay_blocks_update(root, openwrt):
+    # Debian's local upgrader backs up the old program before stopping services; all downloads are already
+    # verified by then. Keep USB tethering alive until that point. OpenWrt's apk flow may still need the network.
+    return (carplay_in_use(root) if openwrt else
+            bool(read(Path(root) / "state/receiver/phone-presence.json").get("active")))
+
+
 def forbidden_in_plan(simulation):
     """Packages an apk --simulate output would touch that an online update must not (kernel, kmod, BlueZ)."""
     names = re.findall(r"^\(\d+/\d+\) (?:Installing|Upgrading|Downgrading|Replacing|Purging) (\S+)", simulation, re.M)
     return sorted({name for name in names if FORBIDDEN.match(name)})
 
 
-def previous_packages(version, prefixes, work, report=None):
-    """The installed release's three packages (to go back to), checked against that release's SHA256SUMS."""
+def previous_packages(version, prefixes, work, report=None, key=KEY):
+    """Authenticate rollback packages too; a mirror must never supply its own trust anchor."""
+    if version_key(version) >= SIGNED_RELEASE_MIN:
+        # Reuse the selected-release verifier, but do not replace today's mirror preferences with an old list.
+        manifest = latest_manifest(work, True, key, version=version, prefixes=prefixes, remember=False)
+        try:
+            feed = manifest['openwrt']
+            entries = []
+            for package in OPENWRT_PACKAGES:
+                entry = feed['packages'][package]
+                name, digest, size = entry['file'], entry['sha256'], entry['size']
+                if (not isinstance(name, str) or '\\' in name or
+                        not re.fullmatch(rf'{re.escape(package)}-[0-9][^/]*\.apk', name) or
+                        not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest) or
+                        type(size) is not int or not 0 < size <= 256 << 20):
+                    raise ValueError('invalid package entry')
+                entries.append((name, digest, size))
+            base = feed['base']
+            if not isinstance(base, str) or not base.endswith('/'):
+                raise ValueError('invalid package base')
+        except (KeyError, TypeError, ValueError):
+            raise UpdateError('当前版本的回退清单不完整或格式不正确，已停止升级') from None
+        files = []
+        for name, digest, size in entries:
+            target = Path(work) / 'previous' / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            files.append(fetch(base + name, prefixes, target=target, sha256=digest, size=size, report=report))
+        return files
+    # Legacy releases have no signature. Only the official HTTPS origin may provide their hashes;
+    # package bytes can still use a mirror, but must match those independently obtained hashes.
     base = PREVIOUS_FEED.format(version=version)
     try:
-        sums = fetch(base + "SHA256SUMS", prefixes, limit=1 << 16).decode()
+        sums = fetch(base + "SHA256SUMS", (DIRECT,), limit=1 << 16).decode()
     except NotFound:
         raise UpdateError(f"找不到当前版本 {version} 的安装包（它不是正式发布的版本），升级失败时无法退回，已停止。"
                           "请按装机说明手动升级") from None
@@ -597,11 +701,20 @@ def backup(root, openwrt):
             if Path(config).exists():
                 out.add(config, arcname="config/" + Path(config).name)
     os.chmod(target.with_suffix(".tmp"), 0o600)
+    # Finish and sync the complete archive before replacing the previous backup. Any sync error must
+    # propagate to _install, which stops before invoking either platform's installer.
+    with open(target.with_suffix(".tmp"), "rb") as saved:
+        os.fsync(saved.fileno())
     os.replace(target.with_suffix(".tmp"), target)
+    directory = os.open(target.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
     return target
 
 
-def install_openwrt(root, manifest, status, work):
+def install_openwrt(root, manifest, status, work, key=KEY):
     current = current_version(root, True)
     if not current:
         raise UpdateError("没有找到已安装的 dashplay 软件包")
@@ -617,7 +730,7 @@ def install_openwrt(root, manifest, status, work):
     prefixes = sources(root, True, feed["base"] + biggest["file"], fresh=True, size=biggest["size"])
     # The way back first: without it nothing is installed, so the new release is not fetched for nothing.
     progress = Progress(status, "downloading", f"正在下载当前版本 {current} 的安装包（升级失败时用来退回）")
-    previous = previous_packages(current, prefixes, work, progress)
+    previous = previous_packages(current, prefixes, work, progress, key=key)
     total = sum(entry["size"] for entry in wanted.values())
     progress = Progress(status, "downloading", f"正在下载 {manifest['version']}（{total // 1048576} MB）", total)
     progress.show()
@@ -636,16 +749,42 @@ def install_openwrt(root, manifest, status, work):
     blocked = forbidden_in_plan(simulation.stdout)
     if blocked:
         raise UpdateError("升级会改动内核、内核模块或系统蓝牙（" + "、".join(blocked) + "），已停止，请按说明手动升级")
+    check_openwrt_domain(manifest)  # UCI may have changed while the packages were downloading.
     status("installing", "正在安装，CarPlay 会断开约 1 分钟")
     port = settings_port()
-    result = run("apk", "add", *direction, "--allow-untrusted", *map(str, files), timeout=600)
-    if result.returncode == 0 and service_up(port):
+    reason = "新版本没有正常启动"
+    try:
+        result = run_installer("apk", "add", *direction, "--allow-untrusted", *map(str, files), timeout=600)
+        installed = result.returncode == 0
+    except subprocess.TimeoutExpired:
+        reason = "安装超时"
+        installed = False
+    if installed and service_up(port):
         return
-    status("restoring", "新版本没有正常启动，正在退回原来的版本")
-    back = run("apk", "add", "--allow-untrusted", *map(str, previous), timeout=600)
-    up = back.returncode == 0 and service_up(port)
-    raise UpdateError(f"新版本没有正常启动，已退回 {current}" if up else
-                      "新版本没有正常启动，退回也没有成功：请按说明用电脑恢复（数据备份在 /opt/" + BACKUP + "）")
+    status("restoring", reason + "，正在退回原来的版本")
+    try:
+        back = run_installer("apk", "add", "--allow-untrusted", *map(str, previous), timeout=600)
+        up = back.returncode == 0 and service_up(port)
+    except (OSError, subprocess.TimeoutExpired):
+        up = False
+    raise UpdateError(f"{reason}，已退回 {current}" if up else
+                      reason + "，退回也没有成功：请按说明用电脑恢复（数据备份在 " + str(root.parent / BACKUP) + "）")
+
+
+def durable_program_backup(path):
+    """Inspect a local tool's capability without executing retained/old code."""
+    try:
+        return re.search(r'^PROGRAM_BACKUP_FSYNC = 1(?:\s*#.*)?$', Path(path).read_text(), re.M) is not None
+    except (OSError, UnicodeError):
+        return False
+
+
+def platform_upgrade_check(path):
+    """A retained installer must keep the firmware compatibility gate across downgrades."""
+    try:
+        return re.search(r'^PLATFORM_UPGRADE_CHECK = 1(?:\s*#.*)?$', Path(path).read_text(), re.M) is not None
+    except (OSError, UnicodeError):
+        return False
 
 
 def install_debian(root, manifest, status, work):
@@ -663,10 +802,39 @@ def install_debian(root, manifest, status, work):
     status("installing", "正在安装，CarPlay 和盒子热点会断开约 1 分钟")
     # Downgrading must not hand control to an old installer that lacks today's preservation checks.
     retained = Path(root) / 'state/version-manager/upgrade.py'
-    upgrader = retained if retained.is_file() else Path(root) / 'firmware/upgrade.py'
-    result = run(sys.executable, str(upgrader), str(bundle), timeout=900)
+    source = next((path for path in (retained, Path(root) / 'firmware/upgrade.py')
+                   if durable_program_backup(path) and platform_upgrade_check(path)), None)
+    if source is None:
+        raise UpdateError('本地升级工具缺少可靠备份或设备兼容检查支持，已停止安装；请从新版设置页重新打开版本选择，或按电脑升级说明恢复工具')
+    # The candidate may replace/delete firmware/upgrade.py before timing out. Retain this run's known tool.
+    upgrader = Path(work) / 'upgrade.py'
+    shutil.copyfile(source, upgrader)
+    if not durable_program_backup(upgrader) or not platform_upgrade_check(upgrader):
+        raise UpdateError('本地升级工具在复制时发生变化，未确认可靠备份和设备兼容检查支持，已停止安装')
+    previous = Path(root).parent / 'dashplay-previous.tar'
+    before = backup_generation(previous)
+    try:
+        result = run_installer(sys.executable, str(upgrader), str(bundle), timeout=900)
+    except subprocess.TimeoutExpired:
+        after = backup_generation(previous)
+        if after is None or after == before:
+            raise UpdateError("安装超时，未确认本次升级的完整备份，未自动回退：请按说明用电脑检查恢复"
+                              "（详见 state/upgrade.log）") from None
+        status("restoring", "安装超时，正在恢复升级前的程序")
+        try:
+            # Also protect boxes retaining an older upgrade.py: its --rollback does not stop the service.
+            stopped = run_installer('systemctl', 'stop', 'dashplay', timeout=60)
+            restored = False
+            if stopped.returncode == 0:
+                back = run_installer(sys.executable, str(upgrader), '--rollback', timeout=900)
+                restored = back.returncode == 0  # --rollback checks that the restored service stays up.
+        except (OSError, subprocess.TimeoutExpired):
+            restored = False
+        raise UpdateError("安装超时，已恢复升级前的程序（详见 state/upgrade.log）" if restored else
+                          "安装超时，自动恢复没有成功：请按说明用电脑恢复（详见 state/upgrade.log）") from None
     if result.returncode != 0:
-        raise UpdateError("新版本没有正常启动，已自动退回原来的程序（详见 state/upgrade.log）")
+        # A nonzero exit can also be a failed preflight or a failed internal rollback, not proof of recovery.
+        raise UpdateError("安装没有完成，请查看 state/upgrade.log 确认恢复结果；盒子无法使用时请按说明用电脑恢复")
     save(Path(root) / "state/update.json", {"version": manifest["version"], "at": int(time.time())})
 
 
@@ -702,14 +870,19 @@ def _install(root, openwrt=None, key=KEY, version=None):
         if not found.get("online"):
             raise UpdateError(f"{found.get('reason') or '这一版改了系统'}，不能在线升级 {manifest['version']}："
                               "请按装机说明用刷机包升级")
-        if carplay_in_use(root):
+        if carplay_blocks_update(root, openwrt):
             raise UpdateError("正在使用 CarPlay：停车、断开后再升级")
+        if openwrt:
+            check_openwrt_domain(manifest)
         if shutil.disk_usage(tempfile.gettempdir()).free < 200 << 20:
             raise UpdateError("临时空间不足 200 MB，无法下载")
         status("backup", "正在备份配对、证书和设置")
         saved = backup(root, openwrt)
         with tempfile.TemporaryDirectory(prefix="dashplay-update.") as work:
-            (install_openwrt if openwrt else install_debian)(root, manifest, status, work)
+            if openwrt:
+                install_openwrt(root, manifest, status, work, key=key)
+            else:
+                install_debian(root, manifest, status, work)
         if before and before != manifest['version']:
             save(root / 'state/version-manager/previous.json', {'version': before, 'installed': manifest['version']})
         status("done", f"已安装 {manifest['version']}", version=manifest["version"], backup=str(saved))
@@ -773,7 +946,7 @@ def launch(root, openwrt=None, version=None):
     openwrt = is_openwrt() if openwrt is None else openwrt
     if running(root):
         return "正在升级，请稍候"
-    if carplay_in_use(root):
+    if carplay_blocks_update(root, openwrt):
         return "正在使用 CarPlay：停车、断开后再升级"
     install = [sys.executable, str(Path(__file__).resolve()), "install", "--root", str(root)]
     if version is not None:

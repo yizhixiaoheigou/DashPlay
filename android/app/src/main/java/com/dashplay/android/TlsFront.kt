@@ -38,7 +38,6 @@ class TlsFront(
     @Volatile private var listener: ServerSocket? = null
     private val connections: MutableSet<Socket> = ConcurrentHashMap.newKeySet()
     private val slots = Semaphore(32)
-    val localPort: Int get() = checkNotNull(listener).localPort
 
     fun start() {
         val socket = context.serverSocketFactory.createServerSocket() as SSLServerSocket

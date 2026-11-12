@@ -18,6 +18,16 @@ import subprocess
 import time
 
 RUN = Path("/run/dashplay")
+
+
+def signal_group(pid, sig):
+    """A child can exit between poll() and the signal; still let the caller reap it."""
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        pass
+
+
 STA_NETWORK = Path("/run/systemd/network/60-onecloud-sta.network")
 # USB shared network (iPhone ipheth, Android/MiFi rndis_host, cdc_ether, cdc_ncm), options.json car_internet "usb_tether"; sorted
 # before any image-wide match so its route stays behind the Ethernet cable (default metric 1024).
@@ -67,6 +77,9 @@ def derived_address(key, purpose):
     return ":".join(f"{b:02x}" for b in raw)
 
 
+AP_CHANNELS = frozenset((*range(1, 15), 36, 40, 44, 48, 149, 153, 157, 161, 165))
+
+
 def ap_width(channel, width):
     """The widest of width that the channel allows: 2.4 GHz and channel 165 have no 80 MHz block."""
     if channel <= 14 or channel == 165:
@@ -94,6 +107,8 @@ def station_network_lines(hotspot):
 def hostapd_config(interface, channel, width, ssid, passphrase, country="CN"):
     """passphrase None: an open network (first-run setup only). country None: leave the regulatory
     domain to the driver."""
+    if channel not in AP_CHANNELS:
+        raise ValueError("Unsupported hotspot channel (DFS is not configured)")
     # One setting per line: a newline in the name or password added its own (review 2026-10-12).
     if any(ord(c) < 32 or ord(c) == 127 for c in ssid + (passphrase or "")):
         raise ValueError("control character in the hotspot name or password")
@@ -179,7 +194,7 @@ def wifi_interface(net=Path("/sys/class/net")):
         names = sorted(entry.name for entry in net.iterdir())
     except OSError:
         return None
-    return next((name for name in names if name not in (AP_VIF, "ap0") and
+    return next((name for name in names if name not in (AP_VIF, "ap0") and not name.startswith("p2p") and
                  ((net / name / "wireless").exists() or (net / name / "phy80211").exists())), None)
 
 
@@ -280,6 +295,10 @@ class DebianPlatform:
         self.ap_interface = interface
         self.children = []
         self.bluetooth_state = None
+        self.connectivity_enabled = False
+        self.connectivity = None
+        self.connectivity_notify = None
+        self.forwarding_aps = {}
 
     ap_vif = AP_VIF
     wifi_interface = staticmethod(wifi_interface)
@@ -344,15 +363,18 @@ class DebianPlatform:
         return child
 
     def stop_child(self, name):
+        if name == 'dnsmasq' and self.connectivity:
+            self.connectivity.close()
+            self.connectivity = None
         for entry in list(self.children):
             if entry[0] == name:
                 self.children.remove(entry)
                 if entry[1].poll() is None:
-                    os.killpg(entry[1].pid, signal.SIGTERM)
+                    signal_group(entry[1].pid, signal.SIGTERM)
                     try:
                         entry[1].wait(timeout=8)
                     except subprocess.TimeoutExpired:
-                        os.killpg(entry[1].pid, signal.SIGKILL)
+                        signal_group(entry[1].pid, signal.SIGKILL)
                         entry[1].wait()
 
     def check_lan_children(self):
@@ -385,7 +407,23 @@ class DebianPlatform:
     def concurrent_ap(self):
         """Channels a station and an AP may use at once: 0 none, 1 the same (rtw88 built by
         build-rtw88-concurrent.sh), 2 different ones (MT7921AU)."""
-        return supports_sta_ap(subprocess.run(["iw", "list"], capture_output=True, text=True, timeout=10).stdout)
+        phy = SYS_NET / self.interface / 'phy80211'
+        command = ['iw', 'phy', phy.resolve().name, 'info'] if phy.exists() else ['iw', 'list']
+        text = subprocess.run(command, capture_output=True, text=True, timeout=10, check=True).stdout
+        # Never borrow a different radio's advertised capabilities.
+        if not phy.exists() and text.count('Wiphy ') > 1:
+            return 0
+        channels = supports_sta_ap(text)
+        return 1 if self.vendor_phone_ap() else channels
+
+    def vendor_phone_ap(self):
+        """Known vendor exception only: an existing p2p0 on the station's own phy."""
+        if wifi_driver(self.interface) != '8188fu':
+            return None
+        sta, ap = SYS_NET / self.interface / 'phy80211', SYS_NET / 'p2p0' / 'phy80211'
+        if sta.exists() and ap.exists() and sta.resolve() == ap.resolve():
+            return 'p2p0'
+        return None
 
     def wired_capable(self, compatible=Path("/proc/device-tree/compatible")):
         """Whether the iPhone can be plugged in: not on a Snapdragon 410 stick, whose only USB port is its plug (device
@@ -455,6 +493,7 @@ class DebianPlatform:
         write_conf(known)
         request = f"RequestAddress={lease['address']}\n" if lease.get("ssid") == car["ssid"] else ""
         # Ask the car's DHCP server for the previous address, so the head unit's bookmark keeps working.
+        self.sta_network.parent.mkdir(parents=True, exist_ok=True)
         self.sta_network.write_text(f"[Match]\nName={self.interface}\n[Network]\nDHCP=ipv4\n"
                                f"[DHCPv4]\nRouteMetric=2048\n{request}")
         self.sta_network.chmod(0o644)   # read by systemd-network; no secrets
@@ -715,6 +754,32 @@ class DebianPlatform:
         router: hand out the box as default gateway with those names (Tesla offline checks, supervisor.hotspot_router)."""
         network = address.network
         hosts = list(network.hosts())
+        if self.connectivity:
+            self.connectivity.close()
+            self.connectivity = None
+        dynamic = None
+        dynamic_flags = []
+        if self.connectivity_enabled and not portal:
+            from connectivity import DnsFiles
+            from setup_wizard import TESLA_CHECK_NAMES
+            check_names = tuple(name for name in names if name in TESLA_CHECK_NAMES)
+            if check_names:
+                # Beside run/ (0700), so dnsmasq can reread as nobody after dropping privileges.
+                try:
+                    self.phone_resolv.parent.mkdir(parents=True, exist_ok=True)
+                    self.phone_resolv.parent.chmod(0o755)
+                    dynamic = DnsFiles(self.phone_resolv.parent / 'checks', address.ip, check_names)
+                    dynamic_flags = dynamic.prepare()
+                    if upstream_file is None:
+                        self.set_phone_dns(upstream)
+                        upstream_file = self.phone_resolv
+                except OSError as error:
+                    dynamic, dynamic_flags = None, []
+                    if self.connectivity_notify:
+                        self.connectivity_notify(dict(link=None, internet=None, checks={}, local=list(check_names),
+                                                      mode='protect', error=type(error).__name__, retry=False))
+                else:
+                    names = tuple(name for name in names if name not in check_names)
         # On dnsmasq >= 2.86 an IPv4 --address alone still forwards other query types.
         # Keep AAAA/HTTPS queries local too: deSEC names intentionally have no public records.
         local_names = [flag for name in names for flag in
@@ -736,13 +801,33 @@ class DebianPlatform:
                    f"--dhcp-option=3,{address.ip}" if router else "--dhcp-option=3", f"--dhcp-option=6,{address.ip}"]
         else:
             dns = ["--port=0", "--dhcp-option=3", "--dhcp-option=6"]
-        self.start("dnsmasq", ["dnsmasq", "--keep-in-foreground", "--conf-file=/dev/null", *dns,
+        child = self.start("dnsmasq", ["dnsmasq", "--keep-in-foreground", "--conf-file=/dev/null", *dns, *dynamic_flags,
                           f"--interface={self.ap_interface}", "--bind-interfaces", "--except-interface=lo",
                           f"--dhcp-range={hosts[9]},{hosts[99]},{network.netmask},12h",
                           "--dhcp-authoritative",
                           f"--dhcp-leasefile={self.run / 'dnsmasq.leases'}", "--log-dhcp",
                           *(["--log-queries", "--log-facility=-"] if query_log else [])],
                    **({"query_log": query_log} if query_log else {}))
+        if dynamic:
+            from connectivity import Monitor, Probe
+            ap = self.ap_interface
+            self.connectivity = Monitor(Probe(upstream_file, ap, ready=lambda: self.sharing_ready(ap)), dynamic,
+                                        lambda: child.send_signal(signal.SIGHUP), self.connectivity_notify)
+            if self.connectivity_notify:
+                self.connectivity_notify(self.connectivity.status)
+            self.connectivity.start()
+
+    def sharing_ready(self, ap):
+        from connectivity import ipv4_forwarding
+        return ap in tuple(self.forwarding_aps.values()) and ipv4_forwarding()
+
+    def note_forwarding(self, owner, ap=None):
+        if ap is None:
+            self.forwarding_aps.pop(owner, None)
+        else:
+            self.forwarding_aps[owner] = ap
+        if self.connectivity:
+            self.connectivity.changed()
 
     def uplink_gateway(self):
         result = subprocess.run(['ip', '-j', '-4', 'route', 'show', 'default', 'dev', self.interface],
@@ -770,6 +855,8 @@ class DebianPlatform:
         temporary.write_text(text)
         temporary.chmod(0o644)
         temporary.replace(path)
+        if self.connectivity:
+            self.connectivity.changed()
 
     def phone_hotspot_frequency(self, ssid, frequency=None, timeout=5):
         """One bounded scan, retaining each SSID's frequency (including escaped UTF-8).
@@ -810,6 +897,7 @@ class DebianPlatform:
                         f' scan_freq={frequency}\n'
                         f' freq_list={frequency}\n}}\n')
         conf.chmod(0o600)
+        self.sta_network.parent.mkdir(parents=True, exist_ok=True)
         self.sta_network.write_text(f'[Match]\nName={self.interface}\n[Network]\nDHCP=ipv4\n'
                                     '[DHCPv4]\nRouteMetric=2048\n')
         self.sta_network.chmod(0o644)
@@ -824,6 +912,7 @@ class DebianPlatform:
         self.stop_child('wpa_supplicant')
         # Removing the .network file alone can leave networkd's old DHCP client alive.
         # Explicitly disable it without bringing the shared radio or AP down.
+        self.sta_network.parent.mkdir(parents=True, exist_ok=True)
         self.sta_network.write_text(f'[Match]\nName={self.interface}\n[Network]\n'
                                     'DHCP=no\nLinkLocalAddressing=no\n')
         self.sta_network.chmod(0o644)
@@ -874,20 +963,56 @@ class DebianPlatform:
         if original.lower() in SHARED_WIFI_ADDRESSES:
             original = info['address']
         from setup_wizard import save_json
+        vendor = self.vendor_phone_ap()
         save_json(self.run / 'phone-uplink.json', {'mac': original, 'interface': self.interface,
-                  'forward': Path('/proc/sys/net/ipv4/ip_forward').read_text().strip(), 'network': None})
-        for args in (['down'], ['address', station_mac(original)]):
+                  'forward': Path('/proc/sys/net/ipv4/ip_forward').read_text().strip(), 'network': None,
+                  'ap_vif': None, 'vendor_ap': vendor, 'station_mac_changed': not bool(vendor)})
+        steps = (['down'],) if vendor else (['down'], ['address', station_mac(original)])
+        for args in steps:
             subprocess.run(['ip', 'link', 'set', 'dev', self.interface, *args], check=True, capture_output=True, timeout=5)
 
     def add_phone_ap(self):
-        saved = json.loads((self.run / 'phone-uplink.json').read_text())
-        # STA already has a different MAC. ap0 gets the same MAC as the normal daily AP.
-        subprocess.run(['iw', 'dev', self.interface, 'interface', 'add', 'ap0', 'type', '__ap'],
-                       check=True, capture_output=True, timeout=10)
-        self.ap_interface = 'ap0'
+        from setup_wizard import save_json
+        path = self.run / 'phone-uplink.json'
+        saved = json.loads(path.read_text())
+        vif = saved.get('vendor_ap') or 'ap0'
+        if saved.get('vendor_ap'):
+            if self.vendor_phone_ap() != vif:
+                raise RuntimeError('Vendor AP no longer belongs to the station radio')
+            info = subprocess.run(['iw', 'dev', vif, 'info'], check=True, capture_output=True, text=True, timeout=5).stdout
+            kind = re.search(r'^\s*type (\S+)', info, re.M)
+            link = json.loads(subprocess.run(['ip', '-j', 'addr', 'show', 'dev', vif],
+                                            check=True, capture_output=True, text=True, timeout=5).stdout)[0]
+            # Borrow only an idle interface: never take an existing user's AP/P2P session.
+            if not kind or kind[1] not in ('managed', 'AP') or 'UP' in link.get('flags', []) or link.get('addr_info'):
+                raise RuntimeError('Vendor AP interface is in use or has an unsupported role')
+            managed = None
+            if shutil.which('nmcli'):
+                running = subprocess.run(['nmcli', '-t', '-f', 'RUNNING', 'general'],
+                                         capture_output=True, text=True, timeout=5,
+                                         env={**os.environ, 'LC_ALL': 'C'})
+                if running.stdout.strip() != 'not running':
+                    if running.returncode or running.stdout.strip() != 'running':
+                        raise RuntimeError('Cannot determine NetworkManager state')
+                    managed = subprocess.run(['nmcli', '-g', 'GENERAL.MANAGED', 'device', 'show', vif],
+                                             check=True, capture_output=True, text=True, timeout=5,
+                                             env={**os.environ, 'LC_ALL': 'C'}).stdout.strip()
+                    if managed not in ('yes', 'no'):
+                        raise RuntimeError('Cannot determine vendor AP ownership')
+            saved['borrowed_ap'] = {'type': kind[1], 'mac': link['address'], 'managed': managed,
+                                    'phy': str((SYS_NET / vif / 'phy80211').resolve())}
+        elif (SYS_NET / vif).exists():
+            raise RuntimeError('AP interface already exists without a recovery record')
+        saved['ap_vif'] = vif
+        save_json(path, saved)  # ownership before creation, NM handoff or hostapd changes
+        self.ap_interface = vif
+        if not saved.get('borrowed_ap'):
+            subprocess.run(['iw', 'dev', self.interface, 'interface', 'add', vif, 'type', '__ap'],
+                           check=True, capture_output=True, timeout=10)
         self.release_phone_ap_from_networkmanager()
-        subprocess.run(['ip', 'link', 'set', 'dev', 'ap0', 'address', saved['mac']],
-                       check=True, capture_output=True, timeout=5)
+        if not saved.get('borrowed_ap'):
+            subprocess.run(['ip', 'link', 'set', 'dev', vif, 'address', saved['mac']],
+                           check=True, capture_output=True, timeout=5)
         return True
 
     def release_phone_ap_from_networkmanager(self):
@@ -905,9 +1030,9 @@ class DebianPlatform:
             raise RuntimeError('Cannot determine NetworkManager state')
         # Its D-Bus device may appear slightly after iw creates the interface.
         for attempt in range(10):
-            subprocess.run(['nmcli', 'device', 'set', 'ap0', 'managed', 'no'],
+            subprocess.run(['nmcli', 'device', 'set', self.ap_interface, 'managed', 'no'],
                            capture_output=True, timeout=3)
-            state = subprocess.run(['nmcli', '-g', 'GENERAL.STATE', 'device', 'show', 'ap0'],
+            state = subprocess.run(['nmcli', '-g', 'GENERAL.STATE', 'device', 'show', self.ap_interface],
                                    capture_output=True, text=True, timeout=3,
                                    env={**os.environ, 'LC_ALL': 'C'})
             if state.returncode == 0 and re.match(r'^10(?:\s|$)', state.stdout.strip()):
@@ -921,15 +1046,13 @@ class DebianPlatform:
         path.write_text(''.join(line for line in path.read_text().splitlines(True)
                                 if not line.startswith(('ieee80211ac=', 'vht_', 'ht_capab='))))
 
-    def phone_nat_rules(self, network):
-        # Follow routing (Ethernet at home, phone Wi-Fi in the car), never translate back onto ap0.
-        return [(['-t', 'nat'], ['POSTROUTING', '-s', str(network), '!', '-o', 'ap0',
-                                '-m', 'comment', '--comment', 'dashplay-phone-uplink', '-j', 'MASQUERADE']),
-                ([], ['FORWARD', '-i', 'ap0', '!', '-o', 'ap0', '-s', str(network),
-                      '-m', 'comment', '--comment', 'dashplay-phone-uplink', '-j', 'ACCEPT']),
-                ([], ['FORWARD', '!', '-i', 'ap0', '-o', 'ap0', '-d', str(network),
-                      '-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED',
-                      '-m', 'comment', '--comment', 'dashplay-phone-uplink', '-j', 'ACCEPT'])]
+    def phone_nat_rules(self, network, ap='ap0', tagged=True):
+        # ap0 remains the default for journals written before interface ownership was recorded.
+        tag = ['-m', 'comment', '--comment', 'dashplay-phone-uplink'] if tagged else []
+        return [(['-t', 'nat'], ['POSTROUTING', '-s', str(network), '!', '-o', ap, *tag, '-j', 'MASQUERADE']),
+                ([], ['FORWARD', '-i', ap, '!', '-o', ap, '-s', str(network), *tag, '-j', 'ACCEPT']),
+                ([], ['FORWARD', '!', '-i', ap, '-o', ap, '-d', str(network),
+                      '-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED', *tag, '-j', 'ACCEPT'])]
 
     def usb_tether_rules(self, network):
         """Box hotspot clients out through whatever holds the default route (the iPhone's USB interface in the car,
@@ -971,6 +1094,7 @@ class DebianPlatform:
         self._usb_tether_rules_for(network)
 
     def _usb_tether_rules_for(self, network):
+        self.note_forwarding('usb')
         # Only the manager the image runs: with both, NetworkManager and networkd each took a lease on the
         # iPhone's interface (two addresses, dp-0017 2026-10-30). networkd also runs on the N1 images (the
         # car-hotspot client), so ask NetworkManager.
@@ -994,11 +1118,19 @@ class DebianPlatform:
         self.tether_profile.chmod(0o600)   # NetworkManager ignores keyfiles others can read
         self.reload_network_managers()
         self.reapply_tether_links()
+        # begin_usb_tether runs before PhoneUplink creates ap0. Journal the
+        # interface actually receiving rules, so partial failures/exit remove them.
+        from setup_wizard import save_json
+        path = self.run / 'usb-tether.json'
+        saved = json.loads(path.read_text())
+        if saved.get('interface') != self.ap_interface:
+            save_json(path, {**saved, 'interface': self.ap_interface})
         subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=1'], check=True, capture_output=True, timeout=5)
         for table, rule in self.usb_tether_rules(network):
             subprocess.run(['iptables', *table, '-I', *rule], check=True, capture_output=True, timeout=5)
         self.set_phone_dns(None)   # public resolvers; the hotspot's dnsmasq reads phone_resolv
         (self.run / 'usb-tether').write_text('on\n')
+        self.note_forwarding('usb', self.ap_interface)
 
     def wired_carrier(self):
         """True when a wired interface is up with a cable in it.
@@ -1080,66 +1212,168 @@ class DebianPlatform:
         self.tether_profile.unlink(missing_ok=True)
         self.reload_network_managers()
 
+    def sharing_journal(self, name):
+        path = self.run / name
+        try:
+            saved = json.loads(path.read_text())
+        except FileNotFoundError:
+            return None
+        if not isinstance(saved, dict):
+            raise ValueError("Invalid sharing recovery record")
+        def interface(value):
+            return isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,15}', value)
+        def mac(value):
+            return isinstance(value, str) and re.fullmatch(r'(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', value)
+        if saved.get('forward') not in ('0', '1'):
+            raise ValueError("Invalid saved forwarding state")
+        network = saved.get('network')
+        if network is not None:
+            ipaddress.IPv4Network(network)
+        if name == 'usb-tether.json':
+            if not network or ('interface' in saved and not interface(saved['interface'])):
+                raise ValueError("Invalid USB sharing recovery record")
+        else:
+            if not interface(saved.get('interface')) or not mac(saved.get('mac')):
+                raise ValueError("Invalid station recovery record")
+            vif = saved.get('ap_vif', 'ap0')
+            if vif is not None and not interface(vif):
+                raise ValueError("Invalid AP recovery interface")
+            for table, rule in saved.get('nat_rules') or []:
+                if (table not in ([], ['-t', 'nat']) or not isinstance(rule, list)
+                        or not rule or not all(isinstance(part, str) for part in rule)):
+                    raise ValueError("Invalid saved NAT rule")
+            for table, chain in saved.get('nat_chains', []):
+                if table not in ([], ['-t', 'nat']) or chain not in ('DP_PHONE_NAT', 'DP_PHONE_FWD'):
+                    raise ValueError("Invalid saved NAT chain")
+            borrowed = saved.get('borrowed_ap')
+            if borrowed is not None and (not isinstance(borrowed, dict) or not vif
+                    or not isinstance(borrowed.get('phy'), str) or not borrowed['phy']
+                    or borrowed.get('type') not in ('AP', 'managed') or not mac(borrowed.get('mac'))
+                    or 'managed' not in borrowed or borrowed['managed'] not in (None, 'yes', 'no')):
+                raise ValueError("Invalid borrowed AP recovery record")
+        return saved
+
     def stop_usb_sharing(self):
         """Undo the hotspot's sharing (NAT, forwarding, the bridge marker); the option's profiles stay. On every
         service stop: the iPhone stays plugged in, and a dropped profile would leave it to NetworkManager's
         default one (see disable_usb_tether)."""
+        self.note_forwarding('usb')
         (self.run / 'usb-tether').unlink(missing_ok=True)
         path = self.run / 'usb-tether.json'
-        try:
-            saved = json.loads(path.read_text())
-        except (OSError, ValueError):
+        saved = self.sharing_journal(path.name)
+        if saved is None:
             return
         ap, self.ap_interface = self.ap_interface, saved.get('interface') or self.ap_interface
         try:
             for table, rule in reversed(self.usb_tether_rules(ipaddress.ip_network(saved['network']))):
-                subprocess.run(['iptables', *table, '-D', *rule], capture_output=True, timeout=5)
+                found = subprocess.run(['iptables', *table, '-C', *rule], capture_output=True, timeout=5)
+                if found.returncode == 1:
+                    continue
+                found.check_returncode()
+                subprocess.run(['iptables', *table, '-D', *rule], capture_output=True, timeout=5).check_returncode()
         finally:
             self.ap_interface = ap
         subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=' + str(saved.get('forward', '0'))],
-                       capture_output=True, timeout=5)
+                       capture_output=True, timeout=5).check_returncode()
         path.unlink(missing_ok=True)
 
     def enable_phone_nat(self, network):
+        self.note_forwarding('phone')
         from setup_wizard import save_json
         path = self.run / 'phone-uplink.json'
         saved = json.loads(path.read_text())
-        saved['network'] = str(network)
+        ap = self.ap_interface
+        rules = self.phone_nat_rules(network, ap, tagged=not bool(saved.get('borrowed_ap')))
+        chains = []
+        if saved.get('borrowed_ap'):
+            # Vendor images may lack xt_comment. Dedicated owned chains distinguish
+            # our rules without removing ownership tags from the normal path.
+            chains = [(['-t', 'nat'], 'DP_PHONE_NAT'), ([], 'DP_PHONE_FWD')]
+            for table, chain in chains:
+                result = subprocess.run(['iptables', *table, '-S', chain], capture_output=True, timeout=5)
+                if result.returncode != 1:
+                    raise RuntimeError('Cannot claim phone sharing chain: ' + chain)
+            for table, rule in rules:
+                rule[0] = 'DP_PHONE_NAT' if table else 'DP_PHONE_FWD'
+            rules += [(['-t', 'nat'], ['POSTROUTING', '-s', str(network), '!', '-o', ap, '-j', 'DP_PHONE_NAT']),
+                      ([], ['FORWARD', '-j', 'DP_PHONE_FWD'])]
+        saved.update(network=str(network), nat_rules=rules, nat_chains=chains)
         save_json(path, saved)
+        for table, chain in chains:
+            subprocess.run(['iptables', *table, '-N', chain], check=True, capture_output=True, timeout=5)
         subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=1'], check=True, capture_output=True, timeout=5)
-        for table, rule in self.phone_nat_rules(network):
+        for table, rule in rules:
             subprocess.run(['iptables', *table, '-I', *rule], check=True, capture_output=True, timeout=5)
+        self.note_forwarding('phone', ap)
 
     def cleanup_phone_uplink(self):
+        self.note_forwarding('phone')
         path = self.run / 'phone-uplink.json'
-        if not path.exists():
+        saved = self.sharing_journal(path.name)
+        if saved is None:
             return
-        saved = json.loads(path.read_text())
         self.stop_child('wpa_supplicant')
         self.remove_sta_network()
-        if saved.get('network'):
-            for table, rule in reversed(self.phone_nat_rules(ipaddress.ip_network(saved['network']))):
-                subprocess.run(['iptables', *table, '-D', *rule], capture_output=True, timeout=5)
+        rules = saved.get('nat_rules')
+        if rules is None:
+            rules = self.phone_nat_rules(ipaddress.ip_network(saved['network'])) if saved.get('network') else []
+        for table, rule in reversed(rules):
+            found = subprocess.run(['iptables', *table, '-C', *rule], capture_output=True, timeout=5)
+            if found.returncode == 1:
+                continue  # absent after a partial install or an earlier cleanup attempt
+            found.check_returncode()
+            subprocess.run(['iptables', *table, '-D', *rule], check=True, capture_output=True, timeout=5)
+        for table, chain in reversed(saved.get('nat_chains', [])):
+            found = subprocess.run(['iptables', *table, '-S', chain], capture_output=True, timeout=5)
+            if found.returncode == 1:
+                continue
+            found.check_returncode()
+            # No flush: unexpected foreign rules must stop cleanup, not be destroyed.
+            subprocess.run(['iptables', *table, '-X', chain], check=True, capture_output=True, timeout=5)
         subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=' + saved['forward']],
                        capture_output=True, check=True, timeout=5)
-        subprocess.run(['iw', 'dev', 'ap0', 'del'], capture_output=True, timeout=5)
-        for args in (['down'], ['address', saved['mac']]):
+        vif = saved.get('ap_vif', 'ap0')  # missing key means a legacy journal
+        borrowed = saved.get('borrowed_ap')
+        if borrowed and (SYS_NET / vif).exists():
+            if str((SYS_NET / vif / 'phy80211').resolve()) != borrowed['phy']:
+                raise RuntimeError('Cannot restore a replaced vendor AP interface')
+            for command in (['ip', 'link', 'set', 'dev', vif, 'down'],
+                            ['ip', 'addr', 'flush', 'dev', vif],
+                            ['iw', 'dev', vif, 'set', 'type', '__ap' if borrowed['type'] == 'AP' else 'managed']):
+                subprocess.run(command, check=True, capture_output=True, timeout=5)
+            link = json.loads(subprocess.run(['ip', '-j', 'link', 'show', 'dev', vif],
+                                            check=True, capture_output=True, text=True, timeout=5).stdout)[0]
+            if link['address'].lower() != borrowed['mac'].lower():
+                subprocess.run(['ip', 'link', 'set', 'dev', vif, 'address', borrowed['mac']],
+                               check=True, capture_output=True, timeout=5)
+            if borrowed['managed'] is not None:
+                subprocess.run(['nmcli', 'device', 'set', vif, 'managed', borrowed['managed']],
+                               check=True, capture_output=True, timeout=5)
+        elif vif and not borrowed:
+            deleted = subprocess.run(['iw', 'dev', vif, 'del'], capture_output=True, timeout=5)
+            if (SYS_NET / vif).exists():
+                deleted.check_returncode()
+        steps = (['down'], ['address', saved['mac']]) if saved.get('station_mac_changed', True) else (['down'],)
+        for args in steps:
             subprocess.run(['ip', 'link', 'set', 'dev', saved['interface'], *args],
                            check=True, capture_output=True, timeout=5)
         subprocess.run(['ip', 'addr', 'flush', 'dev', saved['interface']], check=True, capture_output=True, timeout=5)
         self.ap_interface = self.interface
-        path.unlink()
+        path.unlink()  # only after all owned resources have been restored
 
     def stop_all(self):
+        if self.connectivity:
+            self.connectivity.close()
+            self.connectivity = None
         for name, child in reversed(self.children):
             if child.poll() is None:
-                os.killpg(child.pid, signal.SIGTERM)
+                signal_group(child.pid, signal.SIGTERM)
                 try:
                     # The JVM writes its AppCDS archive while exiting; that took longer than 8 s here. A board's
                     # Bluetooth helper stops its own children within 6 s (board_zte_f50.py).
                     child.wait(timeout={"receiver": 40, "bluetooth": 15}.get(name, 8))
                 except subprocess.TimeoutExpired:
-                    os.killpg(child.pid, signal.SIGKILL)
+                    signal_group(child.pid, signal.SIGKILL)
                     child.wait()
 
     def join_log(self):

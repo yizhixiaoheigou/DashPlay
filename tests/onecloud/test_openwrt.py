@@ -614,6 +614,9 @@ class ManagedPageTests(unittest.TestCase):
         html = self.page.render("")
         for text in ("程序更新", "有新版本 2026.10.20", "当前 2026.10.19.1", "- 新功能&lt;b&gt;<br>- 修复", "立即升级", "检查更新"):
             self.assertIn(text, html)
+        self.assertNotIn('有线 CarPlay 可保持连接', html)
+        with patch.object(self.page, 'managed', None):
+            self.assertIn('有线 CarPlay 可保持连接', self.page.update_block('test-nonce'))
         update.save(self.state / "update-check.json", {"checked_at": 1, "latest": "2026.10.20", "available": True,
                                                        "online": False})
         html = self.page.render("")

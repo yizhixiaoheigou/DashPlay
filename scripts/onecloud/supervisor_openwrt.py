@@ -33,7 +33,7 @@ import diagnostics
 import own_domain
 import update
 from tesla_openwrt import OfflineChecks
-from platform_openwrt import OpenWrtPlatform, RUN
+from platform_openwrt import OpenWrtPlatform, RUN, HandoffUnavailable
 import viewer_port
 
 DEFAULTS = {"enabled": "1", "wifi": "auto", "settings_port": "18080", "viewer_port": "",
@@ -64,6 +64,7 @@ DEFAULTS = {"enabled": "1", "wifi": "auto", "settings_port": "18080", "viewer_po
             # A DuckDNS sub-domain and its token: the name becomes <sub-domain>.duckdns.org, with a Let's Encrypt
             # certificate the router obtains and renews itself (own_domain.py). Empty: off.
             "duckdns_domain": "", "duckdns_token": "",
+            "ddns_provider": "duckdns", "ddns_domain": "", "dnspod_token": "", "dynv6_token": "", "dnspod_id": "",
             # Look for a new release once a day (update.py; installed only when someone clicks it), and the URL
             # prefixes tried after GitHub (read by update.py itself).
             "update_check": "1", "update_mirror": ""}
@@ -132,6 +133,13 @@ def waiting_warning(why):
             break
     return (f"交给 iPhone 的 WiFi 还没准备好：{why}。请在 OpenWrt 后台「网络 → 无线」或「服务 → DashPlay」检查；"
             "准备好后 DashPlay 会自动继续。")
+
+
+def poll_handoff(platform, wanted, config, previous=None):
+    try:
+        return platform.handoff(wanted, external=config)
+    except HandoffUnavailable as error:
+        return previous, str(error)
 
 
 def read_config(uci_text):
@@ -384,15 +392,22 @@ def apply_shared_lan(on, network, state, say, stopped=None):
     return bool(changes), ""
 
 
+DNS_PROVIDERS = ('duckdns', 'dnspod', 'dynv6')  # also read offline when generating the signed release manifest
+
+
 def own_config(config):
-    """The DuckDNS sub-domain and token from uci, or None when off or invalid (then said once, never fatal)."""
-    if not config["duckdns_domain"]:
-        return None
+    """Own-name configuration from UCI; invalid credentials disable it without stopping CarPlay."""
     try:
-        return {"domain": own_domain.sub_domain(config["duckdns_domain"]),
-                "token": own_domain.check_token(config["duckdns_token"])}
+        provider = config.get("ddns_provider", "duckdns") or "duckdns"
+        if provider not in DNS_PROVIDERS:
+            raise ValueError('unsupported provider')
+        domain = config.get("duckdns_domain" if provider == "duckdns" else "ddns_domain", "")
+        if not domain:
+            return None
+        return own_domain.provider_config(provider, domain,
+            config.get(provider + "_token", ""), config.get("dnspod_id", ""))
     except ValueError:
-        print("dashplay.main.duckdns_domain/duckdns_token invalid: own name off", flush=True)
+        print("dashplay own-domain configuration invalid: own name off", flush=True)
         return None
 
 
@@ -421,7 +436,7 @@ def main():
     if ddns:
         config["name"] = own_domain.name_of(ddns)
     for relative in ["run-receiver.py", "phone-presence.py", "pair-phone.py", "pairing_window.py", "settings_page.py",
-                     "settings_ui.py", "platform_openwrt.py", "diagnostics.py", "iphone-usb-bridge.py",
+                     "settings_ui.py", "platform_openwrt.py", "connectivity.py", "diagnostics.py", "iphone-usb-bridge.py",
                      "linux-bt-bridge/bt-bridge"]:
         if not (root / relative).is_file():
             raise RuntimeError("Missing runtime input: " + relative)
@@ -445,7 +460,7 @@ def main():
     state = root / "state"
     # Keep the uci mirroring the effective port, so the LuCI link and field show it (an owner's older
     # state/receiver/config.json value is adopted once; the uci survives package updates).
-    if not args.check and str(viewer) != config.get("viewer_port", ""):
+    if str(viewer) != config.get("viewer_port", ""):
         subprocess.run(["uci", "set", f"dashplay.main.viewer_port={viewer}"], check=False, capture_output=True)
         subprocess.run(["uci", "commit", "dashplay"], check=False, capture_output=True)
         config["viewer_port"] = str(viewer)
@@ -575,7 +590,7 @@ def main():
         planned = early or platform.handoff(config["wifi"], live=False, external=config)[0]
         settings_open = False
         while not stopped.is_set():
-            network, why = platform.handoff(config["wifi"], external=config)
+            network, why = poll_handoff(platform, config["wifi"], config)
             if network:
                 break
             if why != reason:
@@ -615,7 +630,7 @@ def main():
 
         def point(public):
             # The public own name resolves normally online. OfflineChecks owns its A-mode answer.
-            upstream_name = config["tesla_mode"] == "1" and ddns is not None
+            upstream_name = config["tesla_mode"] == "1" and ddns is not None and ddns.get("provider", "duckdns") == "duckdns"
             # No local answer here, and Tesla mode's LAN address is in 100.64.0.0/10: dnsmasq counts a forwarded
             # answer there as a rebind attack (2.93, OpenWrt 25.12.5), so this one name is allowed through while
             # the box itself is the access point's DNS (2026-10-23).
@@ -647,7 +662,8 @@ def main():
                       entries=([f"https://{config['name']}:{viewer}/"] if named or (ddns and own_domain.serving(state)) else [])
                       + [f"https://{host}:{viewer}/"])
         if ddns:
-            maintainer.append(own_domain.Maintainer(root, ddns, host, stopped, say, tesla=config["tesla_mode"] == "1"))
+            maintainer.append(own_domain.Maintainer(root, ddns, host, stopped, say,
+                              interface=network["device"] if not named else None, tesla=config["tesla_mode"] == "1"))
             maintainer[0].start()
         if network["mode"] != "ap" and platform.zone_input(network["network"]) not in ("ACCEPT", None):
             # A client network usually sits in the wan zone, which rejects the iPhone's AirPlay connections.
@@ -713,7 +729,10 @@ def main():
                 next_check = time.monotonic() + RECHECK_EVERY
                 offline_checks.update(config, network, status)
                 refresh_network_warning(shared_on, network["device"], status, base_warning)
-                now, why = platform.handoff(config["wifi"], external=config)
+                now, why = poll_handoff(platform, config["wifi"], config, previous=network)
+                if now is network and why:
+                    status["warning"] = why
+                    continue  # retry next tick without stopping a still-running receiver
                 if now is None or plan_of(now) != plan:
                     request_reexec("Wi-Fi changed" if now else why)
                 elif named and public_mode != "0":

@@ -1,10 +1,14 @@
-"""Optional: a DuckDNS name with a Let's Encrypt certificate, for car browsers that refuse the box's local CA
+"""Optional: one's own domain with a Let's Encrypt certificate, for car browsers that refuse the box's local CA
 and offer no way past the warning (2026-10-13: a head unit's Chromium showed ERR_CERT_AUTHORITY_INVALID with
-no "continue"). Off unless the owner enters a DuckDNS sub-domain and token: on the box in the settings page
-(state/ddns.json), on OpenWrt in LuCI (uci dashplay.main.duckdns_domain / duckdns_token).
+no "continue"). Off unless configured: on the box in the settings page (state/ddns.json), on OpenWrt in
+LuCI (the legacy duckdns_domain / duckdns_token fields or ddns_provider and its provider-specific fields).
+
+- DNSPod and dynv6 take a full name and HTTP API credentials. The box answers the name on its own hotspot;
+  on a joined network the provider's public A record points at its LAN address. IPv6 publishing remains a
+  DuckDNS option. dns_provider.py also backs their DNS-01 hooks; it only removes the current challenge TXT.
 
 - Preconfigured deSEC names use the same runtime and upgrade package. state/ddns.json selects provider=desec,
-  a full domain name and a per-device token. Only DNS-01 TXT is public; the device's hotspot answers A locally.
+  a full domain name and a per-device token. The device hotspot answers A locally; joined networks use public A.
   Factory provisioning tools and actual credentials are separate from the public program.
 - The public DuckDNS record points the name at the address the head unit opens: the box on the car hotspot or
   portable Wi-Fi, 192.168.78.1 on the box hotspot, the router's own address on OpenWrt. DuckDNS takes a
@@ -44,9 +48,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import dns_provider
 
 SUFFIX = ".duckdns.org"
 DESEC = "desec"
+DNSPOD = "dnspod"
+DYNV6 = "dynv6"
+FULL_NAME_PROVIDERS = (DESEC, DNSPOD, DYNV6)
+DNS_HOOKS = {"duckdns": "dns_duckdns", DESEC: "dns_desec", DNSPOD: "dns_dp", DYNV6: "dns_dynv6"}
 DOMAIN = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 TOKEN = re.compile(r"[A-Za-z0-9-]{16,64}")   # DuckDNS shows a UUID
 DESEC_TOKEN = re.compile(r"[A-Za-z0-9_-]{20,64}")   # deSEC shows 28 URL-safe characters
@@ -109,6 +118,8 @@ def load(state):
     try:
         config = json.loads((Path(state) / "ddns.json").read_text())
         provider = str(config.get("provider") or "duckdns").lower()
+        if provider in (DNSPOD, DYNV6):
+            return provider_config(provider, config["domain"], config["token"], config.get("id", ""))
         if provider == DESEC:
             return {"provider": DESEC, "domain": domain_name(config["domain"]),
                     "token": check_desec_token(config["token"])}
@@ -125,7 +136,27 @@ def load(state):
 def name_of(config):
     if not config:
         return None
-    return config["domain"] if config.get("provider") == DESEC else config["domain"] + SUFFIX
+    return config["domain"] if config.get("provider") in FULL_NAME_PROVIDERS else config["domain"] + SUFFIX
+
+
+def provider_config(provider, domain, token, token_id=""):
+    """Validate owner-entered configuration; old DuckDNS files keep their original shape."""
+    token = (token or "").strip()
+    if provider == "duckdns":
+        return {"domain": sub_domain(domain), "token": check_token(token)}
+    if provider not in (DNSPOD, DYNV6):
+        raise ValueError("请选择 DuckDNS、DNSPod 或 dynv6。")
+    pattern = r"[A-Za-z0-9]{16,128}" if provider == DNSPOD else r"[A-Za-z0-9_-]{16,256}"
+    if not re.fullmatch(pattern, token):
+        raise ValueError("DNSPod Token 格式不对，请复制 DNSPod API Token（不是腾讯云 SecretKey）。" if provider == DNSPOD
+                         else "dynv6 Token 格式不对，请在 dynv6 的 Keys 页面复制 HTTP Token。")
+    config = {"provider": provider, "domain": domain_name(domain), "token": token}
+    if provider == DNSPOD:
+        token_id = str(token_id or "").strip()
+        if not re.fullmatch(r"[0-9]{1,20}", token_id):
+            raise ValueError("DNSPod Token ID 应为数字，与 Token 一起从 DNSPod API Token 页面复制。")
+        config["id"] = token_id
+    return config
 
 
 def directory_host():
@@ -181,7 +212,7 @@ def network_ready(run=subprocess.run, resolve=socket.getaddrinfo, provider=None)
     being rebuilt and the Wi-Fi uplink was down, which cost an hour of retry (2026-10-26, N1 mode 3)."""
     if not default_route_families(run):
         return "route"
-    for host in (("desec.io" if provider == DESEC else "www.duckdns.org"), directory_host()):
+    for host in ({DESEC: "desec.io", DNSPOD: "dnsapi.cn", DYNV6: "dynv6.com"}.get(provider, "www.duckdns.org"), directory_host()):
         try:
             resolve(host, 443, type=socket.SOCK_STREAM)
         except OSError:
@@ -275,6 +306,8 @@ def update_record(config, address, ipv6=None, clear=False, timeout=15):
     record only, and the result of update_desec."""
     if config.get("provider") == DESEC:
         return update_desec(config, address, timeout)
+    if config.get("provider") in (DNSPOD, DYNV6):
+        return dns_provider.update_address(config, address, timeout)
     def call(fields):
         query = urllib.parse.urlencode(dict(fields, domains=config["domain"], token=config["token"]))
         with urllib.request.urlopen("https://www.duckdns.org/update?" + query, timeout=timeout) as response:
@@ -482,13 +515,13 @@ class Maintainer(threading.Thread):
         super().__init__(name="own-domain", daemon=True)
         self.root, self.state = Path(root), Path(root) / "state"
         self.config, self.name, self.address = config, name_of(config), address
-        self.local_only = bool(config and config.get("provider") == DESEC)   # deSEC: the box answers the name
+        self.local_only = bool(config and config.get("provider") in FULL_NAME_PROVIDERS)
         if tesla and address:
             from setup_wizard import tesla_reaches
             if not tesla_reaches(address):
                 self.address = None
                 write_status(self.state, name=self.name, record="blocked", warning="特斯拉无法打开当前地址，已保留原域名记录")
-                say("DuckDNS record kept: Tesla cannot reach the current address")
+                say("Own-domain record kept: Tesla cannot reach the current address")
         self.stopped, self.say, self.interface = stopped, say, interface
         self.sent, self.sent_at = None, 0.0   # (address, ipv6) last accepted by DuckDNS, and when
         self.failures = 0                     # consecutive obtain() failures, for the retry ladder
@@ -514,7 +547,7 @@ class Maintainer(threading.Thread):
             now = time.monotonic()
             if self.address and now >= next_record:
                 if self.local_only:
-                    # deSEC: the box's own dnsmasq answers the name on its hotspot (record "local", read by
+                    # Full-name providers: dnsmasq answers the name on the box hotspot (record "local", read by
                     # upgrade_checks); the public A record ("published") only on a joined car hotspot or MiFi
                     # (interface), where the car asks that network. On the box hotspot nothing is published, so
                     # its 100.96 address never goes public. No AAAA, no IPv6 guard.
@@ -526,12 +559,12 @@ class Maintainer(threading.Thread):
                         public = update_record(self.config, self.address)
                         if public == "ok":
                             self.sent, self.sent_at = self.address, now
-                        self.say(f"desec {self.name} -> {self.address}: {public}")
+                        self.say(f"{self.config['provider']} {self.name} -> {self.address}: {public}")
                     write_status(self.state, name=self.name, record="local", address=self.address,
                                  ipv6="", ipv6_state="off", published=public)
                     next_record = (float("inf") if not public else
                                    now + {"ok": RECORD_REFRESH, "denied": DESEC_DENIED_RETRY,
-                                          "invalid": DESEC_DENIED_RETRY}.get(public, RECORD_RETRY))
+                                          "invalid": DESEC_DENIED_RETRY, "conflict": DESEC_DENIED_RETRY}.get(public, RECORD_RETRY))
                 else:
                     ipv6, v6state = self.ipv6()
                     if (self.address, ipv6) == self.sent and now < self.sent_at + RECORD_REFRESH:
@@ -570,17 +603,24 @@ class Maintainer(threading.Thread):
 
     def check_certificate(self):
         """Seconds until the next look."""
-        if certificate_for(self.state, self.name, RENEW_DAYS):
+        try:
+            ready = certificate_for(self.state, self.name, RENEW_DAYS)
+        except (OSError, subprocess.SubprocessError):
+            return CERT_CHECK
+        if ready:
             write_status(self.state, name=self.name, phase="ready", reason="")
             return CERT_CHECK
         try:
-            missing = network_ready(provider=DESEC) if self.local_only else network_ready()
+            missing = network_ready(provider=self.config.get("provider")) if self.local_only else network_ready()
         except (OSError, ValueError, subprocess.SubprocessError, TypeError):   # never kill the worker here
             missing = "route"
         if missing:   # boot, access point rebuilding, uplink not up yet: not a failure, look again shortly
             write_status(self.state, name=self.name, phase="waiting", reason=missing)
             return READY_RETRY
-        renewing = certificate_for(self.state, self.name)
+        try:
+            renewing = certificate_for(self.state, self.name)
+        except (OSError, subprocess.SubprocessError):
+            return CERT_CHECK
         write_status(self.state, name=self.name, phase="renewing" if renewing else "issuing", reason="")
         log = self.state / "acme" / "acme.log"
         before = log.stat().st_mtime_ns if log.exists() else None
@@ -615,7 +655,7 @@ class Maintainer(threading.Thread):
             if log.exists():
                 log.replace(home / "acme.log.1")
             # 2: acme.sh still has a certificate it considers current; install that one.
-            dns = "dns_desec" if self.local_only else "dns_duckdns"
+            dns = DNS_HOOKS[self.config.get("provider", "duckdns")]
             if self.acme(["--issue", "--dns", dns, "--dnssleep", str(DNS_SLEEP), "-d", self.name,
                           "--keylength", "ec-256"], log, lock.fileno()) not in (0, 2):
                 raise RuntimeError("acme.sh could not obtain the certificate")
@@ -634,8 +674,16 @@ class Maintainer(threading.Thread):
         home = self.state / "acme"
         command = [str(self.root / "acme" / "acme.sh"), "--home", str(self.root / "acme"), "--config-home", str(home),
                    "--cert-home", str(home / "certs"), *arguments, "--server", ACME_SERVER, "--no-color"]
-        env = dict(os.environ, **({"DEDYN_TOKEN": self.config["token"]} if self.local_only
-                                  else {"DuckDNS_Token": self.config["token"]}))
+        provider = self.config.get("provider", "duckdns")
+        env = dict(os.environ)
+        for key in ("DEDYN_TOKEN", "DuckDNS_Token", "DP_Id", "DP_Key", "DYNV6_TOKEN"):
+            env.pop(key, None)
+        env[{DESEC: "DEDYN_TOKEN", DNSPOD: "DP_Key", DYNV6: "DYNV6_TOKEN"}.get(provider, "DuckDNS_Token")] = self.config["token"]
+        if provider == DNSPOD:
+            env["DP_Id"] = self.config["id"]
+        if provider in (DNSPOD, DYNV6):
+            env["DASHPLAY_DNS_HELPER"] = str(self.root / "dns_provider.py")
+            env["DASHPLAY_DNS_DOMAIN"] = self.name
         shim = curl_shim(home)
         if shim:   # acme.sh asks for "curl"; its requests get bounded by the shim, the script stays untouched
             env["PATH"] = shim + os.pathsep + env.get("PATH", "")
@@ -704,12 +752,15 @@ def message(state, name, box_hotspot=False, retry=False):
         text += status.get("warning", "已保留原域名记录。")
     if status.get("record") == "failed":
         text += f"更新 {name} 的解析失败，盒子会继续重试。"
-    # deSEC's public A record (Maintainer); on the box hotspot the box answers the name itself, so it does not matter.
+    # Full-name providers' public A record (Maintainer); on the box hotspot the box answers the name itself, so it does not matter.
     if not box_hotspot and status.get("published") == "denied":
         text += ("这个域名的钥匙还不能在网上登记盒子的地址，连车机热点或随身 WiFi 时用域名打不开："
-                 "请先用设置页显示的 IP 地址，并联系设备提供方开通。")
+                 "请先用设置页显示的 IP 地址，检查 Token 的域名管理权限；预配置设备请联系提供方开通。")
     elif not box_hotspot and status.get("published") == "failed":
         text += "盒子的地址还没登记到网上，盒子会继续重试；登记前请用设置页显示的 IP 地址。"
+    elif not box_hotspot and status.get("published") == "conflict":
+        text += ("这个域名已有多条 A、AAAA 或 CNAME 记录，盒子未覆盖它们。请使用专供 DashPlay 的域名，"
+                 "移除该名称下冲突的记录后重启服务；暂时请用设置页显示的 IP 地址。")
     elif not box_hotspot and status.get("published") == "invalid":
         text += ("服务商不接受这个域名的登记（域名的分段或缓存时间不对），重试也修不好，盒子隔几小时再看一次："
                  "连车机热点或随身 WiFi 时先用设置页显示的 IP 地址，并联系设备提供方处理。")
