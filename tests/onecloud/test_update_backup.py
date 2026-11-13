@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import stat
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -76,10 +77,16 @@ class BackupDurabilityTests(unittest.TestCase):
                         if stat.S_ISDIR(os.fstat(fd).st_mode) == fail_directory:
                             raise OSError('synthetic sync failure')
                         fsync(fd)
+                    def command(*args, **kwargs):
+                        self.assertEqual(args, ('uci', '-q', 'show', 'dashplay'))
+                        # No custom domain in this backup-failure fixture. Let the real
+                        # compatibility guard pass before injecting the storage failure.
+                        return subprocess.CompletedProcess(args, 0, "dashplay.main=core\n", '')
                     with patch.object(update, 'latest_manifest', return_value={'version': '2026.11.12'}), \
                             patch.object(update, 'current_version', return_value='2026.11.04'), \
                             patch.object(update, 'compare', return_value={'available': True, 'online': True}), \
                             patch.object(update, 'carplay_blocks_update', return_value=False), \
+                            patch.object(update, 'run', side_effect=command), \
                             patch.object(update.os, 'fsync', side_effect=sync), \
                             patch.object(update, 'install_debian') as debian, \
                             patch.object(update, 'install_openwrt') as router:
