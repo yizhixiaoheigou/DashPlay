@@ -181,6 +181,21 @@ class PhoneUplinkTests(unittest.TestCase):
         self.p.cleanup_phone_uplink.assert_called_once()
         self.receiver.assert_not_called()
 
+    def test_start_failure_records_call_site_without_credentials(self):
+        messages = []
+        self.u.say = messages.append
+        def fail_during_interface_setup():
+            raise RuntimeError('synthetic-secret-password')
+        self.p.add_phone_ap.side_effect = fail_during_interface_setup
+        self.p.phone_hotspot_frequency.return_value = 5745
+        self.assertFalse(self.u.start())
+        detail = '\n'.join(messages)
+        self.assertIn('phone uplink startup failed: RuntimeError', detail)
+        self.assertIn('fail_during_interface_setup', detail)
+        self.assertNotIn('synthetic-secret-password', detail)
+        self.p.cleanup_phone_uplink.assert_called_once()
+        self.receiver.assert_not_called()
+
     def test_working_cable_skips_scan_and_leaving_it_joins_phone(self):
         self.p.default_route_devices.return_value = ['eth0']
         with patch('phone_uplink.subprocess.run', return_value=Mock(returncode=0)) as probe:

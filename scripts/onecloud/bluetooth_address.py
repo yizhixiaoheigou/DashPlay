@@ -145,24 +145,31 @@ class BluetoothIdentity:
         self.target = select_address(current, saved, bonded, derived, SHARED_BLUETOOTH_ADDRESSES, successful)
         if saved is None: save_json(self.path, {'address': self.target})
         if current != self.target:
-            self.command('btmgmt', '--index', '0', 'power', 'off')
-            self.command('btmgmt', '--index', '0', 'public-addr', self.target)
+            self.reconfigure(self.target)
         if self.wait_for_address(self.target): return
         # Linux may already cache the requested public_addr while the controller still
         # reports another address. Setting the cached value succeeds but is a no-op.
         # Reconfigure once through the observed original address (never an invented
         # identity), then retry the saved target. No bond directories are moved.
         if current != self.target and self.current() == current:
-            self.command('btmgmt', '--index', '0', 'power', 'off')
-            self.command('btmgmt', '--index', '0', 'public-addr', current)
+            self.reconfigure(current)
             # This first reconfiguration keeps the same address, so an immediate
             # matching read cannot tell whether the async remove/add has finished.
             self.sleep(1)
             if self.wait_for_address(current):
-                self.command('btmgmt', '--index', '0', 'power', 'off')
-                self.command('btmgmt', '--index', '0', 'public-addr', self.target)
+                self.reconfigure(self.target)
                 if self.wait_for_address(self.target): return
         raise RuntimeError('Bluetooth address did not settle')
+
+    def reconfigure(self, address):
+        # During Linux's boot auto-off window MGMT reports "off" while HCI_UP
+        # is still set. Another off request succeeds without closing HCI; a
+        # public-addr change can then strand it in HCI_CONFIG (N1, 6.12.111).
+        # Complete an explicit on/off transition before changing a configured
+        # controller. Unconfigured controllers use configure_unset instead.
+        self.command('btmgmt', '--index', '0', 'power', 'on')
+        self.command('btmgmt', '--index', '0', 'power', 'off')
+        self.command('btmgmt', '--index', '0', 'public-addr', address)
 
     def wait_for_address(self, address):
         # A successful management command can briefly remove/re-add the adapter.

@@ -108,7 +108,7 @@ class RuntimeGuardTests(unittest.TestCase):
     def test_stuck_udev_and_missing_interface_share_one_deadline(self):
         now = [0.0]
         def settle(command, **kwargs):
-            self.assertLessEqual(kwargs['timeout'], 2)
+            self.assertLessEqual(kwargs['timeout'], 11)
             now[0] += kwargs['timeout']
             raise subprocess.TimeoutExpired(command, kwargs['timeout'])
         def sleep(seconds):
@@ -126,3 +126,16 @@ class RuntimeGuardTests(unittest.TestCase):
                 patch.object(supervisor.setup_wizard, 'wifi_interface', side_effect=[None, 'test0']), \
                 patch.object(supervisor.Path, 'exists', return_value=True):
             self.assertEqual(supervisor.wait_for_wifi_interface(), 'test0')
+
+    def test_wifi_discovery_preserves_the_device_settle_window(self):
+        now = [0.0]
+        def settle(command, **kwargs):
+            limit = int(command[-1].split('=')[1])
+            now[0] += min(limit, max(0, 4-now[0]))
+            return Mock(returncode=0 if now[0] >= 4 else 1)
+        with patch.object(supervisor.time, 'monotonic', side_effect=lambda: now[0]), \
+                patch.object(supervisor.subprocess, 'run', side_effect=settle), \
+                patch.object(supervisor.setup_wizard, 'wifi_interface', return_value='wlan-test'), \
+                patch.object(Path, 'exists', return_value=True):
+            self.assertEqual(supervisor.wait_for_wifi_interface(), 'wlan-test')
+        self.assertGreaterEqual(now[0], 4, 'a visible interface is not evidence that udev finished')

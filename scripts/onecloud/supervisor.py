@@ -229,8 +229,10 @@ def wait_for_wifi_interface(timeout=60):
     deadline = time.monotonic() + timeout
     while (left := deadline - time.monotonic()) > 0:
         try:
-            subprocess.run(["udevadm", "settle", "--timeout=1"], capture_output=True,
-                           timeout=min(2, left))
+            # Preserve the 11.04 device-settle window. Merely seeing wlan0
+            # after one second can race the N1's Bluetooth/NM initialization.
+            subprocess.run(["udevadm", "settle", "--timeout=10"], capture_output=True,
+                           timeout=min(11, left))
         except subprocess.TimeoutExpired:
             pass
         interface = setup_wizard.wifi_interface()

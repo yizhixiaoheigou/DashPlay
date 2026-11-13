@@ -49,6 +49,27 @@ class BluetoothIdentityTests(unittest.TestCase):
         BluetoothIdentity(self.state,self.bluez,self.fake_run,lambda _:None).prepare()
         self.assertEqual(self.current,self.old)
 
+    def test_boot_auto_off_must_finish_before_changing_public_address(self):
+        self.bond(self.old)
+        # Linux can expose an apparently powered-off controller while HCI_UP is
+        # still set during its boot auto-off window. An off request is then a
+        # no-op; changing public-addr strands the controller in HCI_CONFIG.
+        boot_auto_off = True
+        physically_on = True
+        def run(argv, **kwargs):
+            nonlocal boot_auto_off, physically_on
+            if argv[-2:] == ['power', 'on']:
+                boot_auto_off, physically_on = False, True
+            elif argv[-2:] == ['power', 'off'] and not boot_auto_off:
+                physically_on = False
+            elif 'public-addr' in argv:
+                self.assertFalse(physically_on, 'must perform a real power-off before reconfiguration')
+            return self.fake_run(argv, **kwargs)
+        identity = BluetoothIdentity(self.state, self.bluez, run, lambda _: None)
+        identity.prepare()
+        self.assertTrue(identity.verify())
+        self.assertEqual(json.loads((self.state/'bluetooth-identity.json').read_text())['address'], self.old)
+
     def test_ambiguous_or_corrupt_identity_never_silently_replaces_bonds(self):
         with self.assertRaises(ValueError): select_address(self.changed,None,{self.old,'02:00:00:00:00:44'},self.changed,set())
         with self.assertRaises(ValueError): select_address(self.changed,'invalid',set(),self.changed,set())

@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import time
+import traceback
 import own_domain
 import setup_wizard
 
@@ -23,6 +24,13 @@ AP_READY_MISSES = 3  # hostapd checks (2 s apart) before the AP is rebuilt: one 
 #: search and Mode B never found the hotspot (dp-0017 2026-10-31). A single-channel scan is ~0.1 s.
 UPLINK_SCAN_TIMEOUT = 15
 NETWORK_ERRORS = (OSError, ValueError, RuntimeError, subprocess.SubprocessError)
+
+
+def failure_site(error):
+    """Call sites identify the failing step without logging arguments, locals or credentials."""
+    frames = traceback.extract_tb(error.__traceback__)
+    return type(error).__name__ + ' at ' + ' -> '.join(
+        f'{Path(frame.filename).name}:{frame.lineno}:{frame.name}' for frame in frames)
 
 
 class LanRecoveryFailed(RuntimeError):
@@ -423,6 +431,7 @@ class PhoneUplink:
             self.start_receiver(self.channel)
             p.check_lan_children()
         except NETWORK_ERRORS as error:
+            self.say('phone uplink startup failed: ' + failure_site(error))
             self.clear_lan()
             self.set_status('offline', '持续热点启动失败（' + type(error).__name__ + '）；回退普通热点')
             return False
