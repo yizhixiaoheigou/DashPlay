@@ -1,5 +1,9 @@
 # DashPlay
 
+<!-- yarkr:badges:start -->
+[![Indexed on Yarkr](https://api.yarkr.com/functions/v1/api/api/v1/badges/repos/yizhixiaoheigou/DashPlay/version.svg)](https://yarkr.com/arks/yizhixiaoheigou/dashplay)
+<!-- yarkr:badges:end -->
+
 [English](README.en.md)
 
 把带 Wi-Fi 和蓝牙的 Linux 小盒子变成 CarPlay 接收端：iPhone 用数据线插盒子（有线 CarPlay），或经蓝牙引导连上 Wi-Fi（无线 CarPlay）；车机或任何设备用浏览器打开盒子的网页，就能显示画面、播放声音并触控操作。没有 CarPlay 的车，只要车机有浏览器、能连 WiFi，就可以试。
@@ -179,3 +183,36 @@ python3 -m unittest discover -s tests/onecloud      # 设置、多手机、平�
 ## 许可与商标
 
 GPL-3.0，见 [LICENSE](LICENSE) 与 [NOTICE.md](NOTICE.md)。CarPlay、iPhone、AirPlay 和 MFi 是 Apple Inc. 的商标；本项目与 Apple、PlayPort、DiPlay、xcertplay、WheelPlay 均无从属或背书关系。
+
+<!-- yarkr:install:start -->
+## Install with Yarkr
+
+This repo is indexed on [Yarkr](https://yarkr.com/arks/yizhixiaoheigou/dashplay) as the ark [yizhixiaoheigou/dashplay](https://yarkr.com/arks/yizhixiaoheigou/dashplay), so its skills install into Claude Code, Codex, Cursor and other agent harnesses with one command.
+
+### CLI
+
+Install the whole ark, which Yarkr keeps equal to this repo:
+
+```bash
+npx yarkr-cli sync yizhixiaoheigou/dashplay
+```
+
+Or add individual skills:
+
+```bash
+npx yarkr-cli add skill:yizhixiaoheigou/dashplay/dashplay-android-install
+npx yarkr-cli add skill:yizhixiaoheigou/dashplay/dashplay-install
+```
+
+No Node.js? `curl -fsSL https://yarkr.com/install.sh | sh` (macOS, Linux) or `irm https://yarkr.com/install.ps1 | iex` (Windows PowerShell) installs `yarkr` as a standalone binary; then type `yarkr` in place of `npx yarkr-cli`.
+
+### MCP
+
+Connect your agent to the ark over MCP:
+
+```bash
+npx yarkr-cli mcp add yizhixiaoheigou/dashplay
+```
+
+Or point any MCP client at `https://api.yarkr.com/functions/v1/api/mcp/o/yizhixiaoheigou/dashplay`.
+<!-- yarkr:install:end -->
